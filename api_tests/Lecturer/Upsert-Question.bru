@@ -1,0 +1,30 @@
+meta {
+  name: Upsert Question
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/lecturer/question
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "id": 1,
+    "target_table": "users",
+    "correct_sql": "SELECT * FROM users",
+    "type": "QUERY",
+    "points": 10,
+    "strict_mode": {
+      "ordering": false,
+      "attributes": false,
+      "record_order": false
+    }
+  }
+}

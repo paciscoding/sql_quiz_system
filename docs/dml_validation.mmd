@@ -1,0 +1,42 @@
+sequenceDiagram
+    participant S as Student
+    participant B as Backend (Go Gin)
+    participant L as LockManager (pg_advisory_lock)
+    participant DB as Postgres (student_{id} schema)
+
+    S->>B: Submit SQL (Insert/Update/Delete)
+    B->>L: ExecuteLocked(student_id)
+    L->>DB: SELECT pg_advisory_lock(fnv(student_id))
+    Note over B,L: Per-student serialisation across processes
+
+    rect rgb(235, 240, 250)
+        Note right of B: Phase 0: Sandbox preparation
+        B->>DB: InitializeSandbox (idempotent)
+        Note right of B: Only missing tables are cloned<br/>(LIKE INCLUDING ALL + INSERT SELECT)
+        B->>DB: ResetTable(target) -- drop & re-clone target only
+    end
+
+    rect rgb(240, 240, 240)
+        Note right of B: Phase 1: Establish Ground Truth
+        B->>DB: Backup target table
+        B->>DB: Execute Lecturer's Correct SQL
+        DB-->>B: Return Modified State
+        B->>B: Capture Diff (Corrected Result)
+        B->>DB: Restore target from Backup
+    end
+
+    rect rgb(220, 240, 220)
+        Note right of B: Phase 2: Validate Student Submission
+        B->>DB: Execute Student SQL (SET ROLE exam_student)
+        DB-->>B: Return Modified State
+        B->>B: Capture Student Diff
+        B->>B: Compare Diffs (Row-by-Row)
+    end
+
+    L->>DB: SELECT pg_advisory_unlock(fnv(student_id))
+
+    alt Correct
+        B-->>S: Return Full Score
+    else Incorrect / Idempotent
+        B-->>S: Return Partial/Zero Score
+    end

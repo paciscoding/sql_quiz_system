@@ -1,0 +1,36 @@
+graph TD
+    User((Student/Lecturer/Admin)) -->|HTTPS/JWT| Nginx[Nginx Reverse Proxy]
+    Nginx -->|Static Files| Frontend[Vue 3 Frontend]
+    Nginx -->|API Requests| Backend[Go Gin Backend]
+
+    subgraph Auth & RBAC
+        Backend --> AuthService[Auth Service]
+        AuthService --> JWT[JWT Verification]
+        AuthService --> RBAC[Role-Based Access Control]
+    end
+
+    subgraph Core Features
+        Backend --> QuizCtrl[Quiz Controller]
+        Backend --> LecturerCtrl[Lecturer Controller]
+        QuizCtrl --> Exams[Examination Management]
+        LecturerCtrl --> Questions[Question Management]
+    end
+
+    subgraph Concurrency
+        QuizCtrl --> LockMgr[LockManager]
+        LockMgr -->|pg_advisory_lock<br/>FNV(student_id)| DB
+    end
+
+    subgraph Docker Container
+        Backend -->|SQL| DB[(PostgreSQL)]
+        DB -->|app schema| AppDB[System Tables<br/>users / exams / questions]
+        DB -->|public schema| MainDB[Lecturer Curriculum<br/>clone template]
+        DB -.->|LIKE INCLUDING ALL<br/>+ INSERT SELECT| StudentDB[Student Sandbox<br/>student_id schema]
+    end
+
+    subgraph Evaluation Logic
+        Backend --> Logic[Validation Engine]
+        Logic -->|InitializeSandbox<br/>idempotent| StudentDB
+        Logic -->|ResetTable target<br/>before DML| StudentDB
+        Logic -->|Result Comparison| MainDB
+    end

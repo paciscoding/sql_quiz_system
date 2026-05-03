@@ -1,0 +1,21 @@
+meta {
+  name: Import Schema
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/lecturer/import-schema
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "sql": "CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT); INSERT INTO users (name) VALUES ('Alice');"
+  }
+}

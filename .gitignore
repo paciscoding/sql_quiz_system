@@ -1,0 +1,60 @@
+# Binaries
+backend/main
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Packages
+node_modules/
+vendor/
+bun.lockb
+.npm/
+.yarn/
+
+# Build Outputs
+frontend/dist/
+backend/bin/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Docker
+.docker/
+.env
+*.env
+
+# Documentation Artifacts
+*.pdf
+docs/*.png
+docs/*.svg
+docs/*.pdf
+
+# LLMs & AI Tools
+.claude/
+.gemini/
+local_llm_tools/
+AGENTS.md
+CRITIQUE.md
+
+# API Testing (Bruno)
+api_tests/environments/Local.bru
+
+# Custom Logs & Metrics
+*.log
+work_times.log

@@ -1,0 +1,23 @@
+meta {
+  name: Submit Answer
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/quiz/submit
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "student_id": "test_student_bruno",
+    "question_number": 1,
+    "sql_text": "SELECT * FROM users"
+  }
+}
