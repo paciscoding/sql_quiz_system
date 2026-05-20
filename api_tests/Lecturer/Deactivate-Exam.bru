@@ -1,0 +1,21 @@
+meta {
+  name: Deactivate Exam
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/lecturer/exams/1/deactivate
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "active": false
+  }
+}

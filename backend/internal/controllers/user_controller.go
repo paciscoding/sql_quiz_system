@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -24,7 +25,7 @@ func (ctrl *UserController) Login(c *gin.Context) {
 		return
 	}
 
-	res, err := ctrl.authService.Login(req.Username, req.Password)
+	res, err := ctrl.authService.Login(c.Request.Context(), req.Username, req.Password)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -43,12 +44,67 @@ func (ctrl *UserController) ChangePassword(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.authService.ChangePassword(currentUser.ID, req.OldPassword, req.NewPassword); err != nil {
+	if err := ctrl.authService.ChangePassword(c.Request.Context(), currentUser.ID, req.OldPassword, req.NewPassword); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Password updated successfully"})
+}
+
+func (ctrl *UserController) ListStudents(c *gin.Context) {
+	students, err := ctrl.authService.ListUsersByRole(c.Request.Context(), models.RoleStudent)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, students)
+}
+
+func (ctrl *UserController) GetAllUsers(c *gin.Context) {
+	users, err := ctrl.authService.GetAllUsers(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+func (ctrl *UserController) UpdateUser(c *gin.Context) {
+	idStr := c.Param("id")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	var u models.User
+	if err := c.ShouldBindJSON(&u); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	u.ID = id
+
+	if err := ctrl.authService.UpdateUser(c.Request.Context(), u); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "User updated successfully"})
+}
+
+func (ctrl *UserController) DeleteUser(c *gin.Context) {
+	idStr := c.Param("id")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	if err := ctrl.authService.DeleteUser(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 }
 
 func (ctrl *UserController) CreateAccount(c *gin.Context) {

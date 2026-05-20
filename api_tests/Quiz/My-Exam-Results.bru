@@ -1,0 +1,21 @@
+meta {
+  name: My Exam Results
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/quiz/exams/{{examId}}/results
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}

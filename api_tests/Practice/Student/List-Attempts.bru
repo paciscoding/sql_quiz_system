@@ -1,0 +1,15 @@
+meta {
+  name: List My Attempts
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/practice/attempts
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}

@@ -1,72 +1,60 @@
 package services
 
 import (
-	"errors"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/repository"
 )
 
 // MockExecutor implements DBExecutor for testing
 type MockExecutor struct {
-	QueryFunc           func(ctx context.Context, schema, sql string) ([]map[string]interface{}, error)
-	ExecFunc            func(ctx context.Context, schema, sql string) error
-	GetTableStateFunc   func(ctx context.Context, schema, tableName string) (string, error)
-	QueryStudentSQLFunc func(ctx context.Context, schema, sql string) ([]map[string]interface{}, error)
-	ExecStudentSQLFunc  func(ctx context.Context, schema, sql string) error
+	EvaluateFunc        func(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error)
+	EvaluatePreviewFunc func(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (repository.PreviewResult, error)
 }
 
 func (m *MockExecutor) Query(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
-	return m.QueryFunc(ctx, schema, sql)
+	return nil, nil
+}
+func (m *MockExecutor) Exec(ctx context.Context, schema, sql string) error { return nil }
+func (m *MockExecutor) Evaluate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
+	return m.EvaluateFunc(ctx, studentID, question, studentSQL, sandboxSchema)
+}
+func (m *MockExecutor) EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (repository.PreviewResult, error) {
+	return m.EvaluatePreviewFunc(ctx, studentID, question, studentSQL, sandboxSchema)
 }
 
-func (m *MockExecutor) Exec(ctx context.Context, schema, sql string) error {
-	return m.ExecFunc(ctx, schema, sql)
-}
-
-func (m *MockExecutor) GetTableState(ctx context.Context, schema, tableName string) (string, error) {
-	return m.GetTableStateFunc(ctx, schema, tableName)
-}
-
-func (m *MockExecutor) QueryStudentSQL(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
-	if m.QueryStudentSQLFunc != nil {
-		return m.QueryStudentSQLFunc(ctx, schema, sql)
-	}
-	return m.QueryFunc(ctx, schema, sql)
-}
-
-func (m *MockExecutor) ExecStudentSQL(ctx context.Context, schema, sql string) error {
-	if m.ExecStudentSQLFunc != nil {
-		return m.ExecStudentSQLFunc(ctx, schema, sql)
-	}
-	return m.ExecFunc(ctx, schema, sql)
-}
-
-func TestValidationService_ValidateQuery(t *testing.T) {
+func TestValidationService_Validate(t *testing.T) {
 	mock := &MockExecutor{}
 	service := NewValidationService(mock)
 	ctx := context.Background()
 
+	teacherData := []map[string]interface{}{{"id": 1, "name": "Alice"}}
+	teacherJSON, _ := json.Marshal(teacherData)
+
 	question := models.Question{
-		ID:         1,
-		CorrectSQL: "SELECT * FROM users",
-		Type:       "QUERY",
-		Points:     10.0,
+		ID:             1,
+		CorrectSQL:     "SELECT * FROM users",
+		Type:           "QUERY",
+		Points:         10.0,
+		ExpectedResult: teacherJSON,
 	}
 
-	t.Run("Correct Query", func(t *testing.T) {
-		teacherResult := []map[string]interface{}{{"id": 1, "name": "Alice"}}
-		studentResult := []map[string]interface{}{{"id": 1, "name": "Alice"}}
+	t.Run("Correct Submission", func(t *testing.T) {
+		studentData := []map[string]interface{}{{"id": 1, "name": "Alice"}}
+		studentJSON, _ := json.Marshal(studentData)
 
-		mock.QueryFunc = func(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
-			if sql == question.CorrectSQL {
-				return teacherResult, nil
-			}
-			return studentResult, nil
+		mock.EvaluateFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{
+				Status:            "success",
+				ValidationDetails: studentJSON,
+			}, nil
 		}
 
-		result, err := service.Validate(ctx, "123", question, "SELECT name, id FROM users")
+		result, err := service.Validate(ctx, 123, question, "SELECT * FROM users", "sandbox_exam_1")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -75,18 +63,18 @@ func TestValidationService_ValidateQuery(t *testing.T) {
 		}
 	})
 
-	t.Run("Incorrect Query Results", func(t *testing.T) {
-		teacherResult := []map[string]interface{}{{"id": 1, "name": "Alice"}}
-		studentResult := []map[string]interface{}{{"id": 1, "name": "Bob"}}
+	t.Run("Incorrect Results", func(t *testing.T) {
+		studentData := []map[string]interface{}{{"id": 1, "name": "Bob"}}
+		studentJSON, _ := json.Marshal(studentData)
 
-		mock.QueryFunc = func(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
-			if sql == question.CorrectSQL {
-				return teacherResult, nil
-			}
-			return studentResult, nil
+		mock.EvaluateFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{
+				Status:            "success",
+				ValidationDetails: studentJSON,
+			}, nil
 		}
 
-		result, err := service.Validate(ctx, "123", question, "SELECT * FROM other_table")
+		result, err := service.Validate(ctx, 123, question, "SELECT * FROM other", "sandbox_exam_1")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -95,60 +83,261 @@ func TestValidationService_ValidateQuery(t *testing.T) {
 		}
 	})
 
-	t.Run("Student SQL Syntax Error", func(t *testing.T) {
-		mock.QueryFunc = func(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
-			if sql == question.CorrectSQL {
-				return []map[string]interface{}{{"id": 1}}, nil
-			}
-			return nil, errors.New("syntax error")
+	t.Run("Execution Error", func(t *testing.T) {
+		mock.EvaluateFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{
+				Status:   "error",
+				Feedback: "SQL Error: syntax error",
+			}, nil
 		}
 
-		result, err := service.Validate(ctx, "123", question, "INVALID SQL")
+		result, err := service.Validate(ctx, 123, question, "INVALID", "sandbox_exam_1")
 		if err != nil {
 			t.Fatalf("Expected no error from Validate, got %v", err)
 		}
-		if result.Score != 0 || !strings.Contains(result.Feedback, "SQL Error") {
-			t.Errorf("Expected zero score and error feedback, got %+v", result)
+		if result.Status != "syntax_error" || result.Score != 0 || result.IsCorrect {
+			t.Errorf("Expected syntax_error status and zero score, got %+v", result)
+		}
+	})
+
+	t.Run("Strict Ordering - Success", func(t *testing.T) {
+		qStrict := question
+		qStrict.StrictMode.Ordering = true
+
+		data := []map[string]interface{}{{"id": 1}, {"id": 2}}
+		dataJSON, _ := json.Marshal(data)
+		qStrict.ExpectedResult = dataJSON
+
+		mock.EvaluateFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{Status: "success", ValidationDetails: dataJSON}, nil
+		}
+
+		result, _ := service.Validate(ctx, 123, qStrict, "...", "sandbox_exam_1")
+		if !result.IsCorrect {
+			t.Error("Expected correct result with matching order")
+		}
+	})
+
+	t.Run("Strict Ordering - Failure", func(t *testing.T) {
+		qStrict := question
+		qStrict.StrictMode.Ordering = true
+
+		teacherData := []map[string]interface{}{{"id": 1}, {"id": 2}}
+		teacherJSON, _ := json.Marshal(teacherData)
+		qStrict.ExpectedResult = teacherJSON
+
+		studentData := []map[string]interface{}{{"id": 2}, {"id": 1}}
+		studentJSON, _ := json.Marshal(studentData)
+
+		mock.EvaluateFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{Status: "success", ValidationDetails: studentJSON}, nil
+		}
+
+		result, _ := service.Validate(ctx, 123, qStrict, "...", "sandbox_exam_1")
+		if result.IsCorrect {
+			t.Error("Expected failure due to mismatched order")
+		}
+	})
+
+	t.Run("Non-Strict Ordering - Success", func(t *testing.T) {
+		qNormal := question
+		qNormal.StrictMode.Ordering = false
+
+		teacherData := []map[string]interface{}{{"id": 1}, {"id": 2}}
+		teacherJSON, _ := json.Marshal(teacherData)
+		qNormal.ExpectedResult = teacherJSON
+
+		studentData := []map[string]interface{}{{"id": 2}, {"id": 1}}
+		studentJSON, _ := json.Marshal(studentData)
+
+		mock.EvaluateFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{Status: "success", ValidationDetails: studentJSON}, nil
+		}
+
+		result, _ := service.Validate(ctx, 123, qNormal, "...", "sandbox_exam_1")
+		if !result.IsCorrect {
+			t.Error("Expected success for mismatched order in non-strict mode")
 		}
 	})
 }
 
-func TestValidationService_ValidateDML(t *testing.T) {
+func TestValidationService_ValidatePreview(t *testing.T) {
 	mock := &MockExecutor{}
 	service := NewValidationService(mock)
 	ctx := context.Background()
 
+	teacherData := []map[string]interface{}{{"id": float64(1)}}
+	teacherJSON, _ := json.Marshal(teacherData)
+	examID := 1
 	question := models.Question{
-		ID:          2,
-		TargetTable: "users",
-		CorrectSQL:  "UPDATE users SET name = 'Correct'",
-		Type:        "DML",
-		Points:      10.0,
+		ID:             1,
+		Type:           "QUERY",
+		ExamID:         &examID,
+		Points:         10.0,
+		ExpectedResult: teacherJSON,
 	}
 
-	t.Run("Correct DML", func(t *testing.T) {
-		// Strengthened test by using distinct states for teacher and student
-		mock.ExecFunc = func(ctx context.Context, schema, sql string) error { return nil }
-		
-		callCount := 0
-		mock.GetTableStateFunc = func(ctx context.Context, schema, tableName string) (string, error) {
-			callCount++
-			if tableName == "users_backup" {
-				return "initial_state", nil
-			}
-			// First call to GetTableState for "users" is teacher's state
-			// Second call to GetTableState for "users" is student's state
-			if callCount == 1 { return "teacher_state", nil }
-			return "teacher_state", nil 
+	t.Run("Correct Preview", func(t *testing.T) {
+		rows := []map[string]interface{}{{"id": float64(1)}}
+		cols := []string{"id"}
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (repository.PreviewResult, error) {
+			return repository.PreviewResult{
+				Result:   models.ValidationResult{Status: "success"},
+				Rows:     rows,
+				Columns:  cols,
+				RowCount: 1,
+			}, nil
 		}
 
-		result, err := service.Validate(ctx, "123", question, "UPDATE users SET name = 'Correct'")
+		vResult, vRows, vCols, vCount, vTrunc, err := service.ValidatePreview(ctx, 123, question, "SELECT * FROM t", "sandbox_exam_1")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
-		if !result.IsCorrect || result.Score != 10.0 {
-			t.Errorf("Expected correct DML result, got %+v", result)
+		if vResult.Status != "correct" {
+			t.Errorf("Expected status 'correct', got %q", vResult.Status)
+		}
+		if len(vRows) != 1 || len(vCols) != 1 || vCols[0] != "id" {
+			t.Errorf("Expected rows/cols pass-through, got rows=%v cols=%v", vRows, vCols)
+		}
+		if vCount != 1 || vTrunc {
+			t.Errorf("Expected count=1 trunc=false, got count=%d trunc=%v", vCount, vTrunc)
+		}
+	})
+
+	t.Run("Incorrect Preview", func(t *testing.T) {
+		rows := []map[string]interface{}{{"id": float64(99)}}
+		cols := []string{"id"}
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (repository.PreviewResult, error) {
+			return repository.PreviewResult{
+				Result:   models.ValidationResult{Status: "success"},
+				Rows:     rows,
+				Columns:  cols,
+				RowCount: 1,
+			}, nil
+		}
+
+		vResult, vRows, _, _, _, err := service.ValidatePreview(ctx, 123, question, "SELECT * FROM t", "sandbox_exam_1")
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if vResult.Status != "incorrect" {
+			t.Errorf("Expected status 'incorrect', got %q", vResult.Status)
+		}
+		if len(vRows) != 1 {
+			t.Errorf("Expected rows pass-through, got %v", vRows)
+		}
+	})
+
+	t.Run("Syntax Error Preview", func(t *testing.T) {
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (repository.PreviewResult, error) {
+			return repository.PreviewResult{
+				Result: models.ValidationResult{Status: "error", Feedback: "SQL Error: foo"},
+			}, nil
+		}
+
+		vResult, _, _, _, _, err := service.ValidatePreview(ctx, 123, question, "INVALID SQL", "sandbox_exam_1")
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if vResult.Status != "syntax_error" {
+			t.Errorf("Expected status 'syntax_error', got %q", vResult.Status)
+		}
+		if vResult.Feedback == "" || !strings.Contains(vResult.Feedback, "SQL Error") {
+			t.Errorf("Expected feedback containing 'SQL Error', got %q", vResult.Feedback)
 		}
 	})
 }
 
+// TestValidationService_SandboxPracticeSchema verifies that when "sandbox_practice"
+// is passed as the sandboxSchema, the mock executor receives that exact string,
+// and that the existing exam schema ("sandbox_exam_1") behaviour is byte-identical.
+func TestValidationService_SandboxPracticeSchema(t *testing.T) {
+	ctx := context.Background()
+
+	teacherData := []map[string]interface{}{{"id": float64(1)}}
+	teacherJSON, _ := json.Marshal(teacherData)
+
+	question := models.Question{
+		ID:             10,
+		Type:           "DML",
+		Points:         3.0,
+		ExpectedResult: teacherJSON,
+	}
+
+	t.Run("sandbox_practice schema forwarded verbatim", func(t *testing.T) {
+		var capturedSchema string
+		mock := &MockExecutor{
+			EvaluateFunc: func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+				capturedSchema = schema
+				studentJSON, _ := json.Marshal(teacherData) // matching result
+				return models.ValidationResult{
+					Status:            "success",
+					ValidationDetails: studentJSON,
+				}, nil
+			},
+		}
+		svc := NewValidationService(mock)
+
+		_, err := svc.Validate(ctx, 1, question, "INSERT INTO t VALUES(1)", "sandbox_practice")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if capturedSchema != "sandbox_practice" {
+			t.Errorf("executor received schema %q; want %q", capturedSchema, "sandbox_practice")
+		}
+	})
+
+	t.Run("sandbox_exam_1 schema behaviour unchanged", func(t *testing.T) {
+		var capturedSchema string
+		studentData := []map[string]interface{}{{"id": float64(1)}}
+		studentJSON, _ := json.Marshal(studentData)
+
+		mock := &MockExecutor{
+			EvaluateFunc: func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+				capturedSchema = schema
+				return models.ValidationResult{
+					Status:            "success",
+					ValidationDetails: studentJSON,
+				}, nil
+			},
+		}
+		svc := NewValidationService(mock)
+
+		result, err := svc.Validate(ctx, 1, question, "SELECT 1", "sandbox_exam_1")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if capturedSchema != "sandbox_exam_1" {
+			t.Errorf("executor received schema %q; want %q", capturedSchema, "sandbox_exam_1")
+		}
+		// Verify result is correct (byte-identical behaviour to normal exam path)
+		if !result.IsCorrect {
+			t.Errorf("Expected correct result for exam path, got %+v", result)
+		}
+		if result.Score != question.Points {
+			t.Errorf("Expected score %v, got %v", question.Points, result.Score)
+		}
+	})
+
+	t.Run("sandbox_practice empty SQL short-circuits before executor", func(t *testing.T) {
+		executorCalled := false
+		mock := &MockExecutor{
+			EvaluateFunc: func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (models.ValidationResult, error) {
+				executorCalled = true
+				return models.ValidationResult{}, nil
+			},
+		}
+		svc := NewValidationService(mock)
+
+		result, err := svc.Validate(ctx, 1, question, "", "sandbox_practice")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if executorCalled {
+			t.Error("Executor should not be called for empty SQL")
+		}
+		if result.Status != "syntax_error" {
+			t.Errorf("Expected syntax_error for empty SQL, got %q", result.Status)
+		}
+	})
+}

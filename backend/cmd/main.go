@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/paciscoding/sql-quiz-system/internal/controllers"
+	"github.com/paciscoding/sql-quiz-system/internal/middleware"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
@@ -27,6 +31,16 @@ func main() {
 	}
 	defer repo.Close()
 
+	// Initialize Submission Queue
+	submissionQueue := services.NewSubmissionQueue(256, 30*time.Second)
+	defer func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer shutCancel()
+		if err := submissionQueue.Shutdown(shutCtx); err != nil {
+			log.Printf("Warning: submission queue shutdown: %v", err)
+		}
+	}()
+
 	ctx := context.Background()
 
 	// Setup restricted role for student queries
@@ -39,10 +53,15 @@ func main() {
 		log.Fatalf("Failed to initialize system tables: %v", err)
 	}
 
+	// Initialize Practice Sandbox
+	if err := repo.InitializePracticeSandbox(ctx); err != nil {
+		log.Fatalf("Failed to initialize practice sandbox: %v", err)
+	}
+
 	// Initialize Services
 	valService := services.NewValidationService(repo)
-	lockManager := services.NewLockManager(repo.Pool())
-	
+	studentImportService := services.NewStudentImportService(repo)
+
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if len(jwtSecret) < 32 {
 		log.Fatalf("JWT_SECRET must be at least 32 characters long")
@@ -50,14 +69,26 @@ func main() {
 	authService := services.NewAuthService(repo, jwtSecret)
 
 	// Seed Admin
-	if err := authService.SeedAdminAccount(ctx, "admin", "admin123"); err != nil {
+	adminUser := os.Getenv("ADMIN_USER")
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	adminPass := os.Getenv("ADMIN_PASS")
+	if adminPass == "" {
+		adminPass = "admin123"
+	}
+
+	if err := authService.SeedAdminAccount(ctx, adminUser, adminPass); err != nil {
 		log.Printf("Warning: Failed to seed admin: %v", err)
 	}
 
 	// Initialize Controllers
-	quizCtrl := controllers.NewQuizController(valService, lockManager, repo)
+	quizCtrl := controllers.NewQuizController(valService, submissionQueue, repo)
 	lecturerCtrl := controllers.NewLecturerController(repo)
+	lecturerCtrl.SetStudentImportService(studentImportService)
 	userCtrl := controllers.NewUserController(authService)
+	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
+	examFreezeMW := middleware.ExamFreezeMiddleware(repo)
 
 	// Setup Gin
 	r := gin.Default()
@@ -86,6 +117,16 @@ func main() {
 		user.Use(controllers.AuthMiddleware(authService))
 		{
 			user.POST("/password", userCtrl.ChangePassword)
+			user.GET("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.ListStudents)
+
+			// Admin-only User Management
+			adminUsers := user.Group("/")
+			adminUsers.Use(controllers.RoleMiddleware(models.RoleAdmin))
+			{
+				adminUsers.GET("/all", userCtrl.GetAllUsers)
+				adminUsers.PUT("/:id", userCtrl.UpdateUser)
+				adminUsers.DELETE("/:id", userCtrl.DeleteUser)
+			}
 		}
 
 		// Protected Quiz Routes
@@ -93,8 +134,11 @@ func main() {
 		quiz.Use(controllers.AuthMiddleware(authService))
 		{
 			quiz.POST("/submit", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.SubmitAnswer)
+			quiz.POST("/preview", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.PreviewAnswer)
 			quiz.GET("/exams", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExams)
 			quiz.GET("/exams/:id/questions", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExamQuestions)
+			quiz.GET("/exams/:id/results", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExamResults)
+			quiz.GET("/results", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetMyResultsSummary)
 		}
 
 		// Protected Lecturer/Admin Routes
@@ -102,13 +146,44 @@ func main() {
 		staff.Use(controllers.AuthMiddleware(authService))
 		{
 			staff.POST("/lecturer/question", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.UpsertQuestion)
-			staff.POST("/lecturer/import-schema", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportSchema)
+			staff.GET("/lecturer/exams/:id/questions", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamQuestions)
+			staff.DELETE("/lecturer/questions/:id", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeleteQuestion)
+			staff.POST("/lecturer/preview", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.PreviewCorrectSQL)
+			staff.POST("/lecturer/import-schema", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportSchema)
+			staff.POST("/lecturer/students/import", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportStudents)
 			staff.GET("/lecturer/exams", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ListExaminations)
 			staff.POST("/lecturer/exams", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.CreateExamination)
+			staff.GET("/lecturer/exams/:id/submissions", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ListSubmissions)
 			staff.PUT("/lecturer/exams/:id/activate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ActivateExamination)
+			staff.PUT("/lecturer/exams/:id/deactivate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeactivateExamination)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)
+			staff.GET("/lecturer/scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetConsolidatedScores)
+			staff.GET("/lecturer/export-scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ExportScoresCSV)
 			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccount)
 			staff.POST("/users/bulk", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccountsBulk)
+		}
+
+		// Practice student routes (with exam freeze middleware)
+		practiceStudent := v1.Group("/practice")
+		practiceStudent.Use(controllers.AuthMiddleware(authService), controllers.RoleMiddleware(models.RoleStudent), examFreezeMW)
+		{
+			practiceStudent.GET("/questions", practiceCtrl.ListForStudent)
+			practiceStudent.GET("/questions/:id", practiceCtrl.GetForStudent)
+			practiceStudent.POST("/submit", practiceCtrl.Submit)
+			practiceStudent.POST("/preview", practiceCtrl.Preview)
+			practiceStudent.GET("/attempts", practiceCtrl.ListMyAttempts)
+			practiceStudent.GET("/summary", practiceCtrl.GetSummary)
+		}
+
+		// Practice lecturer/admin routes (no freeze middleware)
+		practiceLecturer := v1.Group("/lecturer/practice")
+		practiceLecturer.Use(controllers.AuthMiddleware(authService), controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer))
+		{
+			practiceLecturer.POST("/question", practiceCtrl.Upsert)
+			practiceLecturer.GET("/questions", practiceCtrl.ListForLecturer)
+			practiceLecturer.DELETE("/question/:id", practiceCtrl.Delete)
+			practiceLecturer.POST("/reset-sandbox", practiceCtrl.ResetSandbox)
+			practiceLecturer.POST("/preview", practiceCtrl.LecturerPreview)
 		}
 	}
 

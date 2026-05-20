@@ -1,0 +1,15 @@
+meta {
+  name: List Practice Questions
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/practice/questions
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}

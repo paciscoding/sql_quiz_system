@@ -1,0 +1,22 @@
+meta {
+  name: Submit Practice
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/practice/submit
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "practice_question_id": 1,
+    "sql_text": "SELECT * FROM employee"
+  }
+}

@@ -1,0 +1,24 @@
+meta {
+  name: My Results Summary
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/quiz/results
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("body.exams is an array", function() {
+    expect(Array.isArray(res.body.exams)).to.equal(true);
+  });
+}

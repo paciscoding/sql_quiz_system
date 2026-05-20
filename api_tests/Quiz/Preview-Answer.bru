@@ -1,0 +1,22 @@
+meta {
+  name: Preview Answer
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/quiz/preview
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "question_number": 1,
+    "sql_text": "SELECT * FROM employee"
+  }
+}

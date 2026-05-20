@@ -1,0 +1,27 @@
+meta {
+  name: Upsert Practice Question
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/lecturer/practice/question
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "target_table": "employee",
+    "correct_sql": "SELECT * FROM employee",
+    "question_type": "QUERY",
+    "requirement": "List all employees",
+    "points": 1.0,
+    "strict_ordering": false,
+    "strict_attrs": false
+  }
+}

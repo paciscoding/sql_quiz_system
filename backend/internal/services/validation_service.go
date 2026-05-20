@@ -1,18 +1,19 @@
 package services
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/repository"
 )
 
 type DBExecutor interface {
 	Query(ctx context.Context, schema, sql string) ([]map[string]interface{}, error)
 	Exec(ctx context.Context, schema, sql string) error
-	GetTableState(ctx context.Context, schema, tableName string) (string, error)
-	QueryStudentSQL(ctx context.Context, schema, sql string) ([]map[string]interface{}, error)
-	ExecStudentSQL(ctx context.Context, schema, sql string) error
+	Evaluate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error)
+	EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (repository.PreviewResult, error)
 }
 
 type ValidationService struct {
@@ -23,180 +24,86 @@ func NewValidationService(executor DBExecutor) *ValidationService {
 	return &ValidationService{executor: executor}
 }
 
-func (s *ValidationService) Validate(ctx context.Context, studentID string, question models.Question, studentSQL string) (models.ValidationResult, error) {
-	schema := fmt.Sprintf("student_%s", studentID)
-
-	// 1. Basic Syntax Check
+func (s *ValidationService) Validate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
 	if studentSQL == "" {
 		return models.ValidationResult{
-			Status:    "error",
+			Status:    "syntax_error",
 			Score:     0,
 			Feedback:  "SQL text cannot be empty",
 			IsCorrect: false,
 		}, nil
 	}
 
-	if question.Type == "QUERY" {
-		return s.validateQuery(ctx, schema, question, studentSQL)
+	result, err := s.executor.Evaluate(ctx, studentID, question, studentSQL, sandboxSchema)
+	if err != nil {
+		return models.ValidationResult{}, err
+	}
+
+	if result.Status == "error" {
+		result.Status = "syntax_error"
+		result.IsCorrect = false
+		result.Score = 0
+		return result, nil
+	}
+
+	var studentData []map[string]interface{}
+	if err := json.Unmarshal(result.ValidationDetails, &studentData); err != nil {
+		return models.ValidationResult{}, fmt.Errorf("failed to parse captured student data: %w", err)
+	}
+
+	return s.decideStatus(result, studentData, question), nil
+}
+
+// ValidatePreview runs the student SQL in a read-only sandbox and returns the
+// three-state status together with the result rows and metadata. Unlike Validate
+// it never persists a submission.
+func (s *ValidationService) ValidatePreview(ctx context.Context, studentID int, q models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, []map[string]interface{}, []string, int, bool, error) {
+	if studentSQL == "" {
+		return models.ValidationResult{
+			Status:   "syntax_error",
+			Feedback: "SQL text cannot be empty",
+		}, []map[string]interface{}{}, []string{}, 0, false, nil
+	}
+
+	pr, err := s.executor.EvaluatePreview(ctx, studentID, q, studentSQL, sandboxSchema)
+	if err != nil {
+		return models.ValidationResult{}, nil, nil, 0, false, err
+	}
+
+	if pr.Result.Status == "error" {
+		return models.ValidationResult{
+			Status:   "syntax_error",
+			Feedback: pr.Result.Feedback,
+		}, pr.Rows, pr.Columns, pr.RowCount, pr.Truncated, nil
+	}
+
+	finalResult := s.decideStatus(pr.Result, pr.Rows, q)
+	return finalResult, pr.Rows, pr.Columns, pr.RowCount, pr.Truncated, nil
+}
+
+func (s *ValidationService) decideStatus(execResult models.ValidationResult, studentData []map[string]interface{}, q models.Question) models.ValidationResult {
+	var teacherData []map[string]interface{}
+	if err := json.Unmarshal(q.ExpectedResult, &teacherData); err != nil {
+		// Should not happen for well-formed questions; return incorrect
+		execResult.Status = "incorrect"
+		execResult.IsCorrect = false
+		execResult.Score = 0
+		execResult.Feedback = "The result is wrong."
+		return execResult
+	}
+
+	if s.compareResults(teacherData, studentData, q.StrictMode) {
+		execResult.Status = "correct"
+		execResult.IsCorrect = true
+		execResult.Score = q.Points
+		execResult.Feedback = "Correct! Full points awarded."
 	} else {
-		return s.validateDML(ctx, schema, question, studentSQL)
+		execResult.Status = "incorrect"
+		execResult.IsCorrect = false
+		execResult.Score = 0
+		execResult.Feedback = "The result is wrong."
 	}
-}
-
-func (s *ValidationService) validateQuery(ctx context.Context, schema string, question models.Question, studentSQL string) (models.ValidationResult, error) {
-	// 1. Command Ordering Check (Optional)
-	if question.StrictMode.Ordering {
-		if !s.checkSQLOrdering(question.CorrectSQL, studentSQL) {
-			return models.ValidationResult{
-				Status:    "success",
-				Score:     question.Points * 0.5,
-				Feedback:  "Correct result, but SQL command ordering does not match requirements.",
-				IsCorrect: false,
-			}, nil
-		}
-	}
-
-	// Get teacher result
-	teacherResults, err := s.executor.Query(ctx, schema, question.CorrectSQL)
-	if err != nil {
-		return models.ValidationResult{}, fmt.Errorf("teacher query failed: %w", err)
-	}
-
-	// Get student result
-	studentResults, err := s.executor.QueryStudentSQL(ctx, studentSQL)
-	if err != nil {
-		return models.ValidationResult{
-			Status:    "success",
-			Score:     0,
-			Feedback:  fmt.Sprintf("SQL Error: %v", err),
-			IsCorrect: false,
-		}, nil
-	}
-
-	if s.compareResults(teacherResults, studentResults, question.StrictMode) {
-		return models.ValidationResult{
-			Status:    "success",
-			Score:     question.Points,
-			Feedback:  "Correct!",
-			IsCorrect: true,
-		}, nil
-	}
-
-	return models.ValidationResult{
-		Status:    "success",
-		Score:     0,
-		Feedback:  "Result sets do not match.",
-		IsCorrect: false,
-	}, nil
-}
-
-func (s *ValidationService) checkSQLOrdering(teacherSQL, studentSQL string) bool {
-	keywords := []string{"SELECT", "FROM", "WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT"}
-	extractSequence := func(sql string) []string {
-		upper := strings.ToUpper(sql)
-		var seq []string
-		for _, kw := range keywords {
-			if strings.Contains(upper, kw) {
-				seq = append(seq, kw)
-			}
-		}
-		return seq
-	}
-	tSeq, sSeq := extractSequence(teacherSQL), extractSequence(studentSQL)
-	if len(tSeq) != len(sSeq) {
-		return false
-	}
-	for i := range tSeq {
-		if tSeq[i] != sSeq[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func (s *ValidationService) validateDML(ctx context.Context, schema string, question models.Question, studentSQL string) (models.ValidationResult, error) {
-	// Full implementation of Backup -> Teacher -> Capture -> Restore -> Student -> Compare
-	targetTable := question.TargetTable
-	backupTable := targetTable + "_backup"
-
-	// 1. Backup the main table
-	s.executor.Exec(ctx, schema, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", backupTable))
-	if err := s.executor.Exec(ctx, schema, fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", backupTable, targetTable)); err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed to create backup structure: %w", err)
-	}
-	if err := s.executor.Exec(ctx, schema, fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", backupTable, targetTable)); err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed to backup data: %w", err)
-	}
-	defer s.executor.Exec(ctx, schema, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", backupTable))
-
-	// 2. Execute Teacher's SQL
-	if err := s.executor.Exec(ctx, schema, question.CorrectSQL); err != nil {
-		return models.ValidationResult{}, fmt.Errorf("teacher SQL execution failed: %w", err)
-	}
-
-	// 3. Get Teacher's Result State
-	teacherResults, err := s.executor.Query(ctx, schema, fmt.Sprintf("SELECT * FROM %s", targetTable))
-	if err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed to get teacher results: %w", err)
-	}
-
-	// 4. Restore for student check
-	if err := s.restoreTable(ctx, schema, targetTable, backupTable); err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed to restore table for student: %w", err)
-	}
-
-	// 5. Execute Student SQL
-	if err := s.executor.ExecStudentSQL(ctx, schema, studentSQL); err != nil {
-		return models.ValidationResult{
-			Status:    "success",
-			Score:     0,
-			Feedback:  fmt.Sprintf("SQL Error: %v", err),
-			IsCorrect: false,
-		}, nil
-	}
-
-	// 6. Get Student's Result State
-	studentResults, err := s.executor.Query(ctx, schema, fmt.Sprintf("SELECT * FROM %s", targetTable))
-	if err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed to get student results: %w", err)
-	}
-
-	// 7. Check if student query was idempotent (compare with backup)
-	backupResults, err := s.executor.Query(ctx, schema, fmt.Sprintf("SELECT * FROM %s", backupTable))
-	if err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed to get backup results: %w", err)
-	}
-
-	if s.compareResults(backupResults, studentResults, question.StrictMode) {
-		return models.ValidationResult{
-			Status:    "success",
-			Score:     0,
-			Feedback:  "No changes detected (Idempotent query).",
-			IsCorrect: false,
-		}, nil
-	}
-
-	// 8. Compare
-	if s.compareResults(teacherResults, studentResults, question.StrictMode) {
-		return models.ValidationResult{
-			Status:    "success",
-			Score:     question.Points,
-			Feedback:  "Correct!",
-			IsCorrect: true,
-		}, nil
-	}
-
-	// 9. Reset (Restore back to original)
-	if err := s.restoreTable(ctx, schema, targetTable, backupTable); err != nil {
-		return models.ValidationResult{}, fmt.Errorf("failed final restore: %w", err)
-	}
-
-	return models.ValidationResult{
-		Status:    "success",
-		Score:     0,
-		Feedback:  "The state changes do not match the expected result.",
-		IsCorrect: false,
-	}, nil
+	return execResult
 }
 
 func (s *ValidationService) compareResults(teacher, student []map[string]interface{}, mode models.StrictMode) bool {
@@ -204,7 +111,7 @@ func (s *ValidationService) compareResults(teacher, student []map[string]interfa
 		return false
 	}
 
-	if mode.RecordOrder {
+	if mode.Ordering {
 		// Strict order: compare index by index
 		for i := range teacher {
 			if !s.compareRows(teacher[i], student[i], mode) {

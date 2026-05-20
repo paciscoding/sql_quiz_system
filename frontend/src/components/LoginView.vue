@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 
-const emit = defineEmits(['login-success'])
-
+const router = useRouter()
 const username = ref('')
 const password = ref('')
 const loading = ref(false)
@@ -28,7 +28,7 @@ const handleLogin = async () => {
     localStorage.setItem('sql_quiz_token', data.token)
     localStorage.setItem('sql_quiz_user', JSON.stringify(data.user))
     
-    emit('login-success', data)
+    router.push('/dashboard')
   } catch (err: any) {
     error.value = err.message
   } finally {
@@ -38,53 +38,105 @@ const handleLogin = async () => {
 </script>
 
 <template>
-  <div class="login-card">
-    <h2>Login to SQL Quiz</h2>
-    <form @submit.prevent="handleLogin">
-      <div class="input-group">
-        <label>Username</label>
-        <input v-model="username" type="text" required placeholder="Enter username" />
-      </div>
-      <div class="input-group">
-        <label>Password</label>
-        <input v-model="password" type="password" required placeholder="Enter password" />
-      </div>
-      <button type="submit" :disabled="loading" class="primary-btn">
-        {{ loading ? 'Logging in...' : 'Login' }}
-      </button>
-      <div v-if="error" class="error-box">{{ error }}</div>
-    </form>
-    <div class="hint">Default Admin: admin / admin123</div>
+  <div class="login-shell">
+    <div class="card login-card">
+      <h2 style="margin: 0 0 var(--space-1) 0;">SQL Quiz System</h2>
+      <p class="muted" style="margin: 0 0 var(--space-4) 0;">Sign in to continue</p>
+
+      <form @submit.prevent="handleLogin">
+        <div class="field">
+          <label>Username</label>
+          <input class="input" v-model="username" autocomplete="username" />
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input class="input" v-model="password" type="password" autocomplete="current-password" />
+        </div>
+
+        <button type="submit" class="btn btn-primary" style="width: 100%;" :disabled="loading">
+          {{ loading ? 'Signing in...' : 'Login' }}
+        </button>
+
+        <p v-if="error" style="margin-top: var(--space-3); text-align: center;">
+          <span class="badge badge-danger">{{ error }}</span>
+        </p>
+
+        <p class="muted" style="margin-top: var(--space-4); text-align: center; font-size: 0.8rem;">
+          Default admin: admin / admin123
+        </p>
+      </form>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.login-shell {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: calc(100vh - 80px);
+  padding: var(--space-4);
+  background: var(--color-surface);
+}
 .login-card {
+  width: 100%;
   max-width: 400px;
-  margin: 4rem auto;
-  padding: 2rem;
-  background: white;
-  border-radius: 8px;
-  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+  background: var(--color-surface);
+  border: 2px solid var(--color-border);
+  padding: var(--space-6);
 }
-
-h2 { text-align: center; margin-bottom: 2rem; color: #2d3748; }
-
-.input-group { margin-bottom: 1.5rem; display: flex; flex-direction: column; }
-
-label { font-weight: bold; margin-bottom: 0.5rem; color: #4a5568; }
-
-input { padding: 0.8rem; border: 1px solid #cbd5e0; border-radius: 4px; }
-
-.primary-btn {
-  width: 100%; padding: 1rem; background: #41b883; color: white;
-  border: none; border-radius: 4px; font-weight: bold; cursor: pointer;
+.login-card h2 {
+  color: var(--color-text);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  font-size: 1.8rem;
+  line-height: 1.2;
+  margin-bottom: var(--space-1);
 }
-
-.error-box {
-  margin-top: 1rem; padding: 0.8rem; background: #fff5f5; color: #c53030;
-  border-radius: 4px; text-align: center;
+.muted {
+  color: var(--color-text-muted);
+  font-weight: 500;
+  font-size: 0.9rem;
 }
-
-.hint { margin-top: 1.5rem; font-size: 0.8rem; color: #718096; text-align: center; }
+.field {
+  margin-bottom: var(--space-4);
+}
+.label {
+  display: block;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  color: var(--color-text);
+}
+.input {
+  width: 100%;
+  padding: 0.6rem;
+  border: 2px solid var(--color-border);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 1rem;
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.btn-primary {
+  background: var(--color-primary);
+  color: var(--color-surface);
+  border: 2px solid var(--color-border);
+  font-weight: 700;
+  padding: var(--space-3);
+  cursor: pointer;
+  transition: none;
+}
+.btn-primary:hover:not(:disabled) {
+  background: #333333;
+}
+.btn-primary:active {
+  transform: translateY(1px);
+}
+.badge-danger {
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+  border: 1px solid var(--color-danger);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 700;
+}
 </style>

@@ -1,0 +1,28 @@
+meta {
+  name: Import Students
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/lecturer/students/import
+  body: multipart-form
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:multipart-form {
+  file: @file(./students.csv)
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("created count is greater than 0", function() {
+    expect(res.body.created).to.be.greaterThan(0);
+  });
+}

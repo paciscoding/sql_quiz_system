@@ -70,6 +70,22 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (mod
 	}, nil
 }
 
+func (s *AuthService) ListUsersByRole(ctx context.Context, role models.Role) ([]models.User, error) {
+	return s.repo.GetAllUsersByRole(ctx, role)
+}
+
+func (s *AuthService) GetAllUsers(ctx context.Context) ([]models.User, error) {
+	return s.repo.GetAllUsers(ctx)
+}
+
+func (s *AuthService) UpdateUser(ctx context.Context, u models.User) error {
+	return s.repo.UpdateUser(ctx, u)
+}
+
+func (s *AuthService) DeleteUser(ctx context.Context, id int) error {
+	return s.repo.DeleteUser(ctx, id)
+}
+
 func (s *AuthService) CreateAccount(ctx context.Context, creator models.User, req models.CreateUserRequest) (int, error) {
 	// Role Hierarchical Validation
 	if creator.Role == models.RoleLecturer && req.Role != models.RoleStudent {

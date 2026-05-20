@@ -1,0 +1,22 @@
+meta {
+  name: Preview Practice
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/practice/preview
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "practice_question_id": 1,
+    "sql_text": "SELECT * FROM employee"
+  }
+}

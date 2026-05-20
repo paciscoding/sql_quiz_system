@@ -1,0 +1,23 @@
+meta {
+  name: Lecturer Preview Practice
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/lecturer/practice/preview
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "type": "QUERY",
+    "target_table": "employee",
+    "correct_sql": "SELECT * FROM employee"
+  }
+}
