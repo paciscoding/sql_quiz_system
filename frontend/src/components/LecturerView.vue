@@ -1,13 +1,33 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, computed } from 'vue'
 import BulkImportStudents from './BulkImportStudents.vue'
+import StudentMultiSelect from './StudentMultiSelect.vue'
 import SqlEditor from './SqlEditor.vue'
+import { useSingleFlight } from '../composables/useSingleFlight'
+import { useConfirm } from '../services/confirm_service'
 import { useNotifications } from '../services/notification_service'
+import { handleApiError, toApiError } from '../services/error_handler'
+import Spinner from './Spinner.vue'
+import EmptyState from './EmptyState.vue'
+import { useFormValidation, required } from '../composables/useFormValidation'
+import FieldError from './FieldError.vue'
+import Skeleton from './Skeleton.vue'
+import { useKeyboardShortcut } from '../composables/useKeyboardShortcut'
+import { formatSql } from '../utils/format_sql'
+import { UI_COPY } from '../constants/ui_copy'
+import { setExamIntroduction } from '../services/exam'
+import IntroImagesEditor from './IntroImagesEditor.vue'
 
 interface Examination {
   id: number
   title: string
   is_active: boolean
+  effective_state: string
+  scheduled_start_at: string | null
+  scheduled_end_at: string | null
+  activated_at: string | null
+  archived_at: string | null
+  introduction: string
 }
 
 interface Student {
@@ -22,6 +42,7 @@ interface CaptureStatus {
 }
 
 const { notify } = useNotifications()
+const { confirm } = useConfirm()
 
 const blankQuestion = () => ({
   id: null as number | null,
@@ -38,8 +59,51 @@ const blankQuestion = () => ({
 })
 
 const question = ref(blankQuestion())
+
+// Form validation for question fields (TODO-038)
+const questionValidation = useFormValidation({
+  points: { rules: [required('Points is required')], initial: 10 },
+  requirement: { rules: [required('Requirement is required')], initial: '' },
+  correct_sql: { rules: [required('Correct SQL is required')], initial: '' },
+})
+
+// Keep validation values in sync with question reactive object
+watch(() => question.value.points, (v) => { questionValidation.values.points = v })
+watch(() => question.value.requirement, (v) => { questionValidation.values.requirement = v })
+watch(() => question.value.correct_sql, (v) => { questionValidation.values.correct_sql = v })
+
 const lastCapture = ref<CaptureStatus>({ status: '', error: '', capturedAt: null })
 const examQuestions = ref<any[]>([])
+const sortKey = ref<'id'|'type'|'points'|null>(null)
+const sortDir = ref<'asc'|'desc'>('asc')
+const filterText = ref('')
+
+const displayedQuestions = computed(() => {
+  let list = examQuestions.value.slice()
+  if (filterText.value.trim()) {
+    const q = filterText.value.toLowerCase()
+    list = list.filter(x => (x.requirement || '').toLowerCase().includes(q))
+  }
+  if (sortKey.value) {
+    const k = sortKey.value
+    const dir = sortDir.value === 'asc' ? 1 : -1
+    list.sort((a, b) => {
+      const av = k === 'type' ? (a.question_type || '') : (a[k] ?? 0)
+      const bv = k === 'type' ? (b.question_type || '') : (b[k] ?? 0)
+      return av < bv ? -dir : av > bv ? dir : 0
+    })
+  }
+  return list
+})
+
+function toggleSort(key: 'id'|'type'|'points') {
+  if (sortKey.value === key) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortKey.value = key
+    sortDir.value = 'asc'
+  }
+}
 
 const fetchExamQuestions = async () => {
   if (question.value.exam_id == null) {
@@ -54,8 +118,8 @@ const fetchExamQuestions = async () => {
     if (response.ok) {
       examQuestions.value = await response.json()
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load exam questions' })
   }
 }
 
@@ -67,8 +131,9 @@ watch(() => question.value.exam_id, (newId) => {
   }
 })
 
-const deleteQuestion = async (id: number) => {
-  if (!confirm('Are you sure you want to delete this question?')) return
+const { inFlight: deleteQuestionLoading, run: deleteQuestion } = useSingleFlight(async (id: number) => {
+  const ok = await confirm({ title: 'Delete this question?', body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
+  if (!ok) return
   const token = localStorage.getItem('sql_quiz_token')
   try {
     const response = await fetch(`/api/v1/lecturer/questions/${id}`, {
@@ -82,12 +147,20 @@ const deleteQuestion = async (id: number) => {
       const errData = await response.json()
       throw new Error(errData.error || 'Failed to delete')
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to delete question' })
   }
-}
+})
+
+const isEditMode = ref(false)
+
+const nextFreeId = computed(() => {
+  if (!examQuestions.value || examQuestions.value.length === 0) return 1
+  return Math.max(...examQuestions.value.map((q: any) => q.id)) + 1
+})
 
 const editQuestion = (q: any) => {
+  isEditMode.value = true
   question.value = {
     id: q.id,
     exam_id: q.exam_id,
@@ -110,6 +183,29 @@ const editQuestion = (q: any) => {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
+function onQuestionDropdownChange(event: Event) {
+  const val = (event.target as HTMLSelectElement).value
+  if (val === '') {
+    // Create new question
+    isEditMode.value = false
+    question.value = {
+      id: nextFreeId.value,
+      exam_id: question.value.exam_id,
+      target_table: '',
+      correct_sql: '',
+      requirement: '',
+      type: 'QUERY',
+      points: 10,
+      strict_mode: { ordering: false, attributes: false }
+    }
+    lastCapture.value = { status: '', error: '', capturedAt: null }
+    previewResult.value = { status: '', rows: [], columns: [], error: '' }
+  } else {
+    const q = examQuestions.value.find((q: any) => q.id === Number(val))
+    if (q) editQuestion(q)
+  }
+}
+
 interface PreviewResult {
   status: 'ok' | 'error' | ''
   rows: Record<string, any>[]
@@ -118,6 +214,9 @@ interface PreviewResult {
 }
 const previewResult = ref<PreviewResult>({ status: '', rows: [], columns: [], error: '' })
 const previewLoading = ref(false)
+const questionFormRef = ref<HTMLElement | null>(null)
+
+useKeyboardShortcut({ combo: 'Ctrl+Enter', whenTyping: true, scope: questionFormRef, handler: () => previewCorrectSQL() })
 
 const previewCorrectSQL = async () => {
   if (!question.value.correct_sql) {
@@ -157,9 +256,9 @@ const previewCorrectSQL = async () => {
         error: ''
       }
     }
-  } catch (err: any) {
-    previewResult.value = { status: 'error', rows: [], columns: [], error: err.message }
-    notify(err.message, 'error')
+  } catch (err) {
+    previewResult.value = { status: 'error', rows: [], columns: [], error: (err as Error).message || 'Preview failed' }
+    handleApiError(err, { fallback: 'Preview failed' })
   } finally {
     previewLoading.value = false
   }
@@ -176,11 +275,71 @@ const selectedExamId = ref<number | null>(null)
 
 const activeExam = computed(() => exams.value.find(e => e.id === selectedExamId.value))
 
+// Exam description editor state
+const examIntroductionText = ref('')
+const examIntroSaving = ref(false)
+
+// Pre-populate the description textarea when the selected exam changes.
+watch(selectedExamId, (id) => {
+  if (id !== null) {
+    const exam = exams.value.find(e => e.id === id)
+    examIntroductionText.value = exam?.introduction ?? ''
+  } else {
+    examIntroductionText.value = ''
+  }
+})
+
+const saveExamIntroduction = async () => {
+  if (!selectedExamId.value) return
+  examIntroSaving.value = true
+  try {
+    await setExamIntroduction(selectedExamId.value, examIntroductionText.value)
+    notify('Exam description saved', 'success')
+    // Refresh so the updated intro appears if exams are re-fetched
+    await fetchExams()
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to save exam description' })
+  } finally {
+    examIntroSaving.value = false
+  }
+}
+
 const studentsList = ref<Student[]>([])
 const selectedStudentIds = ref<number[]>([])
 
-const loading = ref(false)
-const error = ref('')
+// --- Autosave for question requirement (TODO-059) ---
+const requirementDraftKey = computed(() =>
+  'sql_quiz_draft.lecturer.questionRequirement.exam-' + (question.value.exam_id ?? 'none')
+)
+const showDraftBanner = ref(false)
+
+let requirementDebounceTimer: number | null = null
+watch(() => question.value.requirement, (val) => {
+  if (requirementDebounceTimer != null) window.clearTimeout(requirementDebounceTimer)
+  requirementDebounceTimer = window.setTimeout(() => {
+    const key = requirementDraftKey.value
+    if (val && val.length >= 10) {
+      try { localStorage.setItem(key, val) } catch { /* quota */ }
+    } else {
+      localStorage.removeItem(key)
+    }
+    requirementDebounceTimer = null
+  }, 600)
+})
+
+watch(requirementDraftKey, (key) => {
+  showDraftBanner.value = !!localStorage.getItem(key)
+}, { immediate: true })
+
+const acceptDraft = () => {
+  const draft = localStorage.getItem(requirementDraftKey.value)
+  if (draft) question.value.requirement = draft
+  showDraftBanner.value = false
+}
+const dismissDraft = () => {
+  localStorage.removeItem(requirementDraftKey.value)
+  showDraftBanner.value = false
+}
 
 // Update question.exam_id and fetch questions whenever the selected exam changes.
 watch(selectedExamId, (id) => {
@@ -202,8 +361,8 @@ const fetchStudents = async () => {
     if (response.ok) {
       studentsList.value = (await response.json()) || []
     }
-  } catch (err: any) {
-    error.value = err.message
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load students' })
   }
 }
 
@@ -216,15 +375,14 @@ const fetchExams = async () => {
     if (response.ok) {
       exams.value = (await response.json()) || []
     } else {
-      const errData = await response.json()
-      error.value = errData.error || 'Failed to fetch exams'
+      throw await toApiError(response, 'Failed to fetch exams')
     }
-  } catch (err: any) {
-    error.value = err.message
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to fetch exams' })
   }
 }
 
-const createExam = async () => {
+const { inFlight: createExamLoading, run: createExam } = useSingleFlight(async () => {
   if (!newExamTitle.value) return
   const token = localStorage.getItem('sql_quiz_token')
   try {
@@ -241,15 +399,14 @@ const createExam = async () => {
       fetchExams()
       notify('Exam created successfully', 'success')
     } else {
-      const errData = await response.json()
-      notify(errData.error || 'Failed to create exam', 'error')
+      throw await toApiError(response, 'Failed to create exam')
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to create exam' })
   }
-}
+})
 
-const toggleExamActive = async (id: number, active: boolean) => {
+const { inFlight: toggleExamActiveLoading, run: toggleExamActive } = useSingleFlight(async (id: number, active: boolean) => {
   const token = localStorage.getItem('sql_quiz_token')
   // Phase 3 has its own dedicated endpoint that drops the per-exam DML sandbox
   // exactly once. Phase 1 activation goes through /activate with {active:true}.
@@ -273,14 +430,160 @@ const toggleExamActive = async (id: number, active: boolean) => {
       notify(`Exam ${active ? 'activated' : 'deactivated'}`, 'success')
     } else {
       const errData = await response.json()
-      notify(errData.error || 'Failed to update exam status', 'error')
+      handleApiError(new Error(errData.error || 'Failed to update exam status'), { fallback: 'Failed to update exam status' })
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to update exam status' })
+  }
+})
+
+// Per-exam activation mode state (keyed by exam id)
+const examActivationMode = ref<Record<number, 'instant' | 'scheduled'>>({})
+const examScheduledStart = ref<Record<number, string>>({})
+const examScheduledEnd = ref<Record<number, string>>({})
+const examDeactivateEndAt = ref<Record<number, string>>({})
+const examActionLoading = ref<Record<number, boolean>>({})
+
+function toISOString(localStr: string): string {
+  if (!localStr) return ''
+  return new Date(localStr).toISOString()
+}
+
+function effectiveStateBadgeClass(state: string): string {
+  switch (state) {
+    case 'active':    return 'success-btn'
+    case 'scheduled': return 'badge-info'
+    case 'ended':     return 'fail-btn'
+    default:          return ''
   }
 }
 
-const assignStudents = async () => {
+async function activateExam(id: number) {
+  const token = localStorage.getItem('sql_quiz_token')
+  const mode = examActivationMode.value[id] || 'instant'
+  let body: any = { active: true, mode: 'instant' }
+  if (mode === 'scheduled') {
+    const startAt = examScheduledStart.value[id]
+    if (!startAt) { notify('Please set a start time', 'error'); return }
+    body = {
+      active: true,
+      mode: 'scheduled',
+      scheduled_start_at: toISOString(startAt),
+      scheduled_end_at: examScheduledEnd.value[id] ? toISOString(examScheduledEnd.value[id]) : undefined
+    }
+  }
+  examActionLoading.value[id] = true
+  try {
+    const resp = await fetch(`/api/v1/lecturer/exams/${id}/activate`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(body)
+    })
+    if (resp.ok) {
+      notify('Exam activated', 'success')
+      fetchExams()
+    } else {
+      const e = await resp.json()
+      handleApiError(new Error(e.error || 'Failed to activate'), { fallback: 'Failed to activate exam' })
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to activate exam' })
+  } finally {
+    examActionLoading.value[id] = false
+  }
+}
+
+async function deactivateExamInstant(id: number) {
+  const ok = await confirm({
+    title: 'Deactivate exam?',
+    body: 'This will drop the exam sandbox immediately. Students cannot submit after this.',
+    confirmLabel: 'Deactivate',
+    danger: true
+  })
+  if (!ok) return
+  const token = localStorage.getItem('sql_quiz_token')
+  examActionLoading.value[id] = true
+  try {
+    const resp = await fetch(`/api/v1/lecturer/exams/${id}/deactivate`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ mode: 'instant' })
+    })
+    if (resp.ok) {
+      notify('Exam deactivated', 'success')
+      fetchExams()
+    } else {
+      const e = await resp.json()
+      handleApiError(new Error(e.error || 'Failed to deactivate'), { fallback: 'Failed to deactivate exam' })
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to deactivate exam' })
+  } finally {
+    examActionLoading.value[id] = false
+  }
+}
+
+async function deactivateExamScheduled(id: number) {
+  const endAt = examDeactivateEndAt.value[id]
+  if (!endAt) { notify('Please set an end time', 'error'); return }
+  const token = localStorage.getItem('sql_quiz_token')
+  examActionLoading.value[id] = true
+  try {
+    const resp = await fetch(`/api/v1/lecturer/exams/${id}/deactivate`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ mode: 'scheduled', scheduled_end_at: toISOString(endAt) })
+    })
+    if (resp.ok) {
+      notify('Exam end time set', 'success')
+      fetchExams()
+    } else {
+      const e = await resp.json()
+      handleApiError(new Error(e.error || 'Failed to set end time'), { fallback: 'Failed to set end time' })
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to set end time' })
+  } finally {
+    examActionLoading.value[id] = false
+  }
+}
+
+interface RosterStudent {
+  student_id: number
+  username: string
+  student_number: string
+  first_name: string
+  last_name: string
+  sec_lec: string
+  sec_lab: string
+  assigned_at: string
+}
+
+const rosterStudents = ref<RosterStudent[]>([])
+
+const fetchRoster = async () => {
+  if (!selectedExamId.value) return
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const resp = await fetch(`/api/v1/lecturer/exams/${selectedExamId.value}/students`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (resp.ok) {
+      const data = await resp.json()
+      rosterStudents.value = data.students || []
+    }
+  } catch (err) {
+    // silently ignore
+  }
+}
+
+// Fetch roster when selected exam changes
+watch(selectedExamId, (id) => {
+  rosterStudents.value = []
+  if (id) fetchRoster()
+})
+
+const { inFlight: assignStudentsLoading, run: assignStudents } = useSingleFlight(async () => {
   if (!selectedExamId.value || selectedStudentIds.value.length === 0) return
   const token = localStorage.getItem('sql_quiz_token')
   try {
@@ -293,27 +596,73 @@ const assignStudents = async () => {
       body: JSON.stringify({ student_ids: selectedStudentIds.value }),
     })
     if (response.ok) {
-      notify('Students assigned successfully', 'success')
+      notify('Students enrolled successfully', 'success')
       selectedStudentIds.value = []
+      fetchRoster()
     } else {
       const errData = await response.json()
-      notify(errData.error || 'Failed to assign students', 'error')
+      handleApiError(new Error(errData.error || 'Failed to enroll students'), { fallback: 'Failed to enroll students' })
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to enroll students' })
+  }
+})
+
+async function removeStudentFromRoster(studentId: number, studentName: string) {
+  const ok = await confirm({
+    title: 'Remove from roster?',
+    body: studentName,
+    confirmLabel: 'Remove',
+    danger: true
+  })
+  if (!ok) return
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const resp = await fetch(`/api/v1/lecturer/exams/${selectedExamId.value}/students/${studentId}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (resp.ok) {
+      notify('Student removed from roster', 'success')
+      fetchRoster()
+    } else {
+      const e = await resp.json()
+      handleApiError(new Error(e.error || 'Failed to remove student'), { fallback: 'Failed to remove student' })
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to remove student' })
   }
 }
 
-const saveQuestion = async () => {
-  if (question.value.id == null || question.value.id <= 0) {
-    notify('Please enter a valid Question ID', 'error')
-    return
-  }
+const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(async () => {
   if (question.value.exam_id == null) {
     notify('Please pick an Exam ID before saving a question', 'error')
     return
   }
-  loading.value = true
+  // In create-new mode the ID is auto-assigned (the dropdown offers only
+  // existing questions or "create new"), so resolve it here rather than relying
+  // on the dropdown's @change having fired. Edit mode keeps the existing ID.
+  if (!isEditMode.value) {
+    question.value.id = nextFreeId.value
+  }
+  if (question.value.id == null || question.value.id <= 0) {
+    notify('Please enter a valid Question ID', 'error')
+    return
+  }
+  questionValidation.markTouched('correct_sql')
+  if (!questionValidation.validateAll()) return
+
+  // Warn before overwriting an existing question when in create-new mode
+  if (!isEditMode.value && examQuestions.value.some((q: any) => q.id === question.value.id)) {
+    const ok = await confirm({
+      title: 'Overwrite existing question?',
+      body: `Question #${question.value.id} already exists and will be overwritten.`,
+      confirmLabel: 'Overwrite',
+      danger: true
+    })
+    if (!ok) return
+  }
+
   const token = localStorage.getItem('sql_quiz_token')
 
   try {
@@ -348,25 +697,31 @@ const saveQuestion = async () => {
     }
 
     fetchExamQuestions()
+    localStorage.removeItem(requirementDraftKey.value)
 
     // Reset for the next question to avoid silent ON CONFLICT overwrites.
     const lastExamId = question.value.exam_id
     question.value = blankQuestion()
     question.value.exam_id = lastExamId
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
-  } catch (err: any) {
-    notify(err.message, 'error')
-  } finally {
-    loading.value = false
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to save question' })
   }
-}
+})
 
 const importSQL = ref('')
-const importLoading = ref(false)
 
-const handleImportSchema = async () => {
+const { inFlight: importSchemaLoading, run: handleImportSchema } = useSingleFlight(async () => {
   if (!importSQL.value) return
-  importLoading.value = true
+
+  // Confirm dangerous destructive action before posting
+  const ok = await confirm({
+    title: 'Import schema — destructive action',
+    body: 'This will drop and recreate all public tables and data. This cannot be undone. Proceed?',
+    confirmLabel: 'Import',
+    danger: true
+  })
+  if (!ok) return
 
   const token = localStorage.getItem('sql_quiz_token')
 
@@ -388,12 +743,10 @@ const handleImportSchema = async () => {
     const data = await response.json()
     notify(data.message, 'success')
     importSQL.value = ''
-  } catch (err: any) {
-    notify(err.message, 'error')
-  } finally {
-    importLoading.value = false
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to import schema' })
   }
-}
+})
 
 interface ConsolidatedScore {
   student_id: number
@@ -421,12 +774,31 @@ const fetchScores = async () => {
     if (response.ok) {
       consolidatedScores.value = await response.json()
     } else {
-      notify('Failed to fetch scores', 'error')
+      handleApiError(new Error('Failed to fetch scores'), { fallback: 'Failed to fetch scores' })
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to fetch scores' })
   } finally {
     loadingScores.value = false
+  }
+  // Also fetch per-exam max scores for the denominators
+  fetchExamMaxScores()
+}
+
+const examMaxScores = ref<Record<string, number>>({})
+
+const fetchExamMaxScores = async () => {
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const resp = await fetch('/api/v1/lecturer/exams/max-scores', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (resp.ok) {
+      const data = await resp.json()
+      examMaxScores.value = data.max_scores || {}
+    }
+  } catch (err) {
+    // Non-fatal: just display '?' for max
   }
 }
 
@@ -456,11 +828,16 @@ watch(activeTab, (v) => {
 
 <template>
   <div>
+    <div class="page-header">
+      <h1>Examination Authoring</h1>
+      <p class="page-subtitle">Manage schemas, author questions, schedule exams, and review consolidated student results.</p>
+    </div>
+
     <div class="tab-bar">
       <button :class="{ 'tab-active': activeTab === 'schema' }" @click="activeTab = 'schema'">Schema</button>
       <button :class="{ 'tab-active': activeTab === 'questions' }" @click="activeTab = 'questions'">Questions</button>
       <button :class="{ 'tab-active': activeTab === 'exams' }" @click="activeTab = 'exams'">Exams</button>
-      <button :class="{ 'tab-active': activeTab === 'assignments' }" @click="activeTab = 'assignments'">Assignments</button>
+      <button :class="{ 'tab-active': activeTab === 'assignments' }" @click="activeTab = 'assignments'">{{ UI_COPY.EXAM_ROSTER }}</button>
       <button :class="{ 'tab-active': activeTab === 'results' }" @click="activeTab = 'results'">Results</button>
     </div>
 
@@ -468,8 +845,8 @@ watch(activeTab, (v) => {
       <h2>Initialize Exam Database</h2>
       <p class="desc">Paste the full SQL schema script (e.g. company.sql) to set up the base tables and data.</p>
       <SqlEditor v-model="importSQL" height="300px" style="margin-bottom: 1rem;" />
-      <button @click="handleImportSchema" :disabled="importLoading || !importSQL" class="secondary-btn">
-        {{ importLoading ? 'Importing...' : 'Import Schema & Data' }}
+      <button @click="handleImportSchema" :disabled="importSchemaLoading || !importSQL" class="secondary-btn">
+<Spinner v-if="importSchemaLoading" size="sm" inline />{{ importSchemaLoading ? 'Importing' : 'Import Schema & Data' }}
       </button>
     </div>
 
@@ -496,21 +873,28 @@ watch(activeTab, (v) => {
             @click="toggleExamActive(activeExam.id, !activeExam.is_active)" 
             :class="activeExam.is_active ? 'fail-btn' : 'success-btn'"
             class="toggle-btn"
+            :disabled="toggleExamActiveLoading"
           >
-            {{ activeExam.is_active ? 'Deactivate Exam' : 'Activate Exam' }}
+            {{ activeExam.is_active ? UI_COPY.DEACTIVATE_EXAM : UI_COPY.ACTIVATE_EXAM }}
           </button>
         </div>
       </div>
 
-      <div v-if="!selectedExamId" class="empty-state">
-        <p>Please select an exam from the dropdown above to start authoring questions.</p>
-      </div>
+      <EmptyState v-if="!selectedExamId" title="No exam selected" body="Select an exam from the dropdown above to start authoring questions." />
 
       <template v-else>
+        <div ref="questionFormRef">
         <div class="form-grid">
           <div class="input-group">
             <label>Question ID:</label>
-            <input type="number" v-model.number="question.id" min="1" />
+            <select @change="onQuestionDropdownChange" :value="isEditMode ? question.id : ''" >
+              <option value="">Create new question (ID: {{ nextFreeId }})</option>
+              <option v-for="q in examQuestions" :key="q.id" :value="q.id">
+                Q{{ q.id }} — {{ (q.requirement || '').slice(0, 50) }}
+              </option>
+            </select>
+            <span v-if="isEditMode" class="badge badge-info" style="margin-top: var(--space-1); font-size: 0.75rem;">Editing #{{ question.id }}</span>
+            <span v-else class="muted" style="font-size: 0.75rem; margin-top: var(--space-1);">New question (ID will be {{ nextFreeId }})</span>
           </div>
 
           <div class="input-group">
@@ -533,22 +917,45 @@ watch(activeTab, (v) => {
 
           <div class="input-group">
             <label>Points:</label>
-            <input type="number" v-model.number="question.points" />
+            <input
+              type="number"
+              v-model.number="question.points"
+              :aria-invalid="questionValidation.touched.points && !!questionValidation.errors.points"
+              :aria-describedby="'points-error'"
+              @blur="questionValidation.markTouched('points')"
+            />
+            <FieldError id="points-error" :message="questionValidation.touched.points ? questionValidation.errors.points : ''" />
           </div>
         </div>
 
+        <div v-if="showDraftBanner" class="draft-banner">
+          A draft from your previous session is available.
+          <button type="button" class="btn btn-sm" @click="acceptDraft">Restore</button>
+          <button type="button" class="btn btn-sm" @click="dismissDraft">Discard</button>
+        </div>
         <div class="input-group full-width">
           <label>Question Requirement:</label>
           <textarea
             v-model="question.requirement"
             rows="3"
             placeholder="Describe what the student should do"
+            :aria-invalid="questionValidation.touched.requirement && !!questionValidation.errors.requirement"
+            aria-describedby="err-requirement"
+            @blur="questionValidation.markTouched('requirement')"
           ></textarea>
+          <FieldError :message="questionValidation.touched.requirement ? questionValidation.errors.requirement : ''" id="err-requirement" />
         </div>
 
         <div class="input-group full-width">
           <label>Correct SQL:</label>
           <SqlEditor v-model="question.correct_sql" height="200px" />
+          <FieldError id="correct-sql-error" :message="questionValidation.touched.correct_sql ? questionValidation.errors.correct_sql : ''" />
+          <button
+            @click="question.correct_sql = formatSql(question.correct_sql)"
+            :disabled="!question.correct_sql"
+            class="secondary-btn"
+            style="margin-top: 0.5rem; width: auto; padding: 0.5rem 1rem; margin-right: 0.5rem;"
+          >Format SQL</button>
           <button
             @click="previewCorrectSQL"
             :disabled="previewLoading || !question.correct_sql"
@@ -564,7 +971,7 @@ watch(activeTab, (v) => {
           <strong v-else>Preview failed</strong>
           <div v-if="previewResult.status === 'error'" class="preview-error">{{ previewResult.error }}</div>
           <div v-else-if="previewResult.rows.length === 0" class="preview-empty">(no rows returned)</div>
-          <div v-else class="preview-table-wrap">
+          <div v-else class="preview-table-wrap sticky-table-head">
             <table class="preview-table">
               <thead>
                 <tr><th v-for="c in previewResult.columns" :key="c">{{ c }}</th></tr>
@@ -586,8 +993,8 @@ watch(activeTab, (v) => {
           </div>
         </div>
 
-        <button @click="saveQuestion" :disabled="loading" class="primary-btn">
-          {{ loading ? 'Saving...' : 'Save Question' }}
+        <button @click="saveQuestion" :disabled="saveQuestionLoading" class="primary-btn">
+          <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : 'Save Question' }}
         </button>
 
         <div v-if="lastCapture.status" class="capture-status" :class="lastCapture.status">
@@ -597,23 +1004,45 @@ watch(activeTab, (v) => {
           <div v-if="lastCapture.error" class="capture-error">{{ lastCapture.error }}</div>
           <div v-if="lastCapture.capturedAt" class="capture-time">Captured at: {{ lastCapture.capturedAt }}</div>
         </div>
+        </div><!-- /questionFormRef -->
 
+        <!-- Exam Description editor — shown whenever an exam is selected -->
+        <div v-if="selectedExamId" style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">
+          <h3 style="margin: 0 0 var(--space-2) 0;">Exam Description</h3>
+          <p class="muted" style="margin: 0 0 var(--space-2) 0; font-size: 0.85rem;">This text is shown to enrolled students on the intro page before they begin the exam.</p>
+          <textarea
+            v-model="examIntroductionText"
+            class="input"
+            rows="4"
+            style="width: 100%; resize: vertical;"
+            placeholder="Describe the exam's database structure or any context students should know..."
+          ></textarea>
+          <div style="margin-top: var(--space-2);">
+            <button class="btn-sm" :disabled="examIntroSaving" @click="saveExamIntroduction">
+              {{ examIntroSaving ? 'Saving...' : 'Save Description' }}
+            </button>
+          </div>
+          <IntroImagesEditor scope="exam" :owner-id="selectedExamId!" />
+        </div>
+
+        <EmptyState v-if="selectedExamId && examQuestions.length === 0" :compact="true" title="No questions in this exam yet" body="Use the form above to add the first question." />
         <div v-if="examQuestions.length > 0" class="questions-list-section" style="margin-top: 2rem; border-top: 2px solid var(--color-border); padding-top: 1rem;">
-          <h3 style="margin-bottom: 1rem;">Questions in Exam {{ question.exam_id }}</h3>
-          <div class="preview-table-wrap">
+          <h3 style="margin-bottom: 1rem;">Questions in Exam {{ question.exam_id }} <span class="muted" style="font-size: 0.8rem; font-weight: 400;">({{ displayedQuestions.length }} of {{ examQuestions.length }})</span></h3>
+          <input v-model="filterText" placeholder="Filter by requirement..." class="input" style="margin-bottom: var(--space-2); width: 100%;" />
+          <div class="preview-table-wrap sticky-table-head">
             <table class="preview-table">
               <thead>
                 <tr>
-                  <th>ID</th>
-                  <th>Type</th>
-                  <th>Points</th>
+                  <th @click="toggleSort('id')" style="cursor: pointer;">ID {{ sortKey === 'id' ? (sortDir === 'asc' ? '↑' : '↓') : '' }}</th>
+                  <th @click="toggleSort('type')" style="cursor: pointer;">Type {{ sortKey === 'type' ? (sortDir === 'asc' ? '↑' : '↓') : '' }}</th>
+                  <th @click="toggleSort('points')" style="cursor: pointer;">Points {{ sortKey === 'points' ? (sortDir === 'asc' ? '↑' : '↓') : '' }}</th>
                   <th>Requirement</th>
                   <th>Capture</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="q in examQuestions" :key="q.id">
+                <tr v-for="q in displayedQuestions" :key="q.id">
                   <td>{{ q.id }}</td>
                   <td>{{ q.question_type }}</td>
                   <td>{{ q.points }}</td>
@@ -628,7 +1057,7 @@ watch(activeTab, (v) => {
                   <td>
                     <div style="display: flex; gap: 4px;">
                       <button class="btn-sm" @click="editQuestion(q)">Edit</button>
-                      <button class="btn-sm btn-danger" @click="deleteQuestion(q.id)">Delete</button>
+                      <button class="btn-sm btn-danger" :disabled="deleteQuestionLoading" @click="deleteQuestion(q.id)"><Spinner v-if="deleteQuestionLoading" size="sm" inline />Delete</button>
                     </div>
                   </td>
                 </tr>
@@ -644,24 +1073,79 @@ watch(activeTab, (v) => {
       <div class="form-grid">
         <div class="input-group">
           <label>New Exam Title:</label>
-          <input type="text" v-model="newExamTitle" placeholder="Midterm 2026" />
+          <input type="text" v-model="newExamTitle" placeholder="Midterm 2026" aria-label="New exam title" />
         </div>
-        <button @click="createExam" class="secondary-btn" style="margin-top: 1.8rem;">Create Exam</button>
+        <button @click="createExam" :disabled="createExamLoading" class="secondary-btn" style="margin-top: 1.8rem;">
+          <Spinner v-if="createExamLoading" size="sm" inline />{{ createExamLoading ? 'Creating' : 'Create Exam' }}
+        </button>
       </div>
 
+      <EmptyState v-if="exams.length === 0" :compact="true" title="No exams yet" body="Create your first exam above." />
       <div class="exam-list" v-if="exams.length > 0">
         <h3>Existing Exams</h3>
-        <div v-for="e in exams" :key="e.id" class="exam-item">
-          <span>{{ e.title }} (ID: {{ e.id }})</span>
-          <button @click="toggleExamActive(e.id, !e.is_active)" :class="e.is_active ? 'fail-btn' : 'success-btn'">
-            {{ e.is_active ? 'Deactivate' : 'Activate' }}
-          </button>
+        <div v-for="e in exams" :key="e.id" class="exam-item exam-item-extended">
+          <div class="exam-item-header">
+            <span>{{ e.title }} (ID: {{ e.id }})</span>
+            <span class="badge" :class="effectiveStateBadgeClass(e.effective_state)" style="font-size: 0.75rem; padding: 2px 8px;">
+              {{ e.effective_state || (e.is_active ? 'active' : 'inactive') }}
+            </span>
+          </div>
+          <div class="exam-item-meta muted" v-if="e.scheduled_start_at">
+            Starts: {{ new Date(e.scheduled_start_at).toLocaleString() }}
+          </div>
+          <div class="exam-item-meta muted" v-if="e.scheduled_end_at">
+            Ends: {{ new Date(e.scheduled_end_at).toLocaleString() }}
+          </div>
+          <!-- Activation controls for inactive/scheduled exams -->
+          <div v-if="e.effective_state === 'inactive' || e.effective_state === 'scheduled' || !e.is_active" class="exam-activation-controls">
+            <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+              <input type="radio" :name="'mode-' + e.id" value="instant"
+                :checked="(examActivationMode[e.id] || 'instant') === 'instant'"
+                @change="examActivationMode[e.id] = 'instant'" />
+              Activate now
+            </label>
+            <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+              <input type="radio" :name="'mode-' + e.id" value="scheduled"
+                :checked="examActivationMode[e.id] === 'scheduled'"
+                @change="examActivationMode[e.id] = 'scheduled'" />
+              Schedule activation
+            </label>
+            <template v-if="examActivationMode[e.id] === 'scheduled'">
+              <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 0.5rem;">
+                <div class="input-group" style="flex: 1; min-width: 200px;">
+                  <label>Start time:</label>
+                  <input type="datetime-local" v-model="examScheduledStart[e.id]" />
+                </div>
+                <div class="input-group" style="flex: 1; min-width: 200px;">
+                  <label>End time (optional):</label>
+                  <input type="datetime-local" v-model="examScheduledEnd[e.id]" />
+                </div>
+              </div>
+            </template>
+            <button class="success-btn" :disabled="examActionLoading[e.id]" @click="activateExam(e.id)" style="margin-top: 0.5rem;">
+              Activate
+            </button>
+          </div>
+          <!-- Deactivation controls for active/ended exams -->
+          <div v-else-if="e.is_active" class="exam-activation-controls">
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+              <button class="fail-btn" :disabled="examActionLoading[e.id]" @click="deactivateExamInstant(e.id)">
+                Deactivate Now
+              </button>
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <input type="datetime-local" v-model="examDeactivateEndAt[e.id]" style="border: 1px solid var(--color-border); padding: 0.3rem;" />
+                <button class="secondary-btn" :disabled="examActionLoading[e.id]" @click="deactivateExamScheduled(e.id)">
+                  Set End Time
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
     <div v-show="activeTab === 'assignments'" class="lecturer-form card">
-      <h2>Assign Students to Exam</h2>
+      <h2>Enroll Students in Exam</h2>
       <div class="form-grid">
         <div class="input-group">
           <label>Select Exam:</label>
@@ -671,34 +1155,64 @@ watch(activeTab, (v) => {
           </select>
         </div>
         <div class="input-group full-width">
-          <label>Select Students ({{ selectedStudentIds.length }} selected):</label>
-          <div class="multi-select-box">
-            <div v-for="s in studentsList" :key="s.id" class="student-item">
-              <input type="checkbox" :id="'std-' + s.id" :value="s.id" v-model="selectedStudentIds" />
-              <label :for="'std-' + s.id">{{ s.username }}</label>
-            </div>
-            <div v-if="studentsList.length === 0" class="empty-msg">No students found.</div>
-          </div>
+          <label>Select Students:</label>
+          <StudentMultiSelect v-model="selectedStudentIds" :students="studentsList" />
         </div>
       </div>
-      <button @click="assignStudents" :disabled="!selectedExamId || selectedStudentIds.length === 0" class="primary-btn" style="width: auto; padding: 0.5rem 1rem;">
-        Assign {{ selectedStudentIds.length }} Students
+      <button @click="assignStudents" :disabled="assignStudentsLoading || !selectedExamId || selectedStudentIds.length === 0" class="primary-btn" style="width: auto; padding: 0.5rem 1rem;">
+  <Spinner v-if="assignStudentsLoading" size="sm" inline :invert="true" />{{ assignStudentsLoading ? 'Enrolling' : `Enroll ${selectedStudentIds.length} Students` }}
       </button>
 
       <details class="import-roster-panel">
         <summary>Import Roster</summary>
         <BulkImportStudents />
       </details>
+
+      <!-- Roster table -->
+      <div v-if="selectedExamId" style="margin-top: var(--space-5);">
+        <h3>Enrolled: {{ rosterStudents.length }} student{{ rosterStudents.length !== 1 ? 's' : '' }}</h3>
+        <EmptyState v-if="rosterStudents.length === 0" :compact="true" title="No students enrolled" body="Use the form above to enroll students." />
+        <table v-else class="roster-table" style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr>
+              <th>Student #</th>
+              <th>Name</th>
+              <th>Sec Lec / Lab</th>
+              <th>Enrolled At</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in rosterStudents" :key="s.student_id">
+              <td>{{ s.student_number || s.username }}</td>
+              <td>{{ s.first_name }} {{ s.last_name }}</td>
+              <td>{{ s.sec_lec }} / {{ s.sec_lab }}</td>
+              <td>{{ new Date(s.assigned_at).toLocaleDateString() }}</td>
+              <td>
+                <button
+                  class="btn-sm fail-btn"
+                  :disabled="activeExam?.effective_state === 'active'"
+                  :title="activeExam?.effective_state === 'active' ? 'Cannot remove during active exam' : 'Remove from roster'"
+                  @click="removeStudentFromRoster(s.student_id, s.first_name + ' ' + s.last_name)"
+                >
+                  Remove
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </div>
 
     <div v-show="activeTab === 'results'" class="lecturer-form card">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4);">
+      <div class="results-header">
         <h2>Consolidated Student Performance</h2>
         <button @click="exportCSV" class="secondary-btn" style="margin: 0;">Export Scores (CSV)</button>
       </div>
 
-      <div v-if="loadingScores" class="loading-state">Loading scores...</div>
-      <div v-else class="preview-table-wrap">
+      <Skeleton v-if="loadingScores" variant="table-row" :rows="5" :cols="6" />
+      <EmptyState v-else-if="!loadingScores && consolidatedScores.length === 0" title="No scores yet" body="Once students submit answers, their scores appear here." />
+      <div v-else class="preview-table-wrap sticky-table-head">
         <table class="preview-table">
           <thead>
             <tr>
@@ -706,7 +1220,9 @@ watch(activeTab, (v) => {
               <th>Username</th>
               <th>Name</th>
               <th>Sec (Lec/Lab)</th>
-              <th v-for="title in allExamTitles" :key="title">{{ title }}</th>
+              <th v-for="title in allExamTitles" :key="title">
+                {{ title }}<br /><span class="muted" style="font-size: 0.75rem; font-weight: 400;">(max: {{ examMaxScores[title] !== undefined ? examMaxScores[title].toFixed(0) : '?' }})</span>
+              </th>
               <th>Practice</th>
               <th>Total</th>
             </tr>
@@ -718,7 +1234,11 @@ watch(activeTab, (v) => {
               <td>{{ s.first_name }} {{ s.last_name }}</td>
               <td>{{ s.sec_lec }} / {{ s.sec_lab }}</td>
               <td v-for="title in allExamTitles" :key="title">
-                {{ s.exam_scores[title] !== undefined ? s.exam_scores[title].toFixed(2) : '0.00' }}
+                <span>{{ (s.exam_scores[title] ?? 0).toFixed(2) }} / {{ examMaxScores[title] !== undefined ? examMaxScores[title].toFixed(0) : '?' }}</span>
+                <br />
+                <span class="muted" style="font-size: 0.8rem;">
+                  {{ examMaxScores[title] && examMaxScores[title] > 0 ? Math.round(((s.exam_scores[title] ?? 0) / examMaxScores[title]) * 100) + '%' : '—' }}
+                </span>
               </td>
               <td style="font-weight: 800;">{{ s.practice_total.toFixed(2) }}</td>
               <td style="font-weight: 900; color: var(--color-primary);">{{ s.grand_total.toFixed(2) }}</td>
@@ -733,9 +1253,11 @@ watch(activeTab, (v) => {
 <style scoped>
 .card {
   background: var(--color-surface);
-  padding: var(--space-6);
-  border: 2px solid var(--color-border);
-  border-radius: 0;
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+  margin-bottom: var(--space-4);
 }
 
 .context-selector {
@@ -744,7 +1266,7 @@ watch(activeTab, (v) => {
   align-items: flex-end;
   gap: var(--space-4);
   padding-bottom: var(--space-4);
-  border-bottom: 2px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border-soft);
   margin-bottom: var(--space-4);
 }
 
@@ -775,25 +1297,27 @@ watch(activeTab, (v) => {
 }
 
 .empty-state {
-  padding: var(--space-10) 0;
+  padding: var(--space-7) 0;
   text-align: center;
-  background: var(--color-surface);
-  border: 2px dashed var(--color-border);
-  font-weight: 700;
-  font-size: 1.1rem;
+  background: var(--color-surface-muted);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius);
+  font-weight: 500;
+  font-size: 0.95rem;
+  color: var(--color-text-muted);
 }
 
 .desc {
   color: var(--color-text-muted);
-  font-weight: 700;
-  margin-bottom: var(--space-4);
-  font-size: 0.9rem;
+  margin-bottom: var(--space-3);
+  font-size: 0.88rem;
 }
 
 .multi-select-box {
   max-height: 250px;
   overflow-y: auto;
-  border: 2px solid var(--color-border);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
   padding: var(--space-3);
   background: var(--color-surface);
 }
@@ -861,21 +1385,22 @@ watch(activeTab, (v) => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: var(--space-3);
-  border: 2px solid var(--color-border);
-  margin-bottom: var(--space-3);
+  padding: 10px 14px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  margin-bottom: var(--space-2);
   background: var(--color-surface);
 }
+.exam-item:hover { border-color: var(--color-primary); background: var(--color-primary-bg); }
 
-.exam-list {
-  margin-top: var(--space-6);
-}
+.exam-list { margin-top: var(--space-4); }
 
 .import-roster-panel {
-  border: 2px solid var(--color-border);
-  padding: var(--space-5);
-  margin-top: var(--space-6);
-  background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  margin-top: var(--space-4);
+  background: var(--color-surface-muted);
 }
 
 .import-roster-panel summary {
@@ -967,26 +1492,36 @@ textarea {
 }
 
 .capture-status {
-  margin-top: var(--space-4);
-  padding: 1rem var(--space-5);
-  border: 2px solid var(--color-border);
-  font-weight: 700;
+  margin-top: var(--space-3);
+  padding: 10px 14px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  font-weight: 500;
 }
-.capture-status.captured { background: var(--color-success-bg); color: var(--color-success); border-color: var(--color-success); }
-.capture-status.failed { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger); }
+.capture-status.captured { background: var(--color-success-bg); color: var(--color-success); border-color: #c4dfba; }
+.capture-status.failed   { background: var(--color-danger-bg);  color: var(--color-danger);  border-color: #e9bcbc; }
 
 .preview-block {
-  margin-top: var(--space-4);
-  padding: 1rem var(--space-5);
-  border: 2px solid var(--color-border);
+  margin-top: var(--space-3);
+  padding: 10px 14px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
 }
-.preview-block.ok { background: var(--color-surface); color: var(--color-text); }
-.preview-block.error { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger); }
-.preview-error { margin-top: 0.5rem; font-family: var(--font-mono); font-size: 0.85rem; white-space: pre-wrap; font-weight: 700; }
-.preview-table-wrap { margin-top: 1rem; overflow-x: auto; border: 2px solid var(--color-border); }
-.preview-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; background: var(--color-surface); color: var(--color-text); }
-.preview-table th, .preview-table td { border: 1px solid var(--color-border); padding: 0.5rem 0.8rem; text-align: left; }
-.preview-table th { background: var(--color-surface-muted); color: var(--color-text); font-weight: 700; }
+.preview-block.ok    { background: var(--color-surface); color: var(--color-text); }
+.preview-block.error { background: var(--color-danger-bg); color: var(--color-danger); border-color: #e9bcbc; }
+.preview-error { margin-top: 6px; font-family: var(--font-mono); font-size: 0.82rem; white-space: pre-wrap; }
+.preview-table-wrap { margin-top: 10px; overflow-x: auto; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-surface); }
+.preview-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; background: var(--color-surface); color: var(--color-text); }
+.preview-table th, .preview-table td { border-bottom: 1px solid var(--color-border-soft); padding: 6px 10px; text-align: left; }
+.preview-table th { background: var(--color-surface-sunk); color: var(--color-text); font-weight: 700; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.preview-table tr:nth-child(even) td { background: var(--color-surface-muted); }
+
+.results-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-4);
+}
 
 .badge {
   padding: 4px 10px;
@@ -1020,36 +1555,80 @@ textarea {
 
 h2 {
   color: var(--color-text);
-  font-weight: 800;
-  margin: 0;
-  letter-spacing: -0.01em;
-  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 var(--space-3) 0;
+  font-size: 1.1rem;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-border-soft);
 }
 
 .tab-bar {
-  display: flex;
+  display: inline-flex;
   gap: 0;
-  background: var(--color-border);
-  padding: 0;
-  margin-bottom: var(--space-6);
-  border: 2px solid var(--color-border);
+  background: var(--color-surface-muted);
+  padding: 3px;
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  flex-wrap: wrap;
 }
 .tab-bar button {
-  background: var(--color-surface);
-  border: none;
-  border-right: 2px solid var(--color-border);
-  padding: var(--space-3) var(--space-4);
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 6px 16px;
   cursor: pointer;
-  color: var(--color-text);
-  font-size: 0.95rem;
-  font-weight: 700;
-  flex: 1;
-  transition: none;
+  color: var(--color-text-muted);
+  font-size: 0.86rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  flex: 0 0 auto;
 }
-.tab-bar button:last-child { border-right: none; }
-.tab-bar button:hover { background: var(--color-surface-muted); }
+.tab-bar button:hover { color: var(--color-text); }
 .tab-bar button.tab-active {
-  background: var(--color-primary);
-  color: var(--color-surface);
+  background: var(--color-surface);
+  color: var(--color-primary);
+  border-color: var(--color-border);
+  box-shadow: var(--shadow-1);
+}
+
+@media (max-width: 767.98px) {
+  .tab-bar {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+
+  .tab-bar button {
+    flex: 0 0 auto;
+    min-width: 110px;
+  }
+
+  .context-selector {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .exam-context-status {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .results-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+.draft-banner {
+  border: 1px dashed var(--color-border);
+  background: var(--color-surface-muted);
+  font-family: var(--font-mono);
+  padding: var(--space-2) var(--space-3);
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+  font-size: 0.85rem;
 }
 </style>

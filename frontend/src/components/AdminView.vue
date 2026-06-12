@@ -1,9 +1,18 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
+import { useSingleFlight } from '../composables/useSingleFlight'
+import { useConfirm } from '../services/confirm_service'
+import { useFormValidation, required } from '../composables/useFormValidation'
+import FieldError from './FieldError.vue'
 import { useNotifications } from '../services/notification_service'
+import { handleApiError } from '../services/error_handler'
+import Spinner from './Spinner.vue'
+import EmptyState from './EmptyState.vue'
+import Skeleton from './Skeleton.vue'
 import BulkImportStudents from './BulkImportStudents.vue'
 
 const { notify } = useNotifications()
+const { confirm } = useConfirm()
 const newUser = ref({
   username: '',
   password: '',
@@ -11,9 +20,17 @@ const newUser = ref({
 })
 
 const users = ref<any[]>([])
-const loading = ref(false)
 const listLoading = ref(false)
 const editingUser = ref<any>(null)
+
+
+// Form validation for create user (TODO-038)
+const newUserForm = useFormValidation({
+  username: { rules: [required('Username is required')], initial: '' },
+  password: { rules: [required('Password is required')], initial: '' },
+})
+watch(() => newUser.value.username, (v) => { newUserForm.values.username = v })
+watch(() => newUser.value.password, (v) => { newUserForm.values.password = v })
 
 const fetchUsers = async () => {
   listLoading.value = true
@@ -26,15 +43,15 @@ const fetchUsers = async () => {
     })
     if (!response.ok) throw new Error('Failed to fetch users')
     users.value = await response.json()
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to fetch users' })
   } finally {
     listLoading.value = false
   }
 }
 
-const createUser = async () => {
-  loading.value = true
+const { inFlight: createUserLoading, run: createUser } = useSingleFlight(async () => {
+  if (!newUserForm.validateAll()) return
   const token = localStorage.getItem('sql_quiz_token')
 
   try {
@@ -55,15 +72,14 @@ const createUser = async () => {
     notify(`User ${newUser.value.username} created successfully.`, 'success')
     newUser.value = { username: '', password: '', role: 'STUDENT' }
     fetchUsers()
-  } catch (err: any) {
-    notify(err.message, 'error')
-  } finally {
-    loading.value = false
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to create user' })
   }
-}
+})
 
-const deleteUser = async (id: number) => {
-  if (!confirm('Are you sure you want to delete this user?')) return
+const { inFlight: deleteUserLoading, run: deleteUser } = useSingleFlight(async (id: number) => {
+  const ok = await confirm({ title: 'Delete this user?', body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
+  if (!ok) return
   
   const token = localStorage.getItem('sql_quiz_token')
   try {
@@ -76,10 +92,10 @@ const deleteUser = async (id: number) => {
     if (!response.ok) throw new Error('Failed to delete user')
     notify('User deleted successfully', 'success')
     fetchUsers()
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to delete user' })
   }
-}
+})
 
 const startEdit = (user: any) => {
   editingUser.value = { ...user }
@@ -89,7 +105,7 @@ const cancelEdit = () => {
   editingUser.value = null
 }
 
-const saveUser = async () => {
+const { inFlight: saveUserLoading, run: saveUser } = useSingleFlight(async () => {
   const token = localStorage.getItem('sql_quiz_token')
   try {
     const response = await fetch(`/api/v1/users/${editingUser.value.id}`, {
@@ -104,30 +120,45 @@ const saveUser = async () => {
     notify('User updated successfully', 'success')
     editingUser.value = null
     fetchUsers()
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to update user' })
   }
-}
+})
 
 onMounted(fetchUsers)
 </script>
 
 <template>
-  <div style="max-width: 1200px; margin: var(--space-6) auto; padding: 0 var(--space-4); display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-6);">
+  <div>
+    <div class="page-header">
+      <h1>Account Administration</h1>
+      <p class="page-subtitle">Create, edit, and bulk-import student/lecturer accounts for the grader system.</p>
+    </div>
+  <div class="admin-grid">
     <!-- Create User -->
     <div>
       <div class="card" style="margin-bottom: var(--space-6);">
         <h2 style="margin: 0 0 var(--space-1) 0;">Create Account</h2>
         <p class="muted" style="margin: 0 0 var(--space-4) 0;">Manually create accounts.</p>
 
-        <form @submit.prevent="createUser">
+        <form @submit.prevent="createUser" novalidate>
           <div class="field">
             <label>Username</label>
-            <input class="input" v-model="newUser.username" required />
+            <input class="input" v-model="newUser.username" required autofocus
+              :aria-invalid="newUserForm.touched.username && !!newUserForm.errors.username"
+              aria-describedby="err-username"
+              @blur="newUserForm.markTouched('username')"
+            />
+            <FieldError :message="newUserForm.touched.username ? newUserForm.errors.username : ''" id="err-username" />
           </div>
           <div class="field">
             <label>Password</label>
-            <input class="input" type="password" v-model="newUser.password" required />
+            <input class="input" type="password" v-model="newUser.password" required
+              :aria-invalid="newUserForm.touched.password && !!newUserForm.errors.password"
+              aria-describedby="err-password"
+              @blur="newUserForm.markTouched('password')"
+            />
+            <FieldError :message="newUserForm.touched.password ? newUserForm.errors.password : ''" id="err-password" />
           </div>
           <div class="field">
             <label>Role</label>
@@ -138,8 +169,8 @@ onMounted(fetchUsers)
             </select>
           </div>
 
-          <button type="submit" class="btn btn-primary" style="width: 100%;" :disabled="loading">
-            Create Account
+          <button type="submit" class="btn btn-primary" style="width: 100%;" :disabled="createUserLoading">
+            <Spinner v-if="createUserLoading" size="sm" inline :invert="true" />{{ createUserLoading ? 'Creating' : 'Create Account' }}
           </button>
         </form>
       </div>
@@ -157,8 +188,11 @@ onMounted(fetchUsers)
       <div class="card">
         <h2 style="margin: 0 0 var(--space-4) 0;">User Management</h2>
         
-        <div v-if="listLoading" class="muted">Loading users...</div>
-        <div v-else class="table-container">
+        <Skeleton v-if="listLoading" variant="table-row" :rows="4" :cols="5" />
+        <div v-else-if="!listLoading && users.length === 0">
+          <EmptyState title="No users yet" body="Create the first account using the form on the left." />
+        </div>
+        <div v-else class="table-container sticky-table-head">
           <table class="table">
             <thead>
               <tr>
@@ -204,12 +238,12 @@ onMounted(fetchUsers)
                 <td>
                   <div style="display: flex; gap: 8px;">
                     <template v-if="editingUser?.id === user.id">
-                      <button class="btn btn-sm btn-primary" @click="saveUser">Save</button>
+                      <button class="btn btn-sm btn-primary" :disabled="saveUserLoading" @click="saveUser">Save</button>
                       <button class="btn btn-sm" @click="cancelEdit">Cancel</button>
                     </template>
                     <template v-else>
                       <button class="btn btn-sm" @click="startEdit(user)">Edit</button>
-                      <button class="btn btn-sm btn-danger" @click="deleteUser(user.id)">Delete</button>
+                      <button class="btn btn-sm btn-danger" :disabled="deleteUserLoading" @click="deleteUser(user.id)">Delete</button>
                     </template>
                   </div>
                 </td>
@@ -220,13 +254,24 @@ onMounted(fetchUsers)
       </div>
     </div>
   </div>
+  </div>
 </template>
 
 <style scoped>
+.admin-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: var(--space-5);
+}
+@media (max-width: 1023.98px) {
+  .admin-grid { grid-template-columns: 1fr; }
+}
 .table-container {
   overflow-x: auto;
-  border: 2px solid var(--color-border);
-  margin-top: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  margin-top: var(--space-3);
+  background: var(--color-surface);
 }
 .table {
   width: 100%;
@@ -234,64 +279,29 @@ onMounted(fetchUsers)
   background: var(--color-surface);
 }
 .table th, .table td {
-  padding: var(--space-3);
+  padding: 8px 12px;
   text-align: left;
-  border: 1px solid var(--color-border);
-  font-size: 0.9rem;
+  border-bottom: 1px solid var(--color-border-soft);
+  font-size: 0.88rem;
 }
 .table th {
-  background: var(--color-surface-muted);
+  background: var(--color-surface-sunk);
   color: var(--color-text);
   font-weight: 700;
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
+.table tr:nth-child(even) td { background: var(--color-surface-muted); }
 .input-sm {
   padding: 4px 8px;
   font-size: 0.85rem;
   border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
 }
-.btn-sm {
-  padding: 6px 12px;
-  font-size: 0.8rem;
-  font-weight: 700;
-  border: 2px solid var(--color-border);
-  background: var(--color-surface);
-  color: var(--color-text);
-  cursor: pointer;
-}
-.btn-sm:active {
-  transform: translateY(1px);
-}
-.badge {
-  padding: 4px 10px;
-  border: 1px solid var(--color-border);
-  border-radius: 0;
-  font-size: 0.75rem;
-  font-weight: 700;
-  display: inline-block;
-}
-.badge.admin { background: var(--color-text); color: var(--color-surface); }
-.badge.lecturer { background: var(--color-surface-muted); color: var(--color-text); }
-.badge.student { background: var(--color-surface); color: var(--color-text); }
-
-.btn-danger {
-  background: var(--color-danger);
-  color: var(--color-surface);
-  border-color: var(--color-danger);
-}
-.btn-primary {
-  background: var(--color-primary);
-  color: var(--color-surface);
-}
-.btn-primary:hover {
-  background: #333333;
-}
-
-.card {
-  border: 2px solid var(--color-border);
-  background: var(--color-surface);
-  padding: var(--space-6);
-  border-radius: 0;
-}
+.badge.admin    { background: #1e1c17;   color: #faf7f0; border-color: #1e1c17; }
+.badge.lecturer { background: var(--color-primary-bg); color: var(--color-primary-strong); border-color: var(--color-primary); }
+.badge.student  { background: var(--color-surface-muted); color: var(--color-text-muted); }
 
 h2 {
   font-weight: 800;

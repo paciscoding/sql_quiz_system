@@ -10,8 +10,8 @@
 )
 
 #set text(
-  font: "linux libertine",
-  size: 11pt
+  font: "Times New Roman",
+  size: 12pt
 )
 
 #align(center)[
@@ -49,44 +49,60 @@ The Administrator is responsible for system infrastructure and the initial creat
 4. Click *Generate Account*.
 
 = Lecturer Workflow
-Lecturers prepare the curriculum, initialize the database schema, and enroll students.
+Lecturers prepare the curriculum, initialize the database schema, and manage the examination lifecycle.
 
 == Step 1: Initialize the Exam Database
 Before any questions can be created or answered, you must set up the database structure:
 1. Navigate to the *Questions* tab.
 2. Locate the *Initialize Exam Database* card.
-3. Paste your full SQL setup script into the textarea.
+3. Paste your full SQL setup script (e.g. `company.sql`) into the textarea.
 4. Click *Import Schema & Data*.
 
-== Step 2: Manage Questions
-1. Below the initialization card, find the *Manage Questions* section.
-2. *Question ID:* Assign a unique number.
-3. *Type:* Choose *QUERY* or *DML*.
-4. *Target Table:* The primary table affected by the query.
-5. *Correct SQL:* The teacher's reference query.
-6. *Strict Mode:* Toggle requirements for keyword ordering, attributes, or sorting.
-7. Click *Save Question*.
+== Step 2: Create Questions (Phase 0)
+1. In the *Manage Questions* section, define your question.
+2. *Type:* Choose *QUERY* (SELECT) or *DML* (INSERT/UPDATE/DELETE).
+3. *Correct SQL:* Your reference answer.
+4. *Strict Mode:*
+  - *Row Ordering:* Check this if the specific order of rows matters.
+  - *Exact Attributes:* Check this if students must use specific column aliases.
+5. Click *Save Question*. The system will immediately capture the "Ground Truth" result. If capture fails (e.g. syntax error in your SQL), the status will show as "failed".
 
-== Step 3: Student Enrollment
-1. Navigate to the *Manage Accounts* tab.
-2. Create student accounts individually.
-3. For bulk creation (150+ students), use the API endpoint provided in the developer specification.
+== Step 3: Activation (Phase 1)
+1. Navigate to the *Examination Events* section.
+2. Create an examination event and assign questions to it.
+3. Assign students to the exam.
+4. Click *Activate*. The system will verify that every question has a successfully captured ground truth before allowing the exam to start. Once activated, the exam settings are frozen.
+
+== Step 5: End the Examination (Phase 3)
+1. When the exam session is over, click *Deactivate*.
+2. The system will automatically drop the shared exam sandbox schema to clean up the database.
+
+== Step 6: Reviewing Results
+1. Navigate to the *Results* tab in the Lecturer dashboard.
+2. View consolidated student performance across all exams and practice.
+3. Export the complete scores list as a CSV file for grading.
 
 = Student Workflow
 Students interact only with the examination interface.
 
 == Logging In
 1. Log in with the credentials provided by your Lecturer.
-2. Your *Student ID* is automatically identified by the system.
+2. The system will automatically fetch all active examinations you are enrolled in.
 
 == Submitting Answers
-1. Select the *Question Number*.
+1. Select an *Examination* and then a *Question*.
 2. Enter your SQL query in the editor.
 3. Click *Submit Answer*.
-4. The system will evaluate your query in a isolated sandbox and return a score immediately.
+4. The system evaluates your query in a sharedTransactional sandbox using a FIFO queue. Your answer is compared against the ground truth captured in Step 2.
+5. Scores and feedback are returned immediately and stored for the lecturer's review.
+
+== Practice Mode
+1. Access the *Practice* section from the navigation bar.
+2. Attempt questions from the practice bank to build your skills.
+3. Practice is automatically locked when an examination is active.
 
 = Technical Architecture Notes
-- *Schema Layout:* System tables live in the `app` schema, the lecturer's curriculum lives in `public`, and each student gets a `student_{id}` sandbox containing a copy of every `public` table.
-- *Sandboxing:* The student schema is created on first submission and reused thereafter. Only tables missing from the schema are cloned, so repeat submissions are cheap. For DML questions, only the question's target table is rebuilt between attempts.
-- *Security:* Student queries run under a restricted PostgreSQL role with CRUD-only permissions on the student's own schema.
-- *Queueing:* Submissions are serialised per student via Postgres advisory locks, which keeps the "one submission at a time per student" guarantee intact even when multiple backend instances are deployed.
+- *Schema Isolation:* System tables are in `app`, templates in `public`, and shared sandboxes in `sandbox_exam_{examID}`.
+- *FIFO Submission Queue:* DML submissions are serialised through a global queue to ensure consistent evaluation.
+- *Transactional Rollback:* Every student submission is rolled back to a savepoint after evaluation, ensuring a clean slate for subsequent attempts.
+- *Audit:* Every attempt is recorded in the `app.submissions` table for audit and final grading.

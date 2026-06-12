@@ -4,11 +4,15 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/middleware"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
@@ -33,10 +37,17 @@ func statusForRepoErr(err error) int {
 type LecturerController struct {
 	repo          *repository.PostgresRepository
 	importService *services.StudentImportService
+	hub           *services.Hub
 }
 
-func NewLecturerController(repo *repository.PostgresRepository) *LecturerController {
-	return &LecturerController{repo: repo}
+func NewLecturerController(repo *repository.PostgresRepository, hub *services.Hub) *LecturerController {
+	return &LecturerController{repo: repo, hub: hub}
+}
+
+// buildExamStatusEvent formats an SSE data payload string for a given exam and state.
+func buildExamStatusEvent(examID int, phase string) string {
+	return fmt.Sprintf("event: exam-status\nid: %d\ndata: {\"exam_id\":%d,\"effective_state\":\"%s\",\"server_time\":\"%s\"}\n\n",
+		time.Now().UnixMilli(), examID, phase, time.Now().UTC().Format(time.RFC3339))
 }
 
 func (ctrl *LecturerController) SetStudentImportService(importService *services.StudentImportService) {
@@ -49,7 +60,23 @@ func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, exams)
+	resp := make([]ExaminationResponse, 0, len(exams))
+	for _, e := range exams {
+		resp = append(resp, ExaminationResponse{
+			ID:               e.ID,
+			Title:            e.Title,
+			IsActive:         e.IsActive,
+			CreatedBy:        e.CreatedBy,
+			CreatedAt:        e.CreatedAt,
+			ActivatedAt:      e.ActivatedAt,
+			ArchivedAt:       e.ArchivedAt,
+			ScheduledStartAt: e.ScheduledStartAt,
+			ScheduledEndAt:   e.ScheduledEndAt,
+			EffectiveState:   repository.ExaminationEffectiveState(e).Phase,
+			Introduction:     e.Introduction,
+		})
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (ctrl *LecturerController) CreateExamination(c *gin.Context) {
@@ -83,18 +110,44 @@ func (ctrl *LecturerController) ActivateExamination(c *gin.Context) {
 	}
 
 	var req struct {
-		Active bool `json:"active"`
+		Active           bool       `json:"active"`
+		Mode             string     `json:"mode"`
+		ScheduledStartAt *time.Time `json:"scheduled_start_at"`
+		ScheduledEndAt   *time.Time `json:"scheduled_end_at"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := ctrl.repo.SetExaminationActive(c.Request.Context(), id, req.Active); err != nil {
+	if !req.Active {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "use the deactivate endpoint to deactivate"})
+		return
+	}
+
+	var scheduledStartAt *time.Time
+	var scheduledEndAt *time.Time
+
+	switch req.Mode {
+	case "scheduled":
+		if req.ScheduledStartAt == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "scheduled_start_at is required for scheduled mode"})
+			return
+		}
+		scheduledStartAt = req.ScheduledStartAt
+		scheduledEndAt = req.ScheduledEndAt
+	default:
+		// "instant" or empty — pass nil to use now()
+	}
+
+	if err := ctrl.repo.SetExaminationActive(c.Request.Context(), id, true, scheduledStartAt, scheduledEndAt); err != nil {
 		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
 		return
 	}
 
+	if ctrl.hub != nil {
+		ctrl.hub.Broadcast(id, buildExamStatusEvent(id, "active"))
+	}
 	middleware.InvalidateExamFreezeCache()
 	c.JSON(http.StatusOK, gin.H{"message": "Examination status updated"})
 }
@@ -107,13 +160,92 @@ func (ctrl *LecturerController) DeactivateExamination(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.repo.ArchiveExamination(c.Request.Context(), id); err != nil {
+	var req struct {
+		Mode           string     `json:"mode"`
+		ScheduledEndAt *time.Time `json:"scheduled_end_at"`
+	}
+	// Allow empty body (instant deactivate)
+	_ = c.ShouldBindJSON(&req)
+
+	if req.Mode == "scheduled" && req.ScheduledEndAt != nil {
+		// Set a future end time without dropping the sandbox
+		if err := ctrl.repo.SetScheduledEndAt(c.Request.Context(), id, req.ScheduledEndAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	} else {
+		// Instant deactivate: drop sandbox and archive
+		if err := ctrl.repo.ArchiveExamination(c.Request.Context(), id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	middleware.InvalidateExamFreezeCache()
+	c.JSON(http.StatusOK, gin.H{"message": "Examination deactivated and sandboxes cleaned up"})
+}
+
+// SetPracticeFreeze toggles the per-exam block_practice_during_exam flag. When
+// on, student practice is blocked while this exam is active (the optional focus
+// rule); when off (default), practice stays live during the exam.
+func (ctrl *LecturerController) SetPracticeFreeze(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	var req struct {
+		BlockPractice bool `json:"block_practice"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := ctrl.repo.SetExamPracticeFreeze(c.Request.Context(), id, req.BlockPractice); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	middleware.InvalidateExamFreezeCache()
-	c.JSON(http.StatusOK, gin.H{"message": "Examination deactivated and sandboxes cleaned up"})
+	c.JSON(http.StatusOK, gin.H{"message": "Practice freeze updated", "block_practice": req.BlockPractice})
+}
+
+func (ctrl *LecturerController) GetExamRoster(c *gin.Context) {
+	idStr := c.Param("id")
+	examID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+	students, err := ctrl.repo.GetExamRoster(c.Request.Context(), examID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"count": len(students), "students": students})
+}
+
+func (ctrl *LecturerController) RemoveStudentFromExam(c *gin.Context) {
+	idStr := c.Param("id")
+	examID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+	studentIdStr := c.Param("studentId")
+	studentID, err := strconv.Atoi(studentIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid student id"})
+		return
+	}
+	if err := ctrl.repo.RemoveStudentFromExam(c.Request.Context(), examID, studentID); err != nil {
+		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Student removed from roster"})
 }
 
 func (ctrl *LecturerController) AssignStudents(c *gin.Context) {
@@ -271,7 +403,11 @@ func (ctrl *LecturerController) ImportSchema(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.repo.ExecuteSchemaScript(c.Request.Context(), req.SQL); err != nil {
+	// Get the authenticated user's ID for the audit row
+	userVal, _ := c.Get("user")
+	lecturer := userVal.(models.User)
+
+	if err := ctrl.repo.ExecuteSchemaScript(c.Request.Context(), req.SQL, lecturer.ID); err != nil {
 		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
 		return
 	}
@@ -314,6 +450,47 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, report)
+}
+
+// SetExamIntroduction handles PUT /api/v1/lecturer/exams/:id/introduction
+// Persists a lecturer-authored description for the exam's curriculum page.
+func (ctrl *LecturerController) SetExamIntroduction(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	var req struct {
+		Introduction string `json:"introduction"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	text := strings.TrimSpace(req.Introduction)
+	if len(text) > 20000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "introduction exceeds 20000 character limit"})
+		return
+	}
+
+	if err := ctrl.repo.UpdateExaminationIntroduction(c.Request.Context(), id, text); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Exam introduction updated"})
+}
+
+func (ctrl *LecturerController) GetExamMaxScores(c *gin.Context) {
+	maxScores, err := ctrl.repo.GetExamMaxScores(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"max_scores": maxScores})
 }
 
 func (ctrl *LecturerController) GetConsolidatedScores(c *gin.Context) {
@@ -376,3 +553,135 @@ func (ctrl *LecturerController) ExportScoresCSV(c *gin.Context) {
 		}
 	}
 }
+
+// ─── Exam Intro Images (staff mutations) ─────────────────────────────────────
+
+// UploadExamIntroImage handles POST /api/v1/lecturer/exams/:id/intro-images
+// Accepts a multipart upload with field "image", validates the mime type by
+// magic bytes, enforces per-file (5 MB) and aggregate (25 MB) size limits, and
+// inserts the image. Returns the inserted metadata row (201).
+func (ctrl *LecturerController) UploadExamIntroImage(c *gin.Context) {
+	examID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 5*1024*1024)
+	if err := c.Request.ParseMultipartForm(5 * 1024 * 1024); err != nil {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file too large (max 5 MB)"})
+		return
+	}
+
+	file, _, err := c.Request.FormFile("image")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "image field is required"})
+		return
+	}
+	defer file.Close()
+
+	// Validate MIME type via magic bytes.
+	magic := make([]byte, 8)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "could not read image"})
+		return
+	}
+	var detectedMime string
+	switch {
+	case len(magic) >= 4 && magic[0] == 0x89 && magic[1] == 0x50 && magic[2] == 0x4E && magic[3] == 0x47:
+		detectedMime = "image/png"
+	case len(magic) >= 3 && magic[0] == 0xFF && magic[1] == 0xD8 && magic[2] == 0xFF:
+		detectedMime = "image/jpeg"
+	default:
+		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "only image/png and image/jpeg are accepted"})
+		return
+	}
+
+	// Re-read the full image (magic bytes + rest).
+	rest, err := io.ReadAll(file)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	data := append(magic, rest...)
+
+	// Aggregate size guard.
+	ctx := c.Request.Context()
+	existing, err := ctrl.repo.CountExamIntroImageBytes(ctx, examID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if existing+int64(len(data)) > 25*1024*1024 {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "aggregate intro-image size exceeds 25 MB"})
+		return
+	}
+
+	img, err := ctrl.repo.InsertExamIntroImage(ctx, examID, detectedMime, data)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, img)
+}
+
+// DeleteExamIntroImage handles DELETE /api/v1/lecturer/exams/:id/intro-images/:imageId
+// Removes a single intro image from an examination. Returns 204 on success.
+func (ctrl *LecturerController) DeleteExamIntroImage(c *gin.Context) {
+	examID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+	imgID, err := strconv.Atoi(c.Param("imageId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image id"})
+		return
+	}
+
+	if err := ctrl.repo.DeleteExamIntroImage(c.Request.Context(), examID, imgID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "image not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// ReorderExamIntroImages handles PUT /api/v1/lecturer/exams/:id/intro-images/order
+// Accepts {"order":[{"id":1,"sort_order":0},…]} and applies the new ordering.
+func (ctrl *LecturerController) ReorderExamIntroImages(c *gin.Context) {
+	examID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	var req struct {
+		Order []struct {
+			ID        int `json:"id"`
+			SortOrder int `json:"sort_order"`
+		} `json:"order"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	order := make([]struct{ ID, SortOrder int }, len(req.Order))
+	for i, item := range req.Order {
+		order[i] = struct{ ID, SortOrder int }{item.ID, item.SortOrder}
+	}
+
+	if err := ctrl.repo.ReorderExamIntroImages(c.Request.Context(), examID, order); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Order updated"})
+}
+

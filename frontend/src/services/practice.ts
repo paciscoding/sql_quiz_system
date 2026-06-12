@@ -7,10 +7,58 @@ export class PracticeUnavailableError extends Error {
   }
 }
 
+// ApiError carries the HTTP status so callers can branch on it (e.g. 409 to
+// surface a "confirm replace / force delete" dialog).
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+export interface PracticeCategory {
+  id: number
+  name: string
+  schema_name: string
+  created_by: number
+  question_count: number
+  created_at: string
+  updated_at: string
+  introduction: string
+}
+
+// Schema introspection types (shared between practice intro and exam intro)
+export interface ColumnIntrospection {
+  name: string
+  data_type: string
+  nullable: boolean
+  is_primary_key: boolean
+  is_foreign_key: boolean
+  references_table?: string
+  references_column?: string
+}
+
+export interface TableIntrospection {
+  name: string
+  columns: ColumnIntrospection[]
+}
+
+export interface CategoryIntroduction {
+  category_id: number
+  category_name: string
+  introduction: string
+  imported: boolean
+  tables: TableIntrospection[]
+}
+
 export interface PracticeQuestion {
   id: number
   created_by: number
-  category: string
+  category_id: number
+  category_name?: string
+  category?: string
   target_table: string
   correct_sql?: string
   question_type: string
@@ -39,6 +87,8 @@ export interface PracticeAttempt {
 
 export interface PracticeSummary {
   question_id: number
+  category_id: number
+  category_name: string
   category: string
   requirement: string
   points: number
@@ -72,13 +122,13 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
   const response = await fetch(path, { ...options, headers })
   if (response.status === 423) {
     const { notify } = useNotifications()
-    notify('Practice unavailable while an exam is active.', 'error')
+    notify('Practice is paused while an exam with focus mode is active.', 'error')
     throw new PracticeUnavailableError()
   }
   if (!response.ok) {
     let body: any = {}
     try { body = await response.json() } catch { /* ignore */ }
-    throw new Error(body.error || 'Request failed')
+    throw new ApiError(response.status, body.error || 'Request failed')
   }
   return response.json()
 }
@@ -122,12 +172,50 @@ export const upsertQuestion = (payload: Partial<PracticeQuestion>): Promise<any>
 export const deleteQuestion = (id: number): Promise<void> =>
   apiFetch(`/api/v1/lecturer/practice/question/${id}`, { method: 'DELETE' })
 
-export const resetSandbox = (): Promise<{ reset_at: string }> =>
-  apiFetch('/api/v1/lecturer/practice/reset-sandbox', { method: 'POST' })
+// --- Practice categories ---
+
+export const listCategories = (): Promise<PracticeCategory[]> =>
+  apiFetch('/api/v1/lecturer/practice/categories')
+
+export const createCategory = (name: string): Promise<PracticeCategory> =>
+  apiFetch('/api/v1/lecturer/practice/categories', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  })
+
+export const renameCategory = (id: number, name: string): Promise<{ message: string }> =>
+  apiFetch(`/api/v1/lecturer/practice/categories/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  })
+
+export const deleteCategory = (id: number, force = false): Promise<{ message: string }> =>
+  apiFetch(`/api/v1/lecturer/practice/categories/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' })
+
+export const importCategorySchema = (id: number, sql: string, confirmReplace = false): Promise<{ message: string }> =>
+  apiFetch(`/api/v1/lecturer/practice/categories/${id}/import${confirmReplace ? '?confirm_replace=true' : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql })
+  })
 
 export const lecturerPreview = (payload: { type: string; target_table: string; correct_sql: string }): Promise<any> =>
   apiFetch('/api/v1/lecturer/practice/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
+  })
+
+// --- Practice category introduction ---
+
+export const getCategoryIntroduction = (id: number): Promise<CategoryIntroduction> =>
+  apiFetch(`/api/v1/practice/categories/${id}/introduction`)
+
+export const setCategoryIntroduction = (id: number, text: string): Promise<void> =>
+  apiFetch(`/api/v1/lecturer/practice/categories/${id}/introduction`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ introduction: text })
   })

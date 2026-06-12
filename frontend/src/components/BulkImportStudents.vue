@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useSingleFlight } from '../composables/useSingleFlight'
 import { useNotifications } from '../services/notification_service'
+import { handleApiError } from '../services/error_handler'
+import { useFormValidation } from '../composables/useFormValidation'
+import FieldError from './FieldError.vue'
+import Spinner from './Spinner.vue'
 
 interface ImportError {
   row: number
@@ -19,21 +24,32 @@ interface ImportReport {
 const { notify } = useNotifications()
 
 const selectedFile = ref<File | null>(null)
-const loading = ref(false)
 const topLevelError = ref('')
 const result = ref<ImportReport | null>(null)
+
+
+// Form validation for file input (TODO-038)
+const fileValidator = (file: File | null) => {
+  if (!file) return 'Please select a file'
+  if (!file.name.match(/\.(csv|xlsx)$/i)) return 'File must be .csv or .xlsx'
+  return null
+}
+const fileForm = useFormValidation({
+  file: { rules: [fileValidator] },
+})
 
 const handleFileChange = (event: Event) => {
   const input = event.target as HTMLInputElement
   selectedFile.value = input.files?.[0] ?? null
+  fileForm.values.file = selectedFile.value
   topLevelError.value = ''
   result.value = null
 }
 
-const submitImport = async () => {
-  if (!selectedFile.value || loading.value) return
+const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () => {
+  if (!fileForm.validateAll()) return
+  if (!selectedFile.value) return
 
-  loading.value = true
   topLevelError.value = ''
   result.value = null
 
@@ -63,11 +79,9 @@ const submitImport = async () => {
     result.value = data
     notify('Import complete', 'success')
   } catch (err: any) {
-    notify(err.message, 'error')
-  } finally {
-    loading.value = false
+    handleApiError(err, { fallback: 'Import failed' })
   }
-}
+})
 </script>
 
 <template>
@@ -79,20 +93,23 @@ const submitImport = async () => {
       <input
         type="file"
         accept=".csv,.xlsx"
-        :disabled="loading"
+        :disabled="importLoading"
         @change="handleFileChange"
         class="file-input"
+        :aria-invalid="fileForm.touched.file && !!fileForm.errors.file"
+        aria-describedby="err-file"
       />
+      <FieldError :message="fileForm.touched.file ? fileForm.errors.file : ''" id="err-file" />
       <button
         class="primary-btn"
-        :disabled="loading || !selectedFile"
+        :disabled="importLoading || !selectedFile"
         @click="submitImport"
       >
-        {{ loading ? 'Importing...' : 'Import' }}
+        <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : 'Import' }}
       </button>
     </div>
 
-    <div v-if="loading" class="loading-msg">Uploading and processing...</div>
+    <div v-if="importLoading" class="loading-msg">Uploading and processing...</div>
 
     <div v-if="topLevelError" class="error-box">
       {{ topLevelError }}

@@ -36,22 +36,99 @@ Before any questions can be created or answered, you must set up the database st
 1. Navigate to the **"Questions"** tab.
 2. Locate the **"Initialize Exam Database"** card.
 3. Paste your full SQL setup script (e.g., `company_elmasri_postgres.sql`) into the textarea.
-4. Click **"Import Schema & Data"**. 
-   - *This will create all tables in the `public` schema. These tables are automatically cloned to student sandboxes upon submission.*
+4. Click **"Import Schema & Data"**.
+   - *This will create all tables in the `public` schema. SELECT questions read this schema directly under a SELECT-only role; DML questions clone it into a single per-exam sandbox at activation time. The lecturer never pays a per-student clone cost.*
 
 ### Step 2: Manage Questions
+*Allowed only while the examination is **inactive** (`is_active = false`). The system rejects question edits on active exams to keep the cached Correct Result safe.*
+
 1. Below the initialization card, find the **"Manage Questions"** section.
 2. **Question ID:** Assign a unique number.
 3. **Type:** Choose **QUERY** (SELECT) or **DML** (Insert/Update/Delete).
 4. **Target Table:** The primary table affected by the query (for DML state-diffing).
 5. **Correct SQL:** The teacher's reference query.
-6. **Strict Mode (Query only):** Toggle requirements for keyword ordering, attributes, or sorting.
+6. **Strict Mode (Query only):** Two toggles — *Ordering* (student's result rows must match the teacher's row-by-row; otherwise comparison is set-equality) and *Attributes* (column names must match the teacher's exactly).
 7. Click **"Save Question"**.
 
+When the question is saved, the system **immediately runs your Correct SQL** on a clone of the imported schema, captures the expected output (result-set for QUERY, target-table post-state for DML), and stores it on the question. Two outcomes:
+- **Captured.** A green badge appears with the captured row count. The question is ready to ship.
+- **Capture failed.** The question is still saved, but a red badge shows the database error (e.g., `syntax error at or near "SELET"`). Fix the SQL and click **"Save Question"** again — capture will retry.
+
 ### Step 3: Student Enrollment
+*Allowed only while the examination is inactive.*
+
 1. Navigate to the **"Manage Accounts"** tab.
 2. Create student accounts individually.
 3. For bulk creation (150+ students), use the API: `POST /api/v1/users/bulk`.
+4. Assign students to the examination via **"Assign Students"** on the exam dashboard.
+
+### Step 3b: Importing a Class Roster
+Instead of creating student accounts individually, you can bulk-import an entire class roster from a spreadsheet:
+
+1. Navigate to the **"Students"** tab in the Lecturer dashboard.
+2. Locate the **"Import Roster"** panel.
+3. Prepare your file in **.csv** or **.xlsx** format. The file must contain a **header row** with the following columns (column order does not matter; names are case-insensitive):
+
+   | Required Column | Accepted Aliases |
+   |---|---|
+   | Student number | student_number, Student No |
+   | SECLEC | sec_lec, lecture_section |
+   | SECLAB | sec_lab, lab_section |
+   | Student_id | student id, student_id_ext, external_id |
+   | First Name | first_name, firstname, given name |
+   | Last Name | last_name, lastname, surname, family name |
+
+4. Click **"Choose File"**, select your spreadsheet, then click **"Import"**.
+5. Successfully imported students appear with status **Created** or **Updated** (if re-imported). Rows with errors (e.g., missing student number) appear in the **Errors** list with the specific problem.
+
+**Default login credentials for imported students:**
+- Username: the student's **student number**
+- Password: the student's **student number** (initial; same as username)
+
+Students should change their password on first login via the **"Profile"** settings.
+
+**Re-import behaviour:** Re-uploading the same roster updates name and section columns but **does not reset passwords**. Students who have already changed their password keep it after a re-import.
+
+### Step 4: Activate the Examination
+Activation is the point of no return for question edits. Click **"Activate"** on the examination card.
+
+- **Pre-flight check.** The system refuses to activate unless every question has a successfully captured Correct Result. If any question is in `failed` or `pending` state, the dialog lists them and you must fix them first.
+- **Once active**, students enrolled in the exam will see it in their dashboard. Curriculum imports, question edits, and student assignments are blocked until you deactivate.
+
+### Step 5: End the Examination
+Click **"Deactivate"** on the examination card. This:
+- Rejects any further submissions.
+- Drops the per-exam sandbox `sandbox_exam_{examID}` (a single `DROP SCHEMA … CASCADE`). Pure-SELECT exams have no sandbox to drop.
+- Retains all submissions and scores in `app.submissions` for read-only review.
+
+### Practice Questions
+The practice module lets you publish questions students can attempt at any time outside of active exams.
+
+#### Authoring Practice Questions
+1. Navigate to the **"Practice"** tab in the Lecturer dashboard.
+2. Fill in the question form: Type (QUERY or DML), Target Table (DML only), Correct SQL, and Points.
+3. Click **"Save Practice Question"**.
+   - The system immediately runs your Correct SQL against the practice schema, captures the expected result, and shows a capture-status badge (green = captured, red = failed with error, amber = pending).
+   - Fix the SQL and re-save if the badge is red.
+4. To view all practice questions, click the **"List Practice Questions"** button.
+5. To delete a question, click **"Delete"** next to it. Deletions do not affect existing attempt records.
+
+#### Resetting the Practice Sandbox
+The practice sandbox (sandbox_practice schema) is shared across all students. If the curriculum schema (public.*) changes — e.g., after importing a new schema — the practice sandbox must be manually reset:
+1. Click **"Reset Practice Sandbox"** in the Practice tab.
+2. The system drops sandbox_practice and re-clones every table from public.* using the same LIKE INCLUDING ALL + INSERT ... SELECT pattern as exam sandbox initialization.
+3. **Caution:** Any in-flight practice DML submission will see an error if a reset races with it. Perform resets when student traffic is low.
+
+### Step 6: Reviewing and Exporting Results
+Once students have completed their assessments, you can review their performance:
+
+1. Navigate to the **"Results"** tab in the Lecturer dashboard.
+2. The table shows a consolidated view of all students, including:
+   - Profile information (Student Number, Name, Sections).
+   - Latest score for each examination.
+   - Total points earned from Practice questions.
+   - Grand Total across all assessments.
+3. Click **"Export Scores (CSV)"** to download the complete results for all students in a format suitable for grading spreadsheets. The CSV includes dynamic columns for each exam in the system.
 
 ---
 
@@ -68,11 +145,58 @@ Students interact only with the examination interface.
 3. Click **"Submit Answer"**.
 4. The system will evaluate your query in a dedicated, isolated sandbox. You will receive a score and feedback (Correct/Incorrect) immediately.
 
+### Using Practice Mode
+Practice mode lets you attempt SQL questions independently of scheduled exams.
+
+1. Navigate to **"/practice"** in the top navigation bar.
+2. Browse available practice questions. Each question shows its type (QUERY or DML) and point value.
+3. Write your SQL in the editor and click **"Submit"** for a scored attempt, or **"Preview"** to see your result set without recording a score.
+4. After submitting, the system shows your score and feedback (Correct / Incorrect / Syntax Error).
+5. Click **"My Attempts"** to review your full attempt history for each practice question.
+
+**When practice is unavailable:** If a lecturer activates an examination, practice mode is temporarily locked system-wide. The interface displays a notice and all practice submit/preview requests return HTTP 423. Practice becomes available again once the exam is deactivated.
+
+### Viewing Your Results
+1. Click **"Results"** in the top navigation bar, or navigate directly to `/student/results`.
+2. The Results page shows a summary card for each exam you are enrolled in: number of questions answered, correct answers, and your total score.
+3. Click on an exam card to see your detailed results - one row per question showing your latest submitted SQL, the score, and whether it was marked correct.
+
+Your results are always visible, even while an exam is still active.
+
+---
+
+## 3a. Keyboard Shortcuts and Accessibility
+The frontend supports a small set of keyboard shortcuts to speed up common actions:
+
+| Shortcut | Where | Action |
+|---|---|---|
+| **Ctrl/Cmd + Enter** | Student exam editor, Practice editor, Lecturer question form | Submit the current SQL / save the question |
+| **Mod + /** | Any SQL editor | Toggle line comment in the CodeMirror editor |
+| **Escape** | Confirm dialog | Cancel the dialog (equivalent to clicking "Cancel") |
+| **Escape** | Mobile hamburger drawer | Close the drawer |
+| **Tab / Shift+Tab** | Confirm dialog, mobile drawer | Focus stays trapped inside; cycles between focusable elements |
+
+Other UX behaviours worth knowing:
+
+- **Format SQL button** — Each SQL editor has a "Format SQL" button that pretty-prints your query (PostgreSQL dialect, uppercased keywords, two-space indent).
+- **Autosave** — When you start typing a Question Requirement in the Lecturer dashboard, your draft is saved to your browser's localStorage every few seconds and restored if you refresh the page.
+- **Form validation** — Required fields display an inline red message after you first interact with them. The form blocks submission while errors are showing.
+- **Double-submit guard** — Submit / Save buttons are single-flight; clicking twice does not fire twice.
+- **Progress strip** — Students see a per-exam progress strip showing answered / correct / total questions and percentage.
+- **Quick navigation** — Press **Tab** to move between fields in any form; the modal/drawer focus trap keeps you from accidentally tabbing into background content.
+- **Mobile** — Below 768 px viewport width, the top nav collapses into a hamburger button (top right); tap it to open the drawer.
+
 ---
 
 ## 4. Technical Architecture Notes
-- **Schema Layout:** System tables live in the `app` schema; the curriculum lives in `public`; each student gets a `student_{id}` sandbox containing a copy of every `public` table.
-- **Sandboxing:** Every submission runs in the student's dedicated `student_{id}` schema. The schema is created on first submission and reused on subsequent submissions — only missing tables are cloned, so repeat requests are cheap.
-- **DML Reset:** Before each DML evaluation, only the question's target table is rebuilt from `public`, leaving the rest of the sandbox untouched.
-- **Security:** Student queries run under a restricted PostgreSQL role (`exam_student`) with limited CRUD-only permissions on the student's own schema.
-- **Queueing:** Submissions are serialised per student via Postgres advisory locks (`pg_advisory_lock`), so the "one-by-one per student" guarantee continues to hold even when multiple backend instances are running.
+For the full design, see `ARCHITECTURE.md § Phase Lifecycle`. Headlines:
+
+- **Schema Layout:** System tables live in `app.*`; the curriculum lives in `public.*` (frozen during the active window); DML submissions share one per-exam sandbox `sandbox_exam_{examID}` cloned from `public.*` at activation.
+- **Cached Correct Result:** When a question is saved, the system runs the teacher SQL once and caches the expected output on `app.questions`. Submissions are graded against this cache — teacher SQL is **not** re-executed per submission.
+- **Freeze-on-Activate:** Activating an examination freezes its questions and the curriculum. Question edits, schema imports, and student assignments are rejected until deactivation.
+- **Two evaluation paths:**
+  - *SELECT (Query):* Reads frozen `public.*` directly under role `exam_student_readonly` (only `USAGE` + `SELECT`). No clone, no queue — data-modifying CTEs are rejected at the engine level on permissions. A 30 s per-query timeout bounds pathological queries.
+  - *DML:* Runs against `sandbox_exam_{examID}` under role `exam_student` (CRUD), serialised through the global in-process FIFO `SubmissionQueue` (one worker goroutine, channel capacity 256, 30 s per-job timeout) so only one student at a time mutates the sandbox.
+- **Hermetic DML Evaluation:** Each DML submission is wrapped in `BEGIN; SAVEPOINT student_eval; … ROLLBACK TO SAVEPOINT student_eval; COMMIT`. The student's writes never persist past the rollback, so the next student in the queue starts from the same byte-identical sandbox state.
+- **Persistence:** Every submission (success or failure) is recorded in `app.submissions` for audit and final scoring.
+- **Queueing:** All DML submissions across the whole system serialise through a single FIFO worker. When the queue is saturated, the submitter receives HTTP 503; on per-job timeout, HTTP 504. SELECT submissions don't queue at all.

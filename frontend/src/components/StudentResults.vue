@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import ResultTable from './ResultTable.vue'
-import { useNotifications } from '../services/notification_service'
-
-const { notify } = useNotifications()
+import EmptyState from './EmptyState.vue'
+import Skeleton from './Skeleton.vue'
+import { handleApiError } from '../services/error_handler'
+import { formatDate, formatRelative } from '../utils/format_date'
 
 interface ExamResult {
   exam_id: number
@@ -64,8 +65,8 @@ const fetchExams = async () => {
     if (response.ok) {
       exams.value = await response.json()
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load exam results' })
   } finally {
     loadingExams.value = false
   }
@@ -81,8 +82,8 @@ const fetchPracticeSummary = async () => {
     if (response.ok) {
       practiceSummary.value = await response.json()
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load practice summary' })
   } finally {
     loadingPractice.value = false
   }
@@ -99,8 +100,8 @@ const fetchExamDetails = async (examId: number) => {
     if (response.ok) {
       selectedExam.value = await response.json()
     }
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load exam details' })
   } finally {
     loadingDetails.value = false
   }
@@ -120,37 +121,46 @@ onMounted(() => {
   fetchPracticeSummary()
 })
 
-const formatDate = (dateStr: string) => {
-  return new Date(dateStr).toLocaleString()
-}
-
 const getColumns = (rows: any[]) => {
   if (!rows || rows.length === 0) return []
   return Object.keys(rows[0])
+}
+
+// Translate a (scored, max) pair into the CMS-spec score class:
+//  - 0          → score-zero    (translucent red)
+//  - (0, max)   → score-partial (translucent amber)
+//  - == max     → score-full    (translucent green)
+//  - undefined  → score-pending (grey)
+function scoreClass(scored: number | null | undefined, max: number | null | undefined): string {
+  if (scored == null || max == null || max <= 0) return 'score-pending'
+  if (scored <= 0) return 'score-zero'
+  if (scored >= max) return 'score-full'
+  return 'score-partial'
 }
 </script>
 
 <template>
   <div class="results-container">
     <div v-if="view === 'list'">
-      <header class="view-header">
-        <h1>Your Results</h1>
-      </header>
+      <div class="page-header">
+        <h1>Submissions &amp; Results</h1>
+        <p class="page-subtitle">All your graded examination and practice submissions.</p>
+      </div>
 
-      <section class="overall-summary">
-        <h2>Performance Overview</h2>
+      <section class="overall-summary well">
+        <h2 style="margin-bottom: var(--space-3);">Performance Overview</h2>
         <div class="summary-grid">
           <div class="summary-item">
             <span class="muted small">Exam Score</span>
-            <p class="summary-val">{{ totalExamScore.toFixed(2) }}</p>
+            <p class="summary-val tabular">{{ totalExamScore.toFixed(2) }}</p>
           </div>
           <div class="summary-item">
             <span class="muted small">Practice Points</span>
-            <p class="summary-val">{{ totalPracticePoints.toFixed(2) }}</p>
+            <p class="summary-val tabular">{{ totalPracticePoints.toFixed(2) }}</p>
           </div>
           <div class="summary-item highlight">
             <span class="muted small">Grand Total</span>
-            <p class="summary-val">{{ grandTotal.toFixed(2) }}</p>
+            <p class="summary-val tabular">{{ grandTotal.toFixed(2) }}</p>
           </div>
         </div>
       </section>
@@ -173,13 +183,9 @@ const getColumns = (rows: any[]) => {
 
       <!-- Exam List View -->
       <div v-if="activeTab === 'exams'">
-        <div v-if="loadingExams" class="loading-state">
-          <p>Loading results...</p>
-        </div>
+        <Skeleton v-if="loadingExams" variant="table-row" :rows="3" :cols="4" />
 
-        <div v-else-if="exams.length === 0" class="empty-state card">
-          <p class="muted">No exams enrolled yet.</p>
-        </div>
+        <EmptyState v-else-if="!loadingExams && exams.length === 0" title="No exam attempts yet" body="Once you submit an exam answer, results appear here." />
 
         <div v-else class="exam-grid">
           <div 
@@ -209,7 +215,10 @@ const getColumns = (rows: any[]) => {
               </div>
               <div class="stat">
                 <span class="muted small">Score</span>
-                <p>{{ exam.total_score }} / {{ exam.max_score }} pts</p>
+                <!-- max_score comes from /quiz/results ExamResultSummary.MaxScore, populated by GetStudentResultsSummary query -->
+                <span class="score-pill" :class="scoreClass(exam.total_score, exam.max_score)">
+                  {{ exam.total_score }} / {{ exam.max_score }}
+                </span>
               </div>
             </div>
           </div>
@@ -218,13 +227,9 @@ const getColumns = (rows: any[]) => {
 
       <!-- Practice Summary View -->
       <div v-else-if="activeTab === 'practice'">
-        <div v-if="loadingPractice" class="loading-state">
-          <p>Loading practice summary...</p>
-        </div>
-        <div v-else-if="practiceSummary.length === 0" class="empty-state card">
-          <p class="muted">No practice questions found.</p>
-        </div>
-        <div v-else class="card table-card">
+        <Skeleton v-if="loadingPractice" variant="table-row" :rows="3" :cols="4" />
+        <EmptyState v-else-if="!loadingPractice && practiceSummary.length === 0" title="No practice attempts yet" body="Head to the Practice page to start." />
+        <div v-else class="card table-card sticky-table-head">
           <table class="data-table">
             <thead>
               <tr>
@@ -255,19 +260,20 @@ const getColumns = (rows: any[]) => {
 
     <!-- Drill-down Details View -->
     <div v-else-if="view === 'details' && selectedExam">
-      <header class="view-header">
-        <button class="btn back-btn" @click="goBack">
-          &larr; Back to List
-        </button>
-        <h1>{{ selectedExam.exam_title }}</h1>
-      </header>
+      <div class="page-header" style="display:flex; align-items:flex-end; justify-content:space-between; gap:var(--space-3);">
+        <div>
+          <h1>{{ selectedExam.exam_title }}</h1>
+          <p class="page-subtitle">Per-question grading breakdown.</p>
+        </div>
+        <button class="btn back-btn" @click="goBack">&larr; Back to list</button>
+      </div>
 
       <div v-if="loadingDetails" class="loading-state">
         <p>Loading question details...</p>
       </div>
 
       <div v-else class="details-content">
-        <div class="card table-card">
+        <div class="card table-card sticky-table-head">
           <table class="data-table questions-table">
             <thead>
               <tr>
@@ -290,15 +296,15 @@ const getColumns = (rows: any[]) => {
                       {{ q.question_type }}
                     </span>
                   </td>
-                  <td>{{ q.points }}</td>
-                  <td>
+                  <td class="tabular">{{ q.points }}</td>
+                  <td
+                    class="score-cell"
+                    :class="q.submission
+                      ? scoreClass(q.submission.is_correct ? q.points : 0, q.points)
+                      : 'score-pending'"
+                  >
                     <template v-if="q.submission">
-                      <span 
-                        class="badge" 
-                        :class="q.submission.is_correct ? 'badge-success' : 'badge-danger'"
-                      >
-                        {{ q.submission.is_correct ? 'Yes' : 'No' }}
-                      </span>
+                      {{ q.submission.is_correct ? q.points : 0 }} / {{ q.points }}
                     </template>
                     <template v-else>&mdash;</template>
                   </td>
@@ -306,7 +312,7 @@ const getColumns = (rows: any[]) => {
                     <code v-if="q.submission">{{ q.submission.sql_text }}</code>
                     <span v-else class="muted">&mdash;</span>
                   </td>
-                  <td>{{ q.submission ? formatDate(q.submission.submitted_at) : '&mdash;' }}</td>
+                  <td><template v-if="q.submission"><span :title="new Date(q.submission.submitted_at).toISOString()">{{ formatDate(q.submission.submitted_at) }} <span class="muted small">({{ formatRelative(q.submission.submitted_at) }})</span></span></template><template v-else>&mdash;</template></td>
                 </tr>
                 <!-- Validation Details Row -->
                 <tr v-if="q.submission && q.submission.validation_details" class="details-row">
@@ -352,38 +358,16 @@ const getColumns = (rows: any[]) => {
 </template>
 
 <style scoped>
-.results-container {
-  max-width: 1200px;
-  margin: var(--space-6) auto;
-  padding: 0 var(--space-4);
-}
-
-.view-header {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  margin-bottom: var(--space-6);
-}
-
-.view-header h1 {
-  margin: 0;
-  font-size: 1.75rem;
-  letter-spacing: -0.01em;
-  font-weight: 800;
-  color: var(--color-text);
-}
+.results-container { /* sits inside .cms-main, which provides the panel */ }
 
 .overall-summary {
-  margin-bottom: var(--space-6);
-  background: var(--color-surface);
-  border: 2px solid var(--color-border);
-  padding: var(--space-6);
+  margin-bottom: var(--space-5);
 }
 
 .overall-summary h2 {
-  font-size: 1.25rem;
-  margin-bottom: var(--space-4);
-  font-weight: 800;
+  font-size: 1.05rem;
+  margin-bottom: var(--space-3);
+  font-weight: 700;
   color: var(--color-text);
 }
 
@@ -395,48 +379,51 @@ const getColumns = (rows: any[]) => {
 
 .summary-item {
   padding: var(--space-4);
-  border: 2px solid var(--color-border);
+  border: 1px solid var(--color-border-soft);
   background: var(--color-surface);
+  border-radius: var(--radius);
 }
 
 .summary-item.highlight {
-  background: var(--color-surface-muted);
+  background: var(--color-primary-bg);
+  border-color: var(--color-primary);
 }
 
 .summary-val {
   margin: 4px 0 0 0;
-  font-size: 1.75rem;
-  font-weight: 800;
+  font-size: 1.55rem;
+  font-weight: 700;
+  font-family: var(--font-mono);
   color: var(--color-text);
   line-height: 1;
 }
 
 .tab-bar {
-  display: flex;
+  display: inline-flex;
   gap: 0;
-  background: var(--color-border);
-  padding: 0;
-  margin-bottom: var(--space-6);
-  border: 2px solid var(--color-border);
+  background: var(--color-surface-muted);
+  padding: 3px;
+  margin-bottom: var(--space-5);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
 }
 
 .tab-bar button {
-  flex: 1;
-  padding: var(--space-3);
-  background: var(--color-surface);
-  border: none;
-  border-right: 2px solid var(--color-border);
-  font-weight: 700;
+  padding: 6px 16px;
+  background: transparent;
+  border: 1px solid transparent;
+  font-weight: 600;
   cursor: pointer;
-  transition: none;
-  font-size: 0.95rem;
-  color: var(--color-text);
+  font-size: 0.86rem;
+  color: var(--color-text-muted);
+  border-radius: var(--radius-sm);
 }
-.tab-bar button:last-child { border-right: none; }
-
+.tab-bar button:hover { color: var(--color-text); }
 .tab-bar button.active {
-  background: var(--color-primary);
-  color: var(--color-surface);
+  background: var(--color-surface);
+  color: var(--color-primary);
+  border-color: var(--color-border);
+  box-shadow: var(--shadow-1);
 }
 
 .exam-grid {
@@ -446,33 +433,37 @@ const getColumns = (rows: any[]) => {
 }
 
 .exam-card {
-  transition: all 0.1s ease;
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-3);
   background: var(--color-surface);
-  border: 2px solid var(--color-border);
-  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  box-shadow: var(--shadow-1);
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
 }
 
 .exam-card.clickable:hover {
-  background-color: var(--color-surface-muted);
   cursor: pointer;
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-1px);
 }
 
 .exam-card-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  border-bottom: 2px solid var(--color-border);
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--color-border-soft);
   padding-bottom: var(--space-2);
-  margin-bottom: var(--space-1);
 }
 
 .exam-card-header h3 {
   margin: 0;
-  font-size: 1.1rem;
-  font-weight: 800;
+  font-size: 0.98rem;
+  font-weight: 700;
   color: var(--color-text);
 }
 
@@ -498,46 +489,31 @@ const getColumns = (rows: any[]) => {
 .table-card {
   padding: 0;
   overflow: auto;
-  border-radius: 0;
-  border: 2px solid var(--color-border);
-}
-
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.data-table th, .data-table td {
   border: 1px solid var(--color-border);
-  padding: 0.6rem 0.8rem;
-  text-align: left;
-}
-
-.data-table th {
-  background: var(--color-surface-muted);
-  color: var(--color-text);
-  font-weight: 700;
+  border-radius: var(--radius);
+  background: var(--color-surface);
 }
 
 .requirement-cell {
   max-width: 400px;
   white-space: pre-wrap;
   font-size: 0.85rem;
-  font-weight: 600;
+  color: var(--color-text);
 }
 
 .sql-cell code {
   display: block;
-  max-width: 250px;
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  background: var(--color-surface-muted);
+  background: var(--color-surface-sunk);
   padding: 2px 8px;
-  border: 1px solid var(--color-border);
-  font-size: 0.8rem;
-  font-weight: 600;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
   font-family: var(--font-mono);
+  color: var(--color-text);
 }
 
 .details-row td {
@@ -562,29 +538,17 @@ const getColumns = (rows: any[]) => {
 }
 
 .back-btn {
-  border: 2px solid var(--color-border);
-  padding: var(--space-2) var(--space-4);
-  font-weight: 700;
+  border: 1px solid var(--color-border);
+  padding: 6px 12px;
+  font-weight: 600;
+  font-size: 0.84rem;
   background: var(--color-surface);
   color: var(--color-text);
   cursor: pointer;
+  border-radius: var(--radius);
+  flex-shrink: 0;
 }
-
-.back-btn:active {
-  transform: translateY(1px);
-}
-
-.badge {
-  padding: 2px 8px;
-  border: 1px solid var(--color-border);
-  border-radius: 0;
-  font-weight: 700;
-  font-size: 0.7rem;
-}
-.badge-success { background: var(--color-success-bg); color: var(--color-success); border-color: var(--color-success); }
-.badge-warning { background: var(--color-warning-bg); color: var(--color-warning); border-color: var(--color-warning); }
-.badge-danger { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger); }
-.badge-info { background: var(--color-primary); color: var(--color-surface); }
+.back-btn:hover { background: var(--color-surface-muted); }
 
 @media (max-width: 768px) {
   .view-header {

@@ -1,150 +1,823 @@
+/* ===========================================================================
+ * SQL Quiz Grader Portal — Design System
+ * Refined-institutional CMS aesthetic: warm-grey/beige canvas, white panels,
+ * soft borders, translucent HSL scoring, blue clarification alerts.
+ * =========================================================================== */
+
 :root {
-  --color-primary: #000000;
-  --color-accent: #000000;
-  --color-success: #166534;
-  --color-success-bg: #dcfce7;
-  --color-warning: #854d0e;
-  --color-warning-bg: #fef9c3;
-  --color-danger: #991b1b;
-  --color-danger-bg: #fee2e2;
-  --color-bg: #ffffff;
-  --color-surface: #ffffff;
-  --color-surface-muted: #f3f4f6;
-  --color-border: #000000;
-  --color-text: #000000;
-  --color-text-muted: #6b7280;
-  --radius: 0px;
+  /* --- Canvas & surfaces ------------------------------------------------- */
+  --color-bg:            #f4f1ec;   /* warm beige canvas */
+  --color-bg-elevated:   #ece7df;   /* deeper canvas for nav rails */
+  --color-surface:       #ffffff;   /* primary panel */
+  --color-surface-muted: #f7f5f1;   /* secondary fill (table stripes, wells) */
+  --color-surface-sunk:  #ebe7df;   /* deepest tone (table head, inset rails) */
+
+  /* --- Strokes & dividers ------------------------------------------------ */
+  --color-border:        #c9c1b3;   /* primary 1px hairline */
+  --color-border-soft:   #ddd6c7;   /* dividers inside wells */
+  --color-rule:          #b8aE9d;   /* h1 underline + emphatic dividers */
+
+  /* --- Text -------------------------------------------------------------- */
+  --color-text:          #1e1c17;   /* near-black, warm */
+  --color-text-muted:    #6b6558;
+  --color-text-subtle:   #948c7c;
+  --color-link:          #285c8a;
+  --color-link-hover:    #1c4366;
+
+  /* --- Brand / action accents ------------------------------------------- */
+  --color-primary:       #285c8a;   /* sober institutional blue */
+  --color-primary-bg:    #e6eff7;
+  --color-primary-strong:#1c4366;
+
+  /* --- Status hues (solid, used for text/badges) ------------------------- */
+  --color-success:       #2f6f3b;
+  --color-success-bg:    #e3efde;
+  --color-warning:       #8a6a14;
+  --color-warning-bg:    #faf2d4;
+  --color-danger:        #8e2727;
+  --color-danger-bg:     #f6dede;
+
+  /* --- Translucent score blocks (CMS-spec HSL) -------------------------- */
+  --score-zero:           hsla(0,   100%, 50%, 0.4);
+  --score-zero-hover:     hsla(0,   100%, 50%, 0.7);
+  --score-partial:        hsla(60,  100%, 50%, 0.4);
+  --score-partial-hover:  hsla(60,  100%, 50%, 0.7);
+  --score-full:           hsla(120, 100%, 50%, 0.4);
+  --score-full-hover:     hsla(120, 100%, 50%, 0.7);
+  --score-pending-fg:     #948c7c;
+
+  /* --- Clarification / announcement alert (CMS-spec) -------------------- */
+  --alert-info-bg:        #d9edf7;
+  --alert-info-border:    #bcd8f1;
+  --alert-info-text:      #3a87ad;
+
+  /* --- Geometry & motion ------------------------------------------------- */
+  --radius:               4px;
+  --radius-sm:            2px;
+  --radius-lg:            8px;
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
-  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --space-7: 48px;
+
+  --shadow-1:             0 1px 0 rgba(30,28,23,0.04);
+  --shadow-2:             0 1px 2px rgba(30,28,23,0.06), 0 4px 12px rgba(30,28,23,0.04);
+
+  /* --- Type ------------------------------------------------------------- */
+  --font-sans: 'Public Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+  /* --- Layout grid ------------------------------------------------------ */
+  --layout-header-h: 60px;
+  --layout-sidebar-w: 260px;
+  --layout-max-w: 1400px;
+
+  /* --- Floating schema diagram window ----------------------------------- */
+  --z-schema-window: 800;
+  --z-schema-chip:   801;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --color-primary: #ffffff;
-    --color-bg: #000000;
-    --color-surface: #000000;
-    --color-surface-muted: #1f2937;
-    --color-border: #ffffff;
-    --color-text: #ffffff;
-    --color-text-muted: #9ca3af;
-    --color-success: #4ade80;
-    --color-success-bg: #064e3b;
-    --color-warning: #fde047;
-    --color-warning-bg: #713f12;
-    --color-danger: #f87171;
-    --color-danger-bg: #7f1d1d;
-  }
-}
+/* The CMS palette is intentionally light. We do NOT invert it under
+   prefers-color-scheme: dark — the grader look is daylight-only. */
 
 * { box-sizing: border-box; }
-body { 
-  margin: 0; 
-  font-family: var(--font-sans); 
-  background-color: var(--color-bg); 
-  color: var(--color-text); 
-  line-height: 1.5;
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-feature-settings: 'ss01', 'cv11';
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
+a {
+  color: var(--color-link);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color .12s ease, color .12s ease;
+}
+a:hover { color: var(--color-link-hover); border-bottom-color: currentColor; }
+
+/* ---------- Typography ---------------------------------------------------- */
 h1, h2, h3, h4, h5, h6 {
-  font-weight: 800;
-  letter-spacing: -0.01em;
+  font-family: var(--font-sans);
+  font-weight: 700;
+  letter-spacing: -0.005em;
   margin: 0;
   color: var(--color-text);
 }
+h1 { font-size: 1.55rem; line-height: 1.25; font-weight: 800; }
+h2 { font-size: 1.15rem; font-weight: 700; }
+h3 { font-size: 1rem;    font-weight: 700; }
 
+/* The thin-rule page header used at the top of each main view, per spec. */
+.page-header {
+  margin: 0 0 var(--space-5) 0;
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-rule);
+}
+.page-header h1 {
+  font-size: 1.55rem;
+  line-height: 1.2;
+}
+.page-header .page-subtitle {
+  margin-top: 4px;
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+}
+
+/* ---------- Buttons ------------------------------------------------------- */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: var(--space-2) var(--space-4);
+  gap: 6px;
+  padding: 7px 14px;
   border-radius: var(--radius);
   cursor: pointer;
-  font-weight: 700;
-  border: 2px solid var(--color-border);
-  transition: all 0.1s ease;
-  font-size: 0.95rem;
+  font-weight: 600;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  border: 1px solid var(--color-border);
   background: var(--color-surface);
   color: var(--color-text);
+  transition: background-color .12s ease, border-color .12s ease,
+              color .12s ease, box-shadow .12s ease;
+  box-shadow: var(--shadow-1);
 }
-.btn:active {
-  transform: translateY(1px);
+.btn:hover:not(:disabled) {
+  background: var(--color-surface-muted);
+  border-color: var(--color-rule);
 }
-.btn-primary { 
-  background: var(--color-primary); 
-  color: var(--color-surface); 
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
-.btn-primary:hover:not(:disabled) { 
-  opacity: 0.9;
+.btn:disabled { opacity: .55; cursor: not-allowed; box-shadow: none; }
+
+.btn-primary {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--color-primary-strong);
 }
-.btn:disabled { 
-  opacity: 0.5; 
-  cursor: not-allowed;
+.btn-primary:hover:not(:disabled) {
+  background: var(--color-primary-strong);
+  border-color: var(--color-primary-strong);
+  color: #fff;
+}
+.btn-success {
+  background: #2f7a3e;
+  border-color: #245d30;
+  color: #fff;
+}
+.btn-success:hover:not(:disabled) { background: #245d30; color: #fff; }
+
+.btn-warning {
+  background: #c97a14;
+  border-color: #9c5d0d;
+  color: #fff;
+}
+.btn-warning:hover:not(:disabled) { background: #9c5d0d; color: #fff; }
+
+.btn-danger {
+  background: #a83232;
+  border-color: #7c2424;
+  color: #fff;
+}
+.btn-danger:hover:not(:disabled) { background: #7c2424; color: #fff; }
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--color-surface-muted);
+  border-color: var(--color-border);
 }
 
-.card { 
-  background: var(--color-surface); 
-  border: 2px solid var(--color-border); 
-  border-radius: var(--radius); 
-  padding: var(--space-5); 
+.btn-sm { padding: 4px 9px; font-size: 0.78rem; }
+.btn-lg { padding: 10px 18px; font-size: 0.95rem; }
+
+/* Legacy aliases (some components use these class names) */
+.primary-btn   { background: var(--color-primary); color: #fff; border: 1px solid var(--color-primary-strong); }
+.secondary-btn { background: var(--color-surface); color: var(--color-text); border: 1px solid var(--color-border); }
+.success-btn   { background: #2f7a3e; color: #fff; border: 1px solid #245d30; }
+.fail-btn      { background: #a83232; color: #fff; border: 1px solid #7c2424; }
+.toggle-btn    { background: var(--color-surface); color: var(--color-text); border: 1px solid var(--color-border); }
+.primary-btn, .secondary-btn, .success-btn, .fail-btn, .toggle-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 7px 14px; border-radius: var(--radius);
+  font-weight: 600; cursor: pointer;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.primary-btn:hover   { background: var(--color-primary-strong); }
+.secondary-btn:hover { background: var(--color-surface-muted); }
+.success-btn:hover   { background: #245d30; }
+.fail-btn:hover      { background: #7c2424; }
+
+/* ---------- Panels & cards ----------------------------------------------- */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-1);
 }
 
-.field { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-4); }
-.field > label { font-size: 0.9rem; font-weight: 700; color: var(--color-text); }
-
-.input { 
-  padding: var(--space-2) var(--space-3); 
-  border: 2px solid var(--color-border); 
-  border-radius: var(--radius); 
-  font-size: 1rem; 
-  font-family: var(--font-mono); 
-  background: var(--color-surface); 
-  color: var(--color-text); 
-  width: 100%; 
+.well {
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  padding: var(--space-4);
 }
-.input:focus { 
+
+/* ---------- Form fields -------------------------------------------------- */
+.field { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--space-4); }
+.field > label,
+.input-group > label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--color-text);
+  letter-spacing: 0.01em;
+}
+
+.input, .form-grid input, .form-grid select, .form-grid textarea,
+.input-group input, .input-group select, .input-group textarea,
+select, textarea, input[type='text'], input[type='number'], input[type='password'],
+input[type='email'], input[type='search'], input[type='date'],
+input[type='datetime-local'], input[type='file'] {
+  padding: 7px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 0.92rem;
+  font-family: var(--font-sans);
+  background: var(--color-surface);
+  color: var(--color-text);
+  width: 100%;
+  transition: border-color .12s ease, box-shadow .12s ease, background-color .12s ease;
+}
+.input:focus, .form-grid input:focus, .form-grid select:focus, .form-grid textarea:focus,
+.input-group input:focus, .input-group select:focus, .input-group textarea:focus,
+select:focus, textarea:focus, input:focus {
   outline: none;
   border-color: var(--color-primary);
-  background: var(--color-surface-muted);
+  box-shadow: 0 0 0 3px var(--color-primary-bg);
+}
+.input.is-invalid, .input[aria-invalid="true"],
+[aria-invalid="true"] {
+  border-color: var(--color-danger);
+  background: var(--color-danger-bg);
 }
 
-.badge { 
-  display: inline-flex; 
-  align-items: center; 
-  padding: 2px 10px; 
-  font-size: 0.75rem; 
-  font-weight: 700; 
+textarea { font-family: var(--font-sans); line-height: 1.5; min-height: 80px; }
+input[type='file'] { padding: 5px; background: var(--color-surface); }
+
+/* Code-shaped inputs (SQL, identifiers) use mono on demand */
+.input-mono { font-family: var(--font-mono); }
+
+/* ---------- Badges ------------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  background: var(--color-surface-muted);
+  color: var(--color-text);
+  border: 1px solid var(--color-border-soft);
+  white-space: nowrap;
+}
+.badge-success { background: var(--color-success-bg); color: var(--color-success); border-color: #c4dfba; }
+.badge-warning { background: var(--color-warning-bg); color: var(--color-warning); border-color: #ecd998; }
+.badge-danger  { background: var(--color-danger-bg);  color: var(--color-danger);  border-color: #e9bcbc; }
+.badge-info    { background: var(--alert-info-bg);    color: var(--alert-info-text); border-color: var(--alert-info-border); }
+.badge-neutral { background: var(--color-surface-muted); color: var(--color-text-muted); border-color: var(--color-border-soft); }
+
+/* "Unread" counter pill — borrowed from the CMS communications panel. */
+.badge-count {
+  background: #c97a14;
+  color: #fff;
+  border-color: #9c5d0d;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px;
+  font-size: 0.7rem;
+}
+
+/* Captured/failed/pending small labels used inside lecturer panels. */
+.badge.captured { background: var(--color-success-bg); color: var(--color-success); border-color: #c4dfba; }
+.badge.failed   { background: var(--color-danger-bg);  color: var(--color-danger);  border-color: #e9bcbc; }
+.badge.pending  { background: var(--color-warning-bg); color: var(--color-warning); border-color: #ecd998; }
+
+/* ---------- Tables ------------------------------------------------------- */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.data-table th, .data-table td {
+  border-bottom: 1px solid var(--color-border-soft);
+  padding: 8px 12px;
+  text-align: left;
+  vertical-align: middle;
+}
+.data-table th {
+  background: var(--color-surface-sunk);
+  color: var(--color-text);
+  font-weight: 700;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--color-border);
+}
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:nth-child(even) td { background: var(--color-surface-muted); }
+.data-table tr:hover td { background: #f1ece2; }
+
+/* Striped sub-table (subtask testcases per CMS spec) */
+.striped-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.striped-table th, .striped-table td {
+  padding: 6px 10px; text-align: left;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+.striped-table th {
+  font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+  background: var(--color-surface-sunk); color: var(--color-text-muted);
+}
+.striped-table tr:nth-child(odd) td { background: var(--color-surface-muted); }
+
+/* ---------- Score cells (the CMS hallmark) -------------------------------
+ * Apply .score-cell + one of .score-zero / .score-partial / .score-full.
+ * For pending/undefined, omit the modifier — falls back to grey text. */
+.score-cell {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: center;
+  transition: background-color .14s ease;
+}
+.score-cell.score-zero    { background: var(--score-zero); }
+.score-cell.score-partial { background: var(--score-partial); }
+.score-cell.score-full    { background: var(--score-full); }
+.score-cell.score-pending { color: var(--score-pending-fg); }
+.data-table tr:hover .score-cell.score-zero    { background: var(--score-zero-hover); }
+.data-table tr:hover .score-cell.score-partial { background: var(--score-partial-hover); }
+.data-table tr:hover .score-cell.score-full    { background: var(--score-full-hover); }
+
+/* Standalone score pill (used outside tables) */
+.score-pill {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 56px; padding: 4px 10px;
+  border-radius: var(--radius);
+  font-family: var(--font-mono); font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid rgba(30,28,23,0.12);
+}
+.score-pill.score-zero    { background: var(--score-zero); }
+.score-pill.score-partial { background: var(--score-partial); }
+.score-pill.score-full    { background: var(--score-full); }
+.score-pill.score-pending { color: var(--score-pending-fg); background: var(--color-surface-muted); }
+
+/* ---------- Alert: clarification / announcement (CMS blue) -------------- */
+.alert-info {
+  background: var(--alert-info-bg);
+  border: 1px solid var(--alert-info-border);
+  color: var(--alert-info-text);
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+}
+.alert-info strong, .alert-info .alert-title { color: #2b6987; font-weight: 700; }
+.alert-info + .alert-info { margin-top: var(--space-3); }
+.alert-info .alert-date { float: right; font-size: 0.78rem; color: #5095b3; }
+.alert-info .alert-body { white-space: pre-line; clear: both; margin-top: 6px; }
+
+.alert-warning {
+  background: var(--color-warning-bg);
+  border: 1px solid #ecd998;
+  color: var(--color-warning);
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+}
+.alert-danger {
+  background: var(--color-danger-bg);
+  border: 1px solid #e9bcbc;
+  color: var(--color-danger);
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+}
+
+/* ---------- Muted helpers ------------------------------------------------ */
+.muted { color: var(--color-text-muted); font-size: 0.88rem; }
+.muted-subtle { color: var(--color-text-subtle); font-size: 0.82rem; }
+.mono { font-family: var(--font-mono); }
+.tabular { font-variant-numeric: tabular-nums; }
+
+/* ---------- Responsive table wrapper utility ----------------------------- */
+.responsive-table-wrap {
+  position: relative;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   background: var(--color-surface);
 }
-.badge-success { background: var(--color-success-bg); color: var(--color-success); border-color: var(--color-success); }
-.badge-warning { background: var(--color-warning-bg); color: var(--color-warning); border-color: var(--color-warning); }
-.badge-danger  { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger); }
-.badge-info    { background: var(--color-primary); color: var(--color-surface); }
+@media (max-width: 767.98px) {
+  .responsive-table-wrap::after {
+    content: '';
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 12px;
+    background: linear-gradient(to right, transparent, rgba(0,0,0,0.06));
+    pointer-events: none;
+  }
+  .form-grid { grid-template-columns: 1fr !important; }
+  .preview-table th,
+  .preview-table td,
+  .data-table th,
+  .data-table td {
+    padding: 6px 8px;
+    font-size: 0.78rem;
+  }
+}
 
-.data-table { 
-  width: 100%; 
-  border-collapse: collapse; 
-  font-size: 0.9rem; 
-  border: 2px solid var(--color-border); 
+/* ---------- Sticky table head ------------------------------------------- */
+.sticky-table-head {
+  max-height: var(--sticky-max-h, 60vh);
+  overflow-y: auto;
 }
-.data-table th, .data-table td { 
-  border: 1px solid var(--color-border); 
-  padding: var(--space-2) var(--space-3); 
-  text-align: left; 
+.sticky-table-head thead th {
+  position: sticky;
+  top: 0;
+  background: var(--color-surface-sunk);
+  z-index: 1;
+  box-shadow: inset 0 -1px 0 var(--color-border), inset 0 1px 0 var(--color-border);
 }
-.data-table th { 
-  background: var(--color-surface-muted); 
-  color: var(--color-text); 
-  font-weight: 800; 
+@media (max-width: 767.98px) {
+  .sticky-table-head { max-height: var(--sticky-max-h-mobile, 50vh); }
 }
-.data-table tr:nth-child(even) { background: var(--color-surface); }
 
-.muted { color: var(--color-text-muted); font-size: 0.9rem; }
+/* ---------- Skeleton (existing utility, retuned) ------------------------- */
+.skeleton {
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  position: relative;
+  overflow: hidden;
+  display: block;
+}
+.skeleton::after {
+  content: '';
+  position: absolute; top: 0; left: -100%;
+  width: 100%; height: 100%;
+  background: linear-gradient(to right, transparent, rgba(255,255,255,0.55), transparent);
+  animation: skel-shimmer 1.2s infinite;
+}
+@keyframes skel-shimmer {
+  from { left: -100%; } to { left: 100%; }
+}
+.skeleton-line { margin-bottom: 8px; }
+.skeleton-table {
+  width: 100%; border-collapse: collapse;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.skeleton-table td {
+  border-bottom: 1px solid var(--color-border-soft);
+  padding: var(--space-2);
+}
+.skeleton-cell { height: 12px; border-radius: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after { animation: none; }
+}
+
+.responsive-table-wrap .scroll-hint {
+  position: absolute; top: 4px; right: 8px;
+  font-family: var(--font-mono); font-size: 0.68rem; font-weight: 700;
+  background: var(--color-surface); color: var(--color-text-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* ---------- Layout shell ------------------------------------------------- */
+.cms-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: var(--layout-header-h) 1fr;
+  background: var(--color-bg);
+}
+
+.cms-header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: 0 var(--space-5);
+  height: var(--layout-header-h);
+  background: linear-gradient(180deg, #ffffff 0%, #faf7f0 100%);
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: var(--shadow-1);
+}
+.cms-brand {
+  display: inline-flex; align-items: center; gap: 10px;
+  font-weight: 800; font-size: 1.02rem; letter-spacing: -0.005em;
+  color: var(--color-text);
+  cursor: pointer;
+  user-select: none;
+}
+.cms-brand .brand-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  background: var(--color-primary);
+  color: #fff;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+.cms-brand .brand-sub {
+  margin-left: 6px;
+  font-weight: 500;
+  font-size: 0.82rem;
+  color: var(--color-text-muted);
+  letter-spacing: 0.01em;
+}
+.cms-header-right {
+  display: flex; align-items: center; gap: var(--space-3);
+  font-size: 0.86rem;
+}
+.cms-header-right .header-greeting { color: var(--color-text-muted); }
+.cms-header-right .header-greeting strong { color: var(--color-text); font-weight: 700; }
+.cms-header-right .locale-select {
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  border-radius: var(--radius);
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  width: auto;
+}
+.cms-header-right .logout-btn {
+  background: #c97a14;
+  border-color: #9c5d0d;
+  color: #fff;
+}
+.cms-header-right .logout-btn:hover { background: #9c5d0d; color: #fff; }
+
+.cms-body {
+  display: grid;
+  grid-template-columns: var(--layout-sidebar-w) minmax(0, 1fr);
+  gap: var(--space-5);
+  width: 100%;
+  max-width: var(--layout-max-w);
+  margin: 0 auto;
+  padding: var(--space-5);
+}
+
+.cms-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  align-self: start;
+  position: sticky;
+  top: calc(var(--layout-header-h) + var(--space-5));
+}
+
+.cms-main {
+  min-width: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-5) var(--space-6);
+  box-shadow: var(--shadow-1);
+}
+
+/* When a view wants to render full-bleed (e.g. login), opt out of .cms-main. */
+.cms-main.is-bare {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+
+/* ---------- Sidebar widgets ---------------------------------------------- */
+.sidebar-clock {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  box-shadow: var(--shadow-1);
+}
+.sidebar-clock .clock-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 8px;
+}
+.sidebar-clock .clock-row + .clock-row {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-border-soft);
+}
+.sidebar-clock .clock-label {
+  font-family: var(--font-sans);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+.sidebar-clock .clock-value {
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--color-text);
+}
+.sidebar-clock .clock-value.is-urgent { color: #a83232; }
+.sidebar-clock .clock-value.is-warn   { color: #c97a14; }
+
+.sidebar-nav {
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  padding: 6px;
+}
+.sidebar-nav .nav-section {
+  padding: 6px 10px 4px;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-subtle);
+  font-weight: 700;
+}
+.sidebar-nav .nav-section:not(:first-child) {
+  margin-top: 4px;
+  border-top: 1px dashed var(--color-border-soft);
+  padding-top: 10px;
+}
+.sidebar-nav a, .sidebar-nav button.nav-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 0.88rem;
+  font-weight: 500;
+  color: var(--color-text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.sidebar-nav a:hover, .sidebar-nav button.nav-item:hover {
+  background: var(--color-surface);
+  border-color: var(--color-border-soft);
+  color: var(--color-link);
+}
+.sidebar-nav a.router-link-active,
+.sidebar-nav a.is-active,
+.sidebar-nav button.nav-item.is-active {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-primary);
+  font-weight: 700;
+  box-shadow: inset 3px 0 0 var(--color-primary);
+}
+.sidebar-nav .nav-task-group {
+  padding: 4px;
+}
+.sidebar-nav .nav-task-title {
+  display: block;
+  padding: 6px 10px 2px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--color-text);
+  letter-spacing: -0.005em;
+}
+.sidebar-nav .nav-sublink {
+  padding-left: 22px;
+  font-size: 0.83rem;
+  color: var(--color-text-muted);
+}
+.sidebar-nav .nav-sublink.is-active { color: var(--color-primary); }
+
+/* ---------- Mobile nav drawer (keeps existing hamburger behavior) -------- */
+.nav-hamburger {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.hbar { display: block; width: 18px; height: 2px; background: var(--color-text); border-radius: 1px; }
+
+@media (max-width: 1023.98px) {
+  .cms-body {
+    grid-template-columns: minmax(0, 1fr);
+    padding: var(--space-4);
+  }
+  .cms-sidebar {
+    position: static;
+    order: 2;
+  }
+}
+@media (max-width: 767.98px) {
+  .cms-header { padding: 0 var(--space-3); }
+  .cms-header-right .header-greeting { display: none; }
+  .cms-main { padding: var(--space-4); }
+  .cms-brand .brand-sub { display: none; }
+}
+
+/* ---------- Subtask collapsible (CMS detail drawer) ---------------------- */
+.subtask {
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  background: var(--color-surface);
+  overflow: hidden;
+}
+.subtask-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px;
+  cursor: pointer;
+  background: var(--color-surface-muted);
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+.subtask-head .chev {
+  display: inline-block; width: 0; height: 0;
+  border-style: solid;
+  border-width: 5px 0 5px 6px;
+  border-color: transparent transparent transparent var(--color-text-muted);
+  transition: transform .15s ease;
+}
+.subtask.is-open .subtask-head .chev { transform: rotate(90deg); }
+.subtask-body { padding: 10px 14px; }
+
+/* ---------- Pre-formatted log (compile output etc.) --------------------- */
+.code-log {
+  background: #1e1c17;
+  color: #f4f1ec;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 0.83rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  border: 1px solid #3a3631;
+}
+
+/* ---------- Form grid (reused by lecturer/admin/practice authoring) ----- */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+.input-group { display: flex; flex-direction: column; gap: 4px; }
+.input-group.full-width { grid-column: 1 / -1; }
+
+/* ---------- Misc legacy compatibility ----------------------------------- */
+.app-container { min-height: 100vh; background: var(--color-bg); }
+.top-nav, .nav-links { /* legacy classnames retained on old views — neutralised */ }
+.nav-links button { background: transparent; }
+
+/* Make focus rings consistent across all interactive elements */
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Selection */
+::selection { background: var(--color-primary-bg); color: var(--color-text); }

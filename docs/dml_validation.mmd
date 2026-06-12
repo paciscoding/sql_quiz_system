@@ -1,42 +1,40 @@
 sequenceDiagram
     participant S as Student
     participant B as Backend (Go Gin)
-    participant L as LockManager (pg_advisory_lock)
-    participant DB as Postgres (student_{id} schema)
+    participant Q as SubmissionQueue<br/>(1 worker, cap 256, 30s timeout)
+    participant DB as Postgres<br/>(sandbox_exam_{examID})
 
-    S->>B: Submit SQL (Insert/Update/Delete)
-    B->>L: ExecuteLocked(student_id)
-    L->>DB: SELECT pg_advisory_lock(fnv(student_id))
-    Note over B,L: Per-student serialisation across processes
-
-    rect rgb(235, 240, 250)
-        Note right of B: Phase 0: Sandbox preparation
-        B->>DB: InitializeSandbox (idempotent)
-        Note right of B: Only missing tables are cloned<br/>(LIKE INCLUDING ALL + INSERT SELECT)
-        B->>DB: ResetTable(target) -- drop & re-clone target only
-    end
-
-    rect rgb(240, 240, 240)
-        Note right of B: Phase 1: Establish Ground Truth
-        B->>DB: Backup target table
-        B->>DB: Execute Lecturer's Correct SQL
-        DB-->>B: Return Modified State
-        B->>B: Capture Diff (Corrected Result)
-        B->>DB: Restore target from Backup
-    end
+    S->>B: POST /quiz/submit (DML)
+    B->>B: Fetch question, verify exam active + enrolled
+    B->>Q: Run(ctx, evaluate)
+    Note over Q: Non-blocking send.<br/>Full → ErrQueueFull → HTTP 503
 
     rect rgb(220, 240, 220)
-        Note right of B: Phase 2: Validate Student Submission
-        B->>DB: Execute Student SQL (SET ROLE exam_student)
-        DB-->>B: Return Modified State
-        B->>B: Capture Student Diff
-        B->>B: Compare Diffs (Row-by-Row)
+        Note right of Q: Phase 2: serialised evaluation (one student at a time)
+        Q->>DB: BEGIN; SAVEPOINT student_eval
+        Q->>DB: SET LOCAL ROLE exam_student
+        Q->>DB: SET LOCAL search_path = sandbox_exam_{examID}, public
+        Q->>DB: Execute student DML
+        DB-->>Q: (writes applied to sandbox)
+        Q->>DB: SELECT * FROM target_table  -- post-image
+        DB-->>Q: Captured rows
+        Q->>DB: ROLLBACK TO SAVEPOINT student_eval
+        Q->>DB: COMMIT
+        Note over Q,DB: Sandbox restored byte-identically<br/>for the next student in the queue
     end
 
-    L->>DB: SELECT pg_advisory_unlock(fnv(student_id))
+    Q-->>B: ValidationResult (status, score, feedback)
+    Note over B: Compare against cached expected_result<br/>(no teacher SQL re-executed)
+    B->>DB: INSERT INTO app.submissions
 
-    alt Correct
-        B-->>S: Return Full Score
-    else Incorrect / Idempotent
-        B-->>S: Return Partial/Zero Score
+    alt status = correct
+        B-->>S: 200 OK · status=correct · full points
+    else status = incorrect
+        B-->>S: 200 OK · status=incorrect · 0 points · "The result is wrong."
+    else status = syntax_error
+        B-->>S: 200 OK · status=syntax_error · 0 points · engine error detail
+    else queue full
+        B-->>S: 503 · "submission queue is full"
+    else per-job timeout (30s)
+        B-->>S: 504 · "submission timed out"
     end

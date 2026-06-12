@@ -5,12 +5,36 @@ import (
 	"time"
 )
 
+// PracticeCategory is a first-class organizational unit for practice questions.
+// Each category owns its own SQL schema (named "practice_cat_<id>", see
+// PracticeCategorySchemaName) into which a lecturer imports a database; every
+// practice question in the category runs against that schema. This is what keeps
+// practice databases separate from the examination curriculum (public).
+type PracticeCategory struct {
+	ID            int       `json:"id"`
+	Name          string    `json:"name"`
+	SchemaName    string    `json:"schema_name"`
+	CreatedBy     int       `json:"created_by"`
+	QuestionCount int       `json:"question_count"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	Introduction  string    `json:"introduction"`
+}
+
 // PracticeQuestion mirrors models.Question (submission.go) minus ExamID.
 // JSON tags match the DDL column names in app.practice_questions exactly.
 type PracticeQuestion struct {
-	ID                       int             `json:"id"`
-	CreatedBy                int             `json:"created_by"`
-	Category                 string          `json:"category"`
+	ID        int `json:"id"`
+	CreatedBy int `json:"created_by"`
+	// CategoryID is the FK to app.practice_categories. It is the authoritative
+	// category reference; the legacy free-text Category field below is retained
+	// for one release for rollback and is write-dead (new writes ignore it).
+	CategoryID int `json:"category_id"`
+	// CategoryName / CategorySchema are populated by read joins for response
+	// convenience; they are not stored on app.practice_questions.
+	CategoryName             string          `json:"category_name,omitempty"`
+	CategorySchema           string          `json:"-"`
+	Category                 string          `json:"category,omitempty"`
 	TargetTable              string          `json:"target_table"`
 	CorrectSQL               string          `json:"correct_sql"`
 	Type                     string          `json:"question_type"`
@@ -64,10 +88,12 @@ type PracticeAttempt struct {
 }
 
 type PracticeSummary struct {
-	QuestionID  int     `json:"question_id"`
-	Category    string  `json:"category"`
-	Requirement string  `json:"requirement"`
-	Points      float64 `json:"points"`
-	IsSolved    bool    `json:"is_solved"`
-	AttemptCount int    `json:"attempt_count"`
+	QuestionID   int     `json:"question_id"`
+	CategoryID   int     `json:"category_id"`
+	CategoryName string  `json:"category_name"`
+	Category     string  `json:"category"`
+	Requirement  string  `json:"requirement"`
+	Points       float64 `json:"points"`
+	IsSolved     bool    `json:"is_solved"`
+	AttemptCount int     `json:"attempt_count"`
 }

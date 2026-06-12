@@ -6,24 +6,63 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
 
+// ExaminationResponse is the outbound exam DTO with the derived effective_state field.
+type ExaminationResponse struct {
+	ID               int        `json:"id"`
+	Title            string     `json:"title"`
+	IsActive         bool       `json:"is_active"`
+	CreatedBy        int        `json:"created_by"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ActivatedAt      *time.Time `json:"activated_at,omitempty"`
+	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
+	ScheduledStartAt *time.Time `json:"scheduled_start_at,omitempty"`
+	ScheduledEndAt   *time.Time `json:"scheduled_end_at,omitempty"`
+	EffectiveState   string     `json:"effective_state"`
+	Introduction     string     `json:"introduction"`
+}
+
 type QuizController struct {
 	valService      *services.ValidationService
 	submissionQueue *services.SubmissionQueue
 	repo            *repository.PostgresRepository
+	hub             *services.Hub
+	authService     *services.AuthService
 }
 
-func NewQuizController(valService *services.ValidationService, submissionQueue *services.SubmissionQueue, repo *repository.PostgresRepository) *QuizController {
+func NewQuizController(valService *services.ValidationService, submissionQueue *services.SubmissionQueue, repo *repository.PostgresRepository, hub *services.Hub, authService *services.AuthService) *QuizController {
 	return &QuizController{
 		valService:      valService,
 		submissionQueue: submissionQueue,
 		repo:            repo,
+		hub:             hub,
+		authService:     authService,
+	}
+}
+
+// examToResponse converts a models.Examination to ExaminationResponse with computed effective_state.
+func examToResponse(e models.Examination) ExaminationResponse {
+	state := repository.ExaminationEffectiveState(e)
+	return ExaminationResponse{
+		ID:               e.ID,
+		Title:            e.Title,
+		IsActive:         e.IsActive,
+		CreatedBy:        e.CreatedBy,
+		CreatedAt:        e.CreatedAt,
+		ActivatedAt:      e.ActivatedAt,
+		ArchivedAt:       e.ArchivedAt,
+		ScheduledStartAt: e.ScheduledStartAt,
+		ScheduledEndAt:   e.ScheduledEndAt,
+		EffectiveState:   state.Phase,
+		Introduction:     e.Introduction,
 	}
 }
 
@@ -31,13 +70,23 @@ func (ctrl *QuizController) GetExams(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	exams, err := ctrl.repo.GetStudentExams(c.Request.Context(), student.ID)
+	var exams []models.Examination
+	var err error
+	if c.Query("include_inactive") == "true" {
+		exams, err = ctrl.repo.GetStudentEnrolledExams(c.Request.Context(), student.ID)
+	} else {
+		exams, err = ctrl.repo.GetStudentExams(c.Request.Context(), student.ID)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, exams)
+	resp := make([]ExaminationResponse, 0, len(exams))
+	for _, e := range exams {
+		resp = append(resp, examToResponse(e))
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
@@ -58,11 +107,25 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 		return
 	}
 
-	// Verify exam is active
+	// Verify exam is effectively active (uses scheduled window)
 	exam, err := ctrl.repo.GetExamByID(c.Request.Context(), examID)
-	if err != nil || !exam.IsActive {
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Examination not found"})
+		return
+	}
+	examState := repository.ExaminationEffectiveState(exam)
+	if !examState.ActiveNow {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Examination is not active"})
 		return
+	}
+	// Lazy sandbox preparation for DML exams
+	if err := ctrl.repo.EnsureExamSandboxReady(c.Request.Context(), examID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare exam sandbox"})
+		return
+	}
+	// Broadcast activation if the exam just became active (scheduled lazy trigger)
+	if ctrl.hub != nil {
+		ctrl.hub.Broadcast(examID, buildExamStatusEvent(examID, "active"))
 	}
 
 	questions, err := ctrl.repo.GetQuestionsByExamID(c.Request.Context(), examID)
@@ -156,7 +219,7 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 		return
 	}
 	exam, err := ctrl.repo.GetExamByID(ctx, *question.ExamID)
-	if err != nil || !exam.IsActive {
+	if err != nil || !repository.ExaminationEffectiveState(exam).ActiveNow {
 		c.JSON(http.StatusForbidden, gin.H{"error": "this examination is not active"})
 		return
 	}
@@ -235,7 +298,7 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 	}
 
 	exam, err := ctrl.repo.GetExamByID(ctx, *question.ExamID)
-	if err != nil || !exam.IsActive {
+	if err != nil || !repository.ExaminationEffectiveState(exam).ActiveNow {
 		c.JSON(http.StatusForbidden, gin.H{"error": "this examination is not active"})
 		return
 	}
@@ -294,4 +357,221 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 		"row_count": vCount,
 		"truncated": vTrunc,
 	})
+}
+
+// GetExamIntroduction handles GET /api/v1/quiz/exams/:id/introduction
+// Returns the public curriculum schema tables + the lecturer's description for
+// any enrolled student, regardless of whether the exam is currently active.
+func (ctrl *QuizController) GetExamIntroduction(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	student := userVal.(models.User)
+
+	idStr := c.Param("id")
+	examID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	exam, err := ctrl.repo.GetExamByID(ctx, examID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		return
+	}
+
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, student.ID, examID)
+	if err != nil || !enrolled {
+		c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
+		return
+	}
+
+	tables, err := ctrl.repo.GetSchemaTablesWithColumns(ctx, "public")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"exam_id":      exam.ID,
+		"title":        exam.Title,
+		"introduction": exam.Introduction,
+		"tables":       tables,
+	})
+}
+
+// StreamExamStatus handles GET /api/v1/quiz/exams/:id/stream?access_token=<jwt>
+// It holds an HTTP connection open and pushes Server-Sent Events to enrolled students.
+// Authentication is done via query param because EventSource cannot send Authorization headers.
+func (ctrl *QuizController) StreamExamStatus(c *gin.Context) {
+	idStr := c.Param("id")
+	examID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	// Authenticate via ?access_token= query param (EventSource cannot send Authorization headers)
+	token := c.Query("access_token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "access_token is required"})
+		return
+	}
+	user, err := ctrl.authService.ValidateToken(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Verify the exam exists
+	exam, err := ctrl.repo.GetExamByID(ctx, examID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		return
+	}
+
+	// Verify enrollment
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID)
+	if err != nil || !enrolled {
+		c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
+		return
+	}
+
+	// Set SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	// Send immediate snapshot so a client connecting after activation gets 'active' at once
+	state := repository.ExaminationEffectiveState(exam)
+	snapshotPayload := fmt.Sprintf("event: exam-status\nid: %d\ndata: {\"exam_id\":%d,\"effective_state\":\"%s\",\"server_time\":\"%s\"}\n\n",
+		time.Now().UnixMilli(), examID, state.Phase, time.Now().UTC().Format(time.RFC3339))
+	c.Writer.WriteString(snapshotPayload)
+	c.Writer.Flush()
+
+	// Subscribe to hub for activation broadcasts
+	ch := ctrl.hub.Subscribe(examID)
+	defer ctrl.hub.Unsubscribe(examID, ch)
+
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case payload, ok := <-ch:
+			if !ok {
+				return
+			}
+			// payload is already a complete SSE frame (event/id/data/\n\n) built
+			// by buildExamStatusEvent; write it directly to avoid a doubled header.
+			c.Writer.WriteString(payload)
+			c.Writer.Flush()
+		case <-ticker.C:
+			c.Writer.WriteString(": ping\n\n")
+			c.Writer.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// ─── Exam Intro Images (student-facing GETs) ──────────────────────────────────
+
+// ListExamIntroImages handles GET /api/v1/quiz/exams/:id/intro-images
+// Returns the metadata list for intro images attached to an examination.
+// Students must be enrolled; Admin/Lecturer skip the enrollment check so the
+// IntroImagesEditor on the lecturer view can list freshly-uploaded images.
+func (ctrl *QuizController) ListExamIntroImages(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	user := userVal.(models.User)
+
+	examID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	_, err = ctrl.repo.GetExamByID(ctx, examID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		return
+	}
+
+	if user.Role == models.RoleStudent {
+		enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID)
+		if err != nil || !enrolled {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
+			return
+		}
+	}
+
+	imgs, err := ctrl.repo.ListExamIntroImages(ctx, examID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"images": imgs})
+}
+
+// GetExamIntroImage handles GET /api/v1/quiz/exams/:id/intro-images/:imageId
+// Streams the binary content of a single intro image. Students must be enrolled;
+// Admin/Lecturer skip the enrollment check so thumbnails render in the editor.
+func (ctrl *QuizController) GetExamIntroImage(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	user := userVal.(models.User)
+
+	examID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+	imgID, err := strconv.Atoi(c.Param("imageId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image id"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	_, err = ctrl.repo.GetExamByID(ctx, examID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		return
+	}
+
+	if user.Role == models.RoleStudent {
+		enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID)
+		if err != nil || !enrolled {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
+			return
+		}
+	}
+
+	mime, data, updatedAt, err := ctrl.repo.GetExamIntroImageBytes(ctx, examID, imgID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "image not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	etag := strconv.FormatInt(updatedAt.Unix(), 10)
+	if c.GetHeader("If-None-Match") == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	c.Header("ETag", etag)
+	c.Header("Cache-Control", "private, max-age=86400, must-revalidate")
+	c.Header("Content-Length", strconv.Itoa(len(data)))
+	c.Data(http.StatusOK, mime, data)
 }

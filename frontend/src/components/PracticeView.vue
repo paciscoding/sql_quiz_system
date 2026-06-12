@@ -1,18 +1,31 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, computed } from 'vue'
 import SqlEditor from './SqlEditor.vue'
+import BackLink from './BackLink.vue'
 import ResultTable from './ResultTable.vue'
+import SchemaIntroduction from './SchemaIntroduction.vue'
+import SchemaImageWindow from './SchemaImageWindow.vue'
+import { useSingleFlight } from '../composables/useSingleFlight'
 import { useNotifications } from '../services/notification_service'
+import { handleApiError } from '../services/error_handler'
+import Spinner from './Spinner.vue'
+import { useKeyboardShortcut } from '../composables/useKeyboardShortcut'
+import { formatSql } from '../utils/format_sql'
+import { formatDate, formatRelative } from '../utils/format_date'
+import { UI_COPY } from '../constants/ui_copy'
 import {
   listQuestions,
   submit,
   preview,
   listMyAttempts,
+  getCategoryIntroduction,
   PracticeUnavailableError,
   type PracticeQuestion,
   type PracticeAttempt,
-  type ValidationResult
+  type ValidationResult,
+  type CategoryIntroduction
 } from '../services/practice'
+import { listCategoryIntroImages, type IntroImageMetadata } from '../services/schemaImages'
 
 const { notify } = useNotifications()
 
@@ -25,8 +38,10 @@ const previewRows = ref<Record<string, any>[]>([])
 const previewCols = ref<string[]>([])
 const attempts = ref<PracticeAttempt[]>([])
 const practiceUnavailable = ref(false)
-const loading = ref(false)
+const editorWrapRef = ref<HTMLElement | null>(null)
 const previewLoading = ref(false)
+const questionListCollapsed = ref(false)
+const attemptsCollapsed = ref(false)
 
 // Initialization
 const loadData = async () => {
@@ -39,7 +54,7 @@ const loadData = async () => {
     if (err instanceof PracticeUnavailableError) {
       practiceUnavailable.value = true
     } else {
-      notify('Failed to load practice questions.', 'error')
+      handleApiError(err, { fallback: 'Failed to load practice questions.' })
     }
   }
 }
@@ -58,11 +73,11 @@ const selectQuestion = (q: PracticeQuestion) => {
   selectedQuestion.value = q
 }
 
-const doSubmit = async () => {
+const { inFlight: submitLoading, run: doSubmit } = useSingleFlight(async () => {
   if (!selectedQuestion.value || !sqlText.value.trim()) return
-  loading.value = true
   result.value = null
   try {
+    await doPreview()
     const res = await submit(selectedQuestion.value.id, sqlText.value)
     result.value = res
     // Refresh attempts
@@ -81,12 +96,12 @@ const doSubmit = async () => {
     if (err instanceof PracticeUnavailableError) {
       practiceUnavailable.value = true
     } else {
-      notify((err as Error).message || 'Submit failed.', 'error')
+      handleApiError(err, { fallback: 'Submit failed.' })
     }
-  } finally {
-    loading.value = false
   }
-}
+})
+
+useKeyboardShortcut({ combo: 'Ctrl+Enter', whenTyping: true, scope: editorWrapRef, handler: () => doSubmit() })
 
 const doPreview = async () => {
   if (!selectedQuestion.value || !sqlText.value.trim()) return
@@ -97,18 +112,11 @@ const doPreview = async () => {
     const res = await preview(selectedQuestion.value.id, sqlText.value)
     previewRows.value = res.rows
     previewCols.value = res.columns
-    if (res.status === 'correct') {
-      notify('Preview: Correct!', 'success')
-    } else if (res.status === 'syntax_error') {
-      notify('Preview: Syntax error.', 'error')
-    } else {
-      notify('Preview: Incorrect.', 'error')
-    }
   } catch (err) {
     if (err instanceof PracticeUnavailableError) {
       practiceUnavailable.value = true
     } else {
-      notify((err as Error).message || 'Preview failed.', 'error')
+      handleApiError(err, { fallback: 'Preview failed.' })
     }
   } finally {
     previewLoading.value = false
@@ -118,48 +126,115 @@ const doPreview = async () => {
 const badgeClassFor = (s: string) => s === 'correct' ? 'badge-success' : s === 'syntax_error' ? 'badge-danger' : 'badge-warning'
 const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_error' ? 'SQL Error' : 'Incorrect'
 
-const formatDate = (dateStr: string) => {
-  return new Date(dateStr).toLocaleString()
-}
-
 const truncate = (str: string, len: number) => {
   if (str.length <= len) return str
   return str.substring(0, len) + '...'
 }
 
+const categoryNameFor = (q: PracticeQuestion) => q.category_name || q.category || 'Uncategorized'
+
 const groupedQuestions = computed(() => {
   const groups: Record<string, PracticeQuestion[]> = {}
   questions.value.forEach(q => {
-    if (!groups[q.category]) {
-      groups[q.category] = []
+    const key = categoryNameFor(q)
+    if (!groups[key]) {
+      groups[key] = []
     }
-    if (groups[q.category].length < 5) {
-      groups[q.category].push(q)
+    if (groups[key].length < 5) {
+      groups[key].push(q)
     }
   })
   return groups
 })
+
+// --- Per-category Introduction panel ---
+// categoryIntroCache maps category_id -> fetched intro (avoids re-fetching)
+const categoryIntroCache = ref<Record<number, CategoryIntroduction>>({})
+const activeCategoryIntroId = ref<number | null>(null)
+const catIntroImages = ref<IntroImageMetadata[]>([])
+
+const activeIntro = computed<CategoryIntroduction | null>(() =>
+  activeCategoryIntroId.value !== null
+    ? (categoryIntroCache.value[activeCategoryIntroId.value] ?? null)
+    : null
+)
+
+const introLoading = ref(false)
+
+const openCategoryIntro = async (q: PracticeQuestion) => {
+  const catId = q.category_id
+  if (!catId) return
+  activeCategoryIntroId.value = catId
+  introLoading.value = true
+  try {
+    const [data, imgs] = await Promise.all([
+      categoryIntroCache.value[catId]
+        ? Promise.resolve(categoryIntroCache.value[catId])
+        : getCategoryIntroduction(catId),
+      listCategoryIntroImages(catId).catch(() => [] as IntroImageMetadata[])
+    ])
+    categoryIntroCache.value = { ...categoryIntroCache.value, [catId]: data }
+    catIntroImages.value = imgs
+  } catch (err) {
+    if (err instanceof PracticeUnavailableError) {
+      practiceUnavailable.value = true
+    } else {
+      handleApiError(err, { fallback: 'Failed to load category introduction.' })
+    }
+    activeCategoryIntroId.value = null
+  } finally {
+    introLoading.value = false
+  }
+}
+
+const closeCategoryIntro = () => {
+  activeCategoryIntroId.value = null
+}
+
+// Derive a representative question for intro lookup from the category group
+const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
+  const qs = groupedQuestions.value[cat]
+  return qs && qs.length > 0 ? qs[0] : null
+}
 </script>
 
 <template>
   <div class="practice-shell">
-    <!-- Unavailability banner -->
-    <div v-if="practiceUnavailable" class="card unavailability-banner">
-      <div style="display: flex; align-items: center; justify-content: space-between;">
-        <p style="margin: 0; color: var(--color-danger); font-weight: 500;">
-          Practice unavailable while an exam is active.
-        </p>
-        <button class="btn btn-secondary" @click="loadData">Retry</button>
-      </div>
+    <div class="page-header">
+      <h1>Practice</h1>
+      <p class="page-subtitle">Browse a category, review its schema, and submit SQL against the practice sandbox.</p>
     </div>
 
-    <div class="pane-grid">
+    <BackLink to="/student" label="Back to Student Dashboard" />
+    <!-- Unavailability banner -->
+    <div v-if="practiceUnavailable" class="alert-warning" style="display:flex; align-items:center; justify-content:space-between; gap:var(--space-3);">
+      <span>Practice is paused while an examination with focus mode is active.</span>
+      <button class="btn btn-sm" @click="loadData">Retry</button>
+    </div>
+
+    <div class="pane-grid" :class="{ 'list-collapsed': questionListCollapsed }">
       <!-- Question List -->
-      <div class="card question-list-card">
-        <h3 style="margin-top: 0;">Practice Categories</h3>
-        <div class="question-list">
+      <div class="card question-list-card" :class="{ collapsed: questionListCollapsed }">
+        <div class="card-header">
+          <h3 v-if="!questionListCollapsed" style="margin: 0;">Practice Categories</h3>
+          <button
+            class="collapse-btn"
+            :title="questionListCollapsed ? 'Expand question list' : 'Collapse question list'"
+            @click="questionListCollapsed = !questionListCollapsed"
+          >{{ questionListCollapsed ? '›' : '‹' }}</button>
+        </div>
+        <div v-if="!questionListCollapsed" class="question-list">
           <div v-for="(qs, cat) in groupedQuestions" :key="cat" class="category-group">
-            <h4 class="category-title">{{ cat }}</h4>
+            <div class="category-header">
+              <h4 class="category-title" style="margin: 0; flex: 1;">{{ cat }}</h4>
+              <button
+                class="btn btn-secondary"
+                style="font-size: 0.75rem; padding: 2px 8px;"
+                :disabled="introLoading"
+                @click="() => { const q = firstQuestionForCategory(String(cat)); if (q) openCategoryIntro(q) }"
+                title="View category schema and description"
+              >Schema</button>
+            </div>
             <div 
               v-for="q in qs" 
               :key="q.id" 
@@ -181,8 +256,34 @@ const groupedQuestions = computed(() => {
         </div>
       </div>
 
+      <!-- Category Introduction Panel (shown when a category Schema button is clicked) -->
+      <div v-if="activeCategoryIntroId !== null" class="card intro-panel" style="grid-column: 1 / -1;">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4);">
+          <h3 style="margin: 0;">
+            Category Introduction
+            <span v-if="activeIntro" class="muted" style="font-size: 0.85rem; font-weight: 500;"> — {{ activeIntro.category_name }}</span>
+          </h3>
+          <button class="btn btn-secondary" style="font-size: 0.8rem; padding: var(--space-1) var(--space-3);" @click="closeCategoryIntro">Dismiss</button>
+        </div>
+        <div v-if="introLoading" class="muted" style="text-align: center; padding: var(--space-6);">Loading schema...</div>
+        <template v-else-if="activeIntro">
+          <SchemaImageWindow
+            v-if="catIntroImages.length > 0"
+            scope="category"
+            :owner-id="activeCategoryIntroId!"
+            :images="catIntroImages"
+          />
+          <SchemaIntroduction
+            :introduction="activeIntro.introduction"
+            :tables="activeIntro.tables"
+            :imported="activeIntro.imported"
+            mode="student"
+          />
+        </template>
+      </div>
+
       <!-- Editor Section -->
-      <div class="card editor-card">
+      <div class="card editor-card" ref="editorWrapRef">
         <div v-if="selectedQuestion">
           <div class="selected-header">
             <h3 style="margin: 0;">Question Details</h3>
@@ -222,32 +323,23 @@ const groupedQuestions = computed(() => {
           <SqlEditor v-model="sqlText" height="240px" />
 
           <div class="actions">
-            <button 
-              class="btn btn-secondary" 
-              :disabled="loading || previewLoading || practiceUnavailable" 
-              @click="doPreview"
-            >
-              {{ previewLoading ? 'Running...' : 'Preview' }}
-            </button>
-            <button 
-              class="btn btn-primary" 
-              :disabled="loading || previewLoading || practiceUnavailable" 
+            <button class="btn btn-secondary" :disabled="!sqlText" @click="sqlText = formatSql(sqlText)">Format SQL</button>
+            <button
+              class="btn btn-primary"
+              :disabled="submitLoading || previewLoading || practiceUnavailable"
               @click="doSubmit"
             >
-              {{ loading ? 'Submitting...' : 'Submit Answer' }}
+              <Spinner v-if="submitLoading || previewLoading" size="sm" inline :invert="true" />{{ submitLoading || previewLoading ? UI_COPY.SUBMIT_ANSWER_LOADING : UI_COPY.SUBMIT_ANSWER }}
             </button>
             <p v-if="practiceUnavailable" class="muted unavailability-msg">
               Practice is unavailable while an exam is active.
             </p>
           </div>
 
-          <!-- Preview Result Panel -->
+          <!-- Query Result Rows -->
           <div v-if="previewRows.length > 0" class="result-panel preview-result">
             <div class="result-header">
-              <span class="badge" :class="badgeClassFor(result?.status || 'incorrect')">
-                {{ statusLabel(result?.status || 'incorrect') }}
-              </span>
-              <span class="muted small">Preview Result</span>
+              <span class="muted small">Query Result</span>
             </div>
             <ResultTable :rows="previewRows" :columns="previewCols" max-height="320px" />
           </div>
@@ -272,8 +364,15 @@ const groupedQuestions = computed(() => {
 
     <!-- Attempts History -->
     <div class="card attempts-card">
-      <h3 style="margin-top: 0;">Attempt History</h3>
-      <div class="attempts-list">
+      <div class="card-header">
+        <h3 style="margin: 0;">Attempt History</h3>
+        <button
+          class="collapse-btn"
+          :title="attemptsCollapsed ? 'Expand attempt history' : 'Collapse attempt history'"
+          @click="attemptsCollapsed = !attemptsCollapsed"
+        >{{ attemptsCollapsed ? '▾' : '▴' }}</button>
+      </div>
+      <div v-if="!attemptsCollapsed" class="attempts-list">
         <div v-for="a in attempts" :key="a.id" class="attempt-item">
           <div class="attempt-main">
             <code class="attempt-sql">{{ truncate(a.sql_text, 80) }}</code>
@@ -282,7 +381,7 @@ const groupedQuestions = computed(() => {
             </span>
           </div>
           <div class="attempt-meta">
-            <span class="muted small">{{ formatDate(a.submitted_at) }}</span>
+            <span :title="new Date(a.submitted_at).toISOString()">{{ formatDate(a.submitted_at) }} <span class="muted small">({{ formatRelative(a.submitted_at) }})</span></span>
           </div>
         </div>
         <p v-if="attempts.length === 0" class="muted">No attempts yet.</p>
@@ -293,38 +392,65 @@ const groupedQuestions = computed(() => {
 
 <style scoped>
 .practice-shell {
-  max-width: 1200px;
-  margin: var(--space-5) auto;
-  padding: 0 var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--space-6);
+  gap: var(--space-5);
 }
 
 .card {
-  border: 2px solid var(--color-border);
+  border: 1px solid var(--color-border);
   background: var(--color-surface);
   padding: var(--space-5);
-  border-radius: 0;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
 }
-
-.unavailability-banner {
-  border: 2px solid var(--color-danger) !important;
-  background-color: var(--color-danger-bg) !important;
-  color: var(--color-danger) !important;
-}
-
-.unavailability-banner p { color: var(--color-danger) !important; font-weight: 700 !important; }
 
 .pane-grid {
   display: grid;
-  grid-template-columns: 350px 1fr;
-  gap: var(--space-6);
+  grid-template-columns: 320px 1fr;
+  gap: var(--space-5);
   align-items: start;
 }
 
+.pane-grid.list-collapsed {
+  grid-template-columns: 48px 1fr;
+}
+
+.question-list-card.collapsed {
+  padding: var(--space-2);
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.question-list-card.collapsed .card-header {
+  margin-bottom: 0;
+  justify-content: center;
+}
+
+.collapse-btn {
+  border: 2px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-weight: 800;
+  font-size: 1rem;
+  line-height: 1;
+  padding: var(--space-1) var(--space-3);
+  cursor: pointer;
+}
+
+.collapse-btn:hover {
+  background: var(--color-surface-muted);
+}
+
 @media (max-width: 1000px) {
-  .pane-grid {
+  .pane-grid,
+  .pane-grid.list-collapsed {
     grid-template-columns: 1fr;
   }
 }
@@ -341,22 +467,31 @@ const groupedQuestions = computed(() => {
   gap: var(--space-3);
 }
 
+.category-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 10px;
+  background: var(--color-surface-sunk);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+}
+
 .category-title {
   margin: 0;
-  padding: var(--space-2) var(--space-4);
-  background: var(--color-surface-muted);
   color: var(--color-text);
-  font-size: 0.85rem;
-  font-weight: 800;
-  border: 2px solid var(--color-border);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .question-item {
-  padding: var(--space-4);
-  border: 2px solid var(--color-border);
-  border-radius: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
   cursor: pointer;
-  transition: none;
+  transition: background-color .12s ease, border-color .12s ease;
   background: var(--color-surface);
 }
 
@@ -365,7 +500,7 @@ const groupedQuestions = computed(() => {
 }
 
 .question-item.active {
-  background-color: var(--color-surface-muted);
+  background-color: var(--color-primary-bg);
   border-color: var(--color-primary);
 }
 
@@ -399,25 +534,29 @@ const groupedQuestions = computed(() => {
   display: flex;
   align-items: center;
   gap: var(--space-4);
-  margin-bottom: var(--space-5);
-  border-bottom: 2px solid var(--color-border);
-  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-4);
+  border-bottom: 1px solid var(--color-border-soft);
+  padding-bottom: var(--space-3);
 }
 
 .small {
-  font-size: 0.75rem;
-  font-weight: 700;
+  font-size: 0.72rem;
+  font-weight: 600;
   color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .requirement-box {
-  padding: var(--space-5);
-  background: var(--color-surface);
-  border: 2px solid var(--color-border);
-  font-size: 1.1rem;
-  line-height: 1.5;
-  font-weight: 500;
-  margin-bottom: var(--space-6);
+  padding: 12px 16px;
+  background: var(--alert-info-bg);
+  border: 1px solid var(--alert-info-border);
+  color: var(--alert-info-text);
+  border-radius: var(--radius);
+  font-size: 0.98rem;
+  line-height: 1.55;
+  margin-bottom: var(--space-5);
+  white-space: pre-line;
 }
 
 .actions {
@@ -428,52 +567,16 @@ const groupedQuestions = computed(() => {
   flex-wrap: wrap;
 }
 
-.btn {
-  border: 2px solid var(--color-border);
-  padding: var(--space-2) var(--space-6);
-  font-weight: 700;
-  cursor: pointer;
-  transition: none;
-}
-
-.btn:active {
-  transform: translateY(1px);
-}
-
-.btn-primary {
-  background: var(--color-primary);
-  color: var(--color-surface);
-}
-
-.btn-primary:hover:not(:disabled) {
-  background: #333333;
-}
-
-.btn-secondary {
-  background: var(--color-surface);
-  color: var(--color-text);
-}
-
-.btn-secondary:hover:not(:disabled) {
-  background: var(--color-surface-muted);
-}
-
-.unavailability-msg {
-  margin: 0;
-  font-size: 0.9rem;
-  color: var(--color-danger);
-  font-weight: 700;
-}
-
 .result-panel {
-  margin-top: var(--space-8);
-  padding: var(--space-6);
-  border: 2px solid var(--color-border);
+  margin-top: var(--space-5);
+  padding: 12px 16px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
 }
 
-.result-panel.correct { background: var(--color-success-bg); color: var(--color-success); border-color: var(--color-success); }
-.result-panel.incorrect { background: var(--color-warning-bg); color: var(--color-warning); border-color: var(--color-warning); }
-.result-panel.syntax_error { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger); }
+.result-panel.correct       { background: var(--color-success-bg); color: var(--color-success); border-color: #c4dfba; }
+.result-panel.incorrect     { background: var(--color-warning-bg); color: var(--color-warning); border-color: #ecd998; }
+.result-panel.syntax_error  { background: var(--color-danger-bg); color: var(--color-danger); border-color: #e9bcbc; }
 
 .result-header {
   display: flex;
@@ -496,28 +599,30 @@ const groupedQuestions = computed(() => {
 }
 
 .empty-state {
-  height: 400px;
+  height: 360px;
   display: flex;
   align-items: center;
   justify-content: center;
   text-align: center;
-  font-weight: 700;
+  font-weight: 500;
   color: var(--color-text-muted);
-  border: 2px dashed var(--color-border);
-  font-size: 1.4rem;
-  padding: var(--space-10);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius);
+  font-size: 1rem;
+  padding: var(--space-7);
+  background: var(--color-surface-muted);
 }
 
 .attempts-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-3);
 }
 
 .attempt-item {
-  padding: var(--space-4);
-  border: 2px solid var(--color-border);
-  margin-bottom: var(--space-3);
+  padding: 10px 12px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
   background: var(--color-surface);
 }
 
@@ -525,32 +630,21 @@ const groupedQuestions = computed(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-5);
-  margin-bottom: var(--space-2);
+  gap: var(--space-3);
+  margin-bottom: 4px;
 }
 
 .attempt-sql {
   font-family: var(--font-mono);
-  font-size: 0.9rem;
-  background: var(--color-surface-muted);
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--color-border);
+  font-size: 0.82rem;
+  background: var(--color-surface-sunk);
+  padding: 2px 8px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
-  font-weight: 600;
+  color: var(--color-text);
 }
-
-.badge {
-  padding: 4px 10px;
-  border: 1px solid var(--color-border);
-  border-radius: 0;
-  font-weight: 700;
-  font-size: 0.75rem;
-}
-.badge-info { background: var(--color-primary); color: var(--color-surface); }
-.badge-success { background: var(--color-success-bg); color: var(--color-success); border-color: var(--color-success); }
-.badge-warning { background: var(--color-warning-bg); color: var(--color-warning); border-color: var(--color-warning); }
-.badge-danger { background: var(--color-danger-bg); color: var(--color-danger); border-color: var(--color-danger); }
 </style>

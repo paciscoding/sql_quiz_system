@@ -1,144 +1,191 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
-import { useRouter, useRoute } from 'vue-router'
+import type { ComputedRef } from 'vue'
+import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import NotificationToast from './components/NotificationToast.vue'
+import ConfirmDialogHost from './components/ConfirmDialogHost.vue'
+import ClockSidebar from './components/ClockSidebar.vue'
+import { useAuth, type AuthUser } from './services/auth'
+import { UI_COPY } from './constants/ui_copy'
+import { useKeyboardShortcut } from './composables/useKeyboardShortcut'
+import { useFocusTrap } from './composables/useFocusTrap'
+
+type AuthNavState = {
+  user: ComputedRef<AuthUser>
+  isLoggedIn: ComputedRef<boolean>
+  logout: () => void
+}
 
 const router = useRouter()
 const route = useRoute()
-
-const isLoggedIn = ref(false)
-const user = ref<any>(null)
-
-const checkAuth = () => {
-  const token = localStorage.getItem('sql_quiz_token')
-  const userData = localStorage.getItem('sql_quiz_user')
-  if (token && userData) {
-    isLoggedIn.value = true
-    user.value = JSON.parse(userData)
-  } else {
-    isLoggedIn.value = false
-    user.value = null
-  }
-}
+const { user, isLoggedIn, logout: doLogout } = useAuth() as AuthNavState
 
 const logout = () => {
-  localStorage.removeItem('sql_quiz_token')
-  localStorage.removeItem('sql_quiz_user')
-  checkAuth()
+  doLogout()
   router.push('/login')
 }
 
-// Watch for route changes to re-check auth status
-watch(() => route.path, () => {
-  checkAuth()
-})
+const navOpen = ref(false)
+const navRef = ref<HTMLElement | null>(null)
+
+const isMobile = ref(window.matchMedia('(max-width: 1023.98px)').matches)
+let mqCleanup: (() => void) | null = null
+
+watch(() => route.fullPath, () => { navOpen.value = false })
 
 onMounted(() => {
-  checkAuth()
+  const resizeObserver = new ResizeObserver(() => {
+    if (document.body.clientWidth >= 1024) navOpen.value = false
+  })
+  resizeObserver.observe(document.body)
+
+  const mq = window.matchMedia('(max-width: 1023.98px)')
+  const mqHandler = (e: MediaQueryListEvent) => { isMobile.value = e.matches }
+  mq.addEventListener('change', mqHandler)
+  mqCleanup = () => mq.removeEventListener('change', mqHandler)
 })
+
+onBeforeUnmount(() => { mqCleanup?.() })
+
+useKeyboardShortcut({
+  combo: 'Escape',
+  handler: () => { navOpen.value = false },
+})
+
+const focusTrapActive = computed(() => navOpen.value && isMobile.value)
+useFocusTrap(navRef, focusTrapActive)
+
+const isLoginRoute = computed(() => route.path === '/login' || route.name === 'login')
+
+// Sidebar visibility: hide entirely on the login page or when no user is signed in
+const showSidebar = computed(() => isLoggedIn.value && !isLoginRoute.value)
+
+// Locale dropdown (cosmetic — UI is currently single-locale).
+const locale = ref('en-US')
+const locales = [
+  { code: 'en-US', label: 'English (US)' },
+  { code: 'th-TH', label: 'ภาษาไทย' },
+]
 </script>
 
 <template>
-  <div class="app-container">
+  <div class="cms-shell">
     <NotificationToast />
-    <nav class="top-nav">
-      <div class="logo" @click="router.push('/')" style="cursor: pointer;">
-        <span class="logo-mark">{ }</span>
-        SQL Quiz System
+    <ConfirmDialogHost />
+
+    <!-- Persistent top header -->
+    <header class="cms-header">
+      <div class="cms-brand" @click="router.push('/')" role="link" tabindex="0">
+        <span class="brand-mark">SQ</span>
+        <span>SQL Quiz</span>
+        <span class="brand-sub">Grader Portal</span>
       </div>
-      <div class="nav-links" v-if="isLoggedIn && user">
-        <span class="user-info">Logged in as: <strong>{{ user.username }}</strong></span>
-        
-        <router-link to="/student" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
-          <button :class="{ active: isActive }" @click="navigate">My Exam</button>
-        </router-link>
 
-        <router-link to="/practice" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
-          <button :class="{ active: isActive }" @click="navigate">Practice</button>
-        </router-link>
+      <button
+        v-if="showSidebar"
+        class="nav-hamburger"
+        @click="navOpen = !navOpen"
+        :aria-expanded="navOpen"
+        aria-label="Toggle navigation"
+        aria-controls="main-nav-links"
+      >
+        <span class="hbar" /><span class="hbar" /><span class="hbar" />
+      </button>
 
-        <router-link to="/student/results" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
-          <button :class="{ active: isActive }" @click="navigate">Results</button>
-        </router-link>
-        
-        <router-link to="/lecturer" v-if="['ADMIN', 'LECTURER'].includes(user.role)" custom v-slot="{ navigate, isActive }">
-          <button :class="{ active: isActive }" @click="navigate">Questions</button>
-        </router-link>
-
-        <router-link to="/admin" v-if="['ADMIN', 'LECTURER'].includes(user.role)" custom v-slot="{ navigate, isActive }">
-          <button :class="{ active: isActive }" @click="navigate">Accounts</button>
-        </router-link>
-
-        <router-link to="/lecturer/practice" v-if="['ADMIN', 'LECTURER'].includes(user.role)" custom v-slot="{ navigate, isActive }">
-          <button :class="{ active: isActive }" @click="navigate">Practice Authoring</button>
-        </router-link>
-
-        <button @click="logout" class="logout-btn">Logout</button>
+      <div v-if="isLoggedIn" class="cms-header-right">
+        <select v-model="locale" class="locale-select" aria-label="Language">
+          <option v-for="l in locales" :key="l.code" :value="l.code">{{ l.label }}</option>
+        </select>
+        <span class="header-greeting">
+          Logged in as <strong>{{ user.username }}</strong>
+        </span>
+        <button class="btn btn-sm logout-btn" @click="logout">{{ UI_COPY.LOGOUT }}</button>
       </div>
-    </nav>
+    </header>
 
-    <main class="content">
-      <router-view />
-    </main>
+    <!-- Two-column body -->
+    <div class="cms-body">
+      <aside
+        v-if="showSidebar"
+        ref="navRef"
+        id="main-nav-links"
+        class="cms-sidebar"
+        :class="{ 'is-open': navOpen }"
+      >
+        <ClockSidebar />
+
+        <nav class="sidebar-nav" aria-label="Primary">
+          <div class="nav-section">General</div>
+
+          <router-link to="/student" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>My Examination</span>
+            </button>
+          </router-link>
+          <router-link to="/practice" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Practice</span>
+            </button>
+          </router-link>
+          <router-link to="/student/results" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Submissions</span>
+            </button>
+          </router-link>
+
+          <template v-if="['ADMIN','LECTURER'].includes(user.role)">
+            <div class="nav-section">Authoring</div>
+            <router-link to="/lecturer" custom v-slot="{ navigate, isActive }">
+              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+                <span>Examinations</span>
+              </button>
+            </router-link>
+            <router-link to="/lecturer/practice" custom v-slot="{ navigate, isActive }">
+              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+                <span>Practice Authoring</span>
+              </button>
+            </router-link>
+          </template>
+
+          <template v-if="user.role === 'ADMIN'">
+            <div class="nav-section">Administration</div>
+            <router-link to="/admin" custom v-slot="{ navigate, isActive }">
+              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+                <span>Accounts</span>
+              </button>
+            </router-link>
+          </template>
+        </nav>
+      </aside>
+
+      <main id="content" class="cms-main" :class="{ 'is-bare': isLoginRoute }" role="main">
+        <router-view />
+      </main>
+    </div>
   </div>
 </template>
 
-<style>
-.app-container { min-height: 100vh; background: var(--color-bg); }
-.top-nav {
-  display: flex; 
-  justify-content: space-between; 
-  align-items: center;
-  padding: 0.8rem 2rem; 
-  background: var(--color-surface); 
-  color: var(--color-text);
-  border-bottom: 2px solid var(--color-border);
+<style scoped>
+/* Mobile drawer behavior for the sidebar */
+@media (max-width: 1023.98px) {
+  .cms-sidebar {
+    display: none;
+  }
+  .cms-sidebar.is-open {
+    display: flex;
+    position: fixed;
+    top: var(--layout-header-h);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    background: var(--color-bg);
+    padding: var(--space-4);
+    overflow-y: auto;
+  }
+  .nav-hamburger { display: inline-flex; }
 }
-.nav-links { display: flex; align-items: center; gap: 0.5rem; }
-.nav-links button {
-  padding: 0.5rem 1rem; 
-  background: transparent; 
-  border: 1px solid transparent;
-  color: var(--color-text); 
-  cursor: pointer; 
-  border-radius: 0; 
-  font-weight: 700;
-  font-size: 0.85rem;
-}
-.nav-links button.active { 
-  background-color: var(--color-primary); 
-  color: var(--color-surface);
-  border-color: var(--color-border);
-}
-.nav-links button:hover:not(.active) { 
-  background-color: var(--color-surface-muted);
-}
-.logout-btn { 
-  background: var(--color-danger) !important; 
-  color: var(--color-surface) !important;
-  border: 1px solid var(--color-danger) !important;
-  font-weight: 800 !important;
-}
-.logout-btn:hover {
-  opacity: 0.9;
-}
-.user-info { 
-  font-size: 0.85rem; 
-  margin-right: 1rem; 
-  color: var(--color-text-muted); 
-}
-.content { max-width: 1200px; margin: 3rem auto; padding: 0 1rem; }
-.logo { 
-  font-weight: 800; 
-  font-size: 1.25rem; 
-  letter-spacing: -0.01em; 
-  color: var(--color-text);
-}
-.logo-mark { 
-  border: 2px solid var(--color-border); 
-  padding: 2px 6px; 
-  font-family: var(--font-mono); 
-  font-weight: 900; 
-  margin-right: 8px; 
+@media (min-width: 1024px) {
+  .nav-hamburger { display: none; }
 }
 </style>

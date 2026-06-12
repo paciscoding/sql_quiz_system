@@ -2,7 +2,7 @@
 import { ref, onMounted, watch, onBeforeUnmount } from 'vue'
 import { EditorState } from '@codemirror/state'
 import { EditorView, keymap, lineNumbers, highlightActiveLineGutter } from '@codemirror/view'
-import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, toggleLineComment } from '@codemirror/commands'
 import { sql } from '@codemirror/lang-sql'
 
 const props = defineProps<{
@@ -26,7 +26,11 @@ const initEditor = () => {
       highlightActiveLineGutter(),
       history(),
       sql(),
-      keymap.of([...defaultKeymap, ...historyKeymap]),
+      keymap.of([
+        { key: 'Mod-/', run: toggleLineComment },
+        ...defaultKeymap,
+        ...historyKeymap,
+      ]),
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           emit('update:modelValue', update.state.doc.toString())
@@ -91,5 +95,7 @@ watch(() => props.modelValue, (newVal) => {
   border-radius: 0;
   overflow: hidden;
   background: var(--color-surface);
+  font-size: 1rem;
+
 }
 </style>

@@ -58,6 +58,10 @@ func main() {
 		log.Fatalf("Failed to initialize practice sandbox: %v", err)
 	}
 
+	// Initialize SSE hub for real-time exam status push
+	hub := services.NewHub()
+	defer hub.Close()
+
 	// Initialize Services
 	valService := services.NewValidationService(repo)
 	studentImportService := services.NewStudentImportService(repo)
@@ -83,12 +87,14 @@ func main() {
 	}
 
 	// Initialize Controllers
-	quizCtrl := controllers.NewQuizController(valService, submissionQueue, repo)
-	lecturerCtrl := controllers.NewLecturerController(repo)
+	quizCtrl := controllers.NewQuizController(valService, submissionQueue, repo, hub, authService)
+	lecturerCtrl := controllers.NewLecturerController(repo, hub)
 	lecturerCtrl.SetStudentImportService(studentImportService)
 	userCtrl := controllers.NewUserController(authService)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
-	examFreezeMW := middleware.ExamFreezeMiddleware(repo)
+	// Practice is live during exams by default; this gate only blocks practice
+	// when an active exam has its block_practice_during_exam toggle on (OQ-1).
+	practiceFreezeMW := middleware.PracticeFreezeMiddleware(repo)
 
 	// Setup Gin
 	r := gin.Default()
@@ -129,6 +135,11 @@ func main() {
 			}
 		}
 
+		// SSE stream route (authentication done inside handler via ?access_token= query param)
+		// Must be registered OUTSIDE the quiz group to bypass the bearer-auth middleware.
+		// Registered before /quiz/:id routes to avoid Gin catching the path in a wildcard.
+		v1.GET("/quiz/exams/:id/stream", quizCtrl.StreamExamStatus)
+
 		// Protected Quiz Routes
 		quiz := v1.Group("/quiz")
 		quiz.Use(controllers.AuthMiddleware(authService))
@@ -138,6 +149,13 @@ func main() {
 			quiz.GET("/exams", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExams)
 			quiz.GET("/exams/:id/questions", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExamQuestions)
 			quiz.GET("/exams/:id/results", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExamResults)
+			// Exam intro: enrollment-gated, NOT active-gated (first page after start + revisitable).
+			quiz.GET("/exams/:id/introduction", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetExamIntroduction)
+			// Exam intro images: metadata list and binary stream. Staff (Admin/Lecturer)
+			// also read these from IntroImagesEditor on the lecturer view; the handler
+			// itself still enforces student enrollment when the caller is a student.
+			quiz.GET("/exams/:id/intro-images", controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer), quizCtrl.ListExamIntroImages)
+			quiz.GET("/exams/:id/intro-images/:imageId", controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer), quizCtrl.GetExamIntroImage)
 			quiz.GET("/results", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetMyResultsSummary)
 		}
 
@@ -146,16 +164,25 @@ func main() {
 		staff.Use(controllers.AuthMiddleware(authService))
 		{
 			staff.POST("/lecturer/question", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.UpsertQuestion)
+			staff.GET("/lecturer/exams/max-scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamMaxScores)
 			staff.GET("/lecturer/exams/:id/questions", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamQuestions)
 			staff.DELETE("/lecturer/questions/:id", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeleteQuestion)
 			staff.POST("/lecturer/preview", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.PreviewCorrectSQL)
-			staff.POST("/lecturer/import-schema", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportSchema)
+			staff.POST("/lecturer/import-schema", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportSchema)
 			staff.POST("/lecturer/students/import", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportStudents)
 			staff.GET("/lecturer/exams", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ListExaminations)
 			staff.POST("/lecturer/exams", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.CreateExamination)
 			staff.GET("/lecturer/exams/:id/submissions", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ListSubmissions)
 			staff.PUT("/lecturer/exams/:id/activate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ActivateExamination)
 			staff.PUT("/lecturer/exams/:id/deactivate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeactivateExamination)
+			staff.PUT("/lecturer/exams/:id/practice-freeze", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.SetPracticeFreeze)
+			staff.PUT("/lecturer/exams/:id/introduction", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.SetExamIntroduction)
+			// Exam intro images: staff mutations (upload, delete, reorder).
+			staff.POST("/lecturer/exams/:id/intro-images", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.UploadExamIntroImage)
+			staff.DELETE("/lecturer/exams/:id/intro-images/:imageId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeleteExamIntroImage)
+			staff.PUT("/lecturer/exams/:id/intro-images/order", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ReorderExamIntroImages)
+			staff.GET("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamRoster)
+			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)
 			staff.GET("/lecturer/scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetConsolidatedScores)
 			staff.GET("/lecturer/export-scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ExportScoresCSV)
@@ -163,9 +190,10 @@ func main() {
 			staff.POST("/users/bulk", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccountsBulk)
 		}
 
-		// Practice student routes (with exam freeze middleware)
+		// Practice student routes. Live during exams unless an active exam has the
+		// block_practice_during_exam toggle on (toggle-aware practiceFreezeMW).
 		practiceStudent := v1.Group("/practice")
-		practiceStudent.Use(controllers.AuthMiddleware(authService), controllers.RoleMiddleware(models.RoleStudent), examFreezeMW)
+		practiceStudent.Use(controllers.AuthMiddleware(authService), controllers.RoleMiddleware(models.RoleStudent), practiceFreezeMW)
 		{
 			practiceStudent.GET("/questions", practiceCtrl.ListForStudent)
 			practiceStudent.GET("/questions/:id", practiceCtrl.GetForStudent)
@@ -173,6 +201,20 @@ func main() {
 			practiceStudent.POST("/preview", practiceCtrl.Preview)
 			practiceStudent.GET("/attempts", practiceCtrl.ListMyAttempts)
 			practiceStudent.GET("/summary", practiceCtrl.GetSummary)
+			// Practice intro: schema + description for a category (available, not required).
+			practiceStudent.GET("/categories/:id/introduction", practiceCtrl.GetCategoryIntroduction)
+		}
+
+		// Practice category intro images: read-only, multi-role (Student + Admin + Lecturer),
+		// and explicitly NOT behind practiceFreezeMW — staff need these from the lecturer
+		// editor even when practice is frozen for students, and descriptive content does
+		// not need the same gating as practice attempts. Distinct group keeps the freeze
+		// MW scoped to the routes that truly are "practice work".
+		practiceIntroImages := v1.Group("/practice")
+		practiceIntroImages.Use(controllers.AuthMiddleware(authService), controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer))
+		{
+			practiceIntroImages.GET("/categories/:id/intro-images", practiceCtrl.ListCategoryIntroImages)
+			practiceIntroImages.GET("/categories/:id/intro-images/:imageId", practiceCtrl.GetCategoryIntroImage)
 		}
 
 		// Practice lecturer/admin routes (no freeze middleware)
@@ -182,8 +224,19 @@ func main() {
 			practiceLecturer.POST("/question", practiceCtrl.Upsert)
 			practiceLecturer.GET("/questions", practiceCtrl.ListForLecturer)
 			practiceLecturer.DELETE("/question/:id", practiceCtrl.Delete)
-			practiceLecturer.POST("/reset-sandbox", practiceCtrl.ResetSandbox)
 			practiceLecturer.POST("/preview", practiceCtrl.LecturerPreview)
+			// Practice category CRUD + per-category database import.
+			practiceLecturer.GET("/categories", practiceCtrl.ListCategories)
+			practiceLecturer.POST("/categories", practiceCtrl.CreateCategory)
+			practiceLecturer.PUT("/categories/:id", practiceCtrl.RenameCategory)
+			practiceLecturer.DELETE("/categories/:id", practiceCtrl.DeleteCategory)
+			practiceLecturer.POST("/categories/:id/import", practiceCtrl.ImportCategorySchema)
+			// Lecturer writes the category description.
+			practiceLecturer.PUT("/categories/:id/introduction", practiceCtrl.SetCategoryIntroduction)
+			// Practice category intro images: staff mutations (upload, delete, reorder).
+			practiceLecturer.POST("/categories/:id/intro-images", practiceCtrl.UploadCategoryIntroImage)
+			practiceLecturer.DELETE("/categories/:id/intro-images/:imageId", practiceCtrl.DeleteCategoryIntroImage)
+			practiceLecturer.PUT("/categories/:id/intro-images/order", practiceCtrl.ReorderCategoryIntroImages)
 		}
 	}
 

@@ -1,68 +1,103 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { useSingleFlight } from '../composables/useSingleFlight'
+import { useFormValidation, required } from '../composables/useFormValidation'
+import FieldError from './FieldError.vue'
+import Spinner from './Spinner.vue'
+import { useAuth } from '../services/auth'
 
 const router = useRouter()
-const username = ref('')
-const password = ref('')
-const loading = ref(false)
+const route = useRoute()
+const { login } = useAuth()
+
+const form = useFormValidation({
+  username: { rules: [required('Username is required')], initial: '' },
+  password: { rules: [required('Password is required')], initial: '' },
+})
+
+import { ref } from 'vue'
+import { UI_COPY } from '../constants/ui_copy'
 const error = ref('')
 
-const handleLogin = async () => {
-  loading.value = true
+const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () => {
   error.value = ''
+  if (!form.validateAll()) return
 
   try {
     const response = await fetch('/api/v1/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: username.value, password: password.value })
+      body: JSON.stringify({ username: form.values.username, password: form.values.password })
     })
 
     if (!response.ok) {
+      form.markTouched('username')
+      form.markTouched('password')
       throw new Error('Invalid username or password')
     }
 
     const data = await response.json()
-    // Save to localStorage
-    localStorage.setItem('sql_quiz_token', data.token)
-    localStorage.setItem('sql_quiz_user', JSON.stringify(data.user))
+    login(data.token, data.user)
     
-    router.push('/dashboard')
+    router.push((route.query.redirect as string) || '/dashboard')
   } catch (err: any) {
     error.value = err.message
-  } finally {
-    loading.value = false
   }
-}
+})
 </script>
 
 <template>
   <div class="login-shell">
-    <div class="card login-card">
-      <h2 style="margin: 0 0 var(--space-1) 0;">SQL Quiz System</h2>
-      <p class="muted" style="margin: 0 0 var(--space-4) 0;">Sign in to continue</p>
+    <div class="login-card card">
+      <div class="login-brand">
+        <span class="brand-mark">SQ</span>
+        <div>
+          <h2>SQL Quiz Grader Portal</h2>
+          <p class="muted">Sign in to continue.</p>
+        </div>
+      </div>
 
-      <form @submit.prevent="handleLogin">
+      <div class="alert-info" style="margin-bottom: var(--space-4);">
+        <strong>Welcome.</strong>
+        <span class="alert-body">Use the credentials issued by your instructor. If you have lost access, contact the course administrator.</span>
+      </div>
+
+      <form @submit.prevent="handleLogin" novalidate>
         <div class="field">
           <label>Username</label>
-          <input class="input" v-model="username" autocomplete="username" />
+          <input
+            class="input"
+            v-model="form.values.username"
+            autocomplete="username"
+            autofocus
+            :aria-invalid="form.touched.username && !!form.errors.username"
+            :aria-describedby="'err-username'"
+            @blur="form.markTouched('username')"
+            @input="form.touched.username && form.validateField('username')"
+          />
+          <FieldError :message="form.touched.username ? form.errors.username : ''" id="err-username" />
         </div>
         <div class="field">
           <label>Password</label>
-          <input class="input" v-model="password" type="password" autocomplete="current-password" />
+          <input
+            class="input"
+            v-model="form.values.password"
+            type="password"
+            autocomplete="current-password"
+            :aria-invalid="form.touched.password && !!form.errors.password"
+            :aria-describedby="'err-password'"
+            @blur="form.markTouched('password')"
+            @input="form.touched.password && form.validateField('password')"
+          />
+          <FieldError :message="form.touched.password ? form.errors.password : ''" id="err-password" />
         </div>
 
-        <button type="submit" class="btn btn-primary" style="width: 100%;" :disabled="loading">
-          {{ loading ? 'Signing in...' : 'Login' }}
+        <button type="submit" class="btn btn-primary" style="width: 100%;" :disabled="loginLoading">
+          <Spinner v-if="loginLoading" size="sm" inline :invert="true" />{{ loginLoading ? UI_COPY.LOGIN_LOADING : UI_COPY.LOGIN }}
         </button>
 
         <p v-if="error" style="margin-top: var(--space-3); text-align: center;">
           <span class="badge badge-danger">{{ error }}</span>
-        </p>
-
-        <p class="muted" style="margin-top: var(--space-4); text-align: center; font-size: 0.8rem;">
-          Default admin: admin / admin123
         </p>
       </form>
     </div>
@@ -73,70 +108,34 @@ const handleLogin = async () => {
 .login-shell {
   display: flex;
   justify-content: center;
-  align-items: center;
-  min-height: calc(100vh - 80px);
-  padding: var(--space-4);
-  background: var(--color-surface);
+  align-items: flex-start;
+  min-height: calc(100vh - var(--layout-header-h) - 80px);
+  padding: var(--space-7) var(--space-4);
 }
 .login-card {
   width: 100%;
-  max-width: 400px;
-  background: var(--color-surface);
-  border: 2px solid var(--color-border);
+  max-width: 420px;
   padding: var(--space-6);
 }
-.login-card h2 {
-  color: var(--color-text);
-  font-weight: 800;
-  letter-spacing: -0.01em;
-  font-size: 1.8rem;
-  line-height: 1.2;
-  margin-bottom: var(--space-1);
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: var(--space-5);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-rule);
 }
-.muted {
-  color: var(--color-text-muted);
-  font-weight: 500;
-  font-size: 0.9rem;
-}
-.field {
-  margin-bottom: var(--space-4);
-}
-.label {
-  display: block;
-  font-weight: 700;
-  margin-bottom: 0.5rem;
-  color: var(--color-text);
-}
-.input {
-  width: 100%;
-  padding: 0.6rem;
-  border: 2px solid var(--color-border);
-  font-family: var(--font-mono);
-  font-weight: 600;
-  font-size: 1rem;
-  background: var(--color-surface);
-  color: var(--color-text);
-}
-.btn-primary {
+.login-brand .brand-mark {
+  width: 44px; height: 44px;
+  display: inline-flex; align-items: center; justify-content: center;
   background: var(--color-primary);
-  color: var(--color-surface);
-  border: 2px solid var(--color-border);
+  color: #fff;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
   font-weight: 700;
-  padding: var(--space-3);
-  cursor: pointer;
-  transition: none;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
 }
-.btn-primary:hover:not(:disabled) {
-  background: #333333;
-}
-.btn-primary:active {
-  transform: translateY(1px);
-}
-.badge-danger {
-  background: var(--color-danger-bg);
-  color: var(--color-danger);
-  border: 1px solid var(--color-danger);
-  padding: var(--space-2) var(--space-4);
-  font-weight: 700;
-}
+.login-brand h2 { margin: 0; font-size: 1.2rem; }
+.login-brand p  { margin: 2px 0 0 0; font-size: 0.85rem; }
 </style>

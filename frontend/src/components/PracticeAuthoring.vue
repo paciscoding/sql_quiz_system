@@ -1,22 +1,40 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed, watch, nextTick } from 'vue'
 import {
   lecturerListQuestions,
   upsertQuestion,
   deleteQuestion,
-  resetSandbox,
   lecturerPreview,
-  type PracticeQuestion
+  listCategories,
+  createCategory,
+  renameCategory,
+  deleteCategory,
+  importCategorySchema,
+  setCategoryIntroduction,
+  ApiError,
+  type PracticeQuestion,
+  type PracticeCategory
 } from '../services/practice'
+import { UI_COPY } from '../constants/ui_copy'
 import SqlEditor from './SqlEditor.vue'
+import BackLink from './BackLink.vue'
 import ResultTable from './ResultTable.vue'
+import { useSingleFlight } from '../composables/useSingleFlight'
+import { useConfirm } from '../services/confirm_service'
 import { useNotifications } from '../services/notification_service'
+import { handleApiError } from '../services/error_handler'
+import { useFormValidation, required } from '../composables/useFormValidation'
+import FieldError from './FieldError.vue'
+import Spinner from './Spinner.vue'
+import { useAutosave } from '../composables/useAutosave'
+import IntroImagesEditor from './IntroImagesEditor.vue'
 
 const { notify } = useNotifications()
+const { confirm } = useConfirm()
 
 const questions = ref<PracticeQuestion[]>([])
+const categories = ref<PracticeCategory[]>([])
 const form = ref<Partial<PracticeQuestion>>({
-  category: 'General',
   question_type: 'QUERY',
   points: 1.0,
   strict_ordering: false,
@@ -24,16 +42,96 @@ const form = ref<Partial<PracticeQuestion>>({
 })
 const previewRows = ref<any[]>([])
 const previewCols = ref<string[]>([])
-const lastResetAt = ref<string | null>(null)
-const loading = ref(false)
 const previewLoading = ref(false)
 const previewError = ref('')
+
+// --- Category management panel state ---
+const showCategoryPanel = ref(false)
+const categoryPanelRef = ref<HTMLElement | null>(null)
+const newCategoryName = ref('')
+
+// The panel renders as the last card on the page (below the create/edit form),
+// so on open we scroll it into view — otherwise clicking the button appears to
+// do nothing because the panel opens below the fold.
+const toggleCategoryPanel = async () => {
+  showCategoryPanel.value = !showCategoryPanel.value
+  if (showCategoryPanel.value) {
+    await nextTick()
+    categoryPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+}
+const importCategoryId = ref<number | null>(null)
+const importSql = ref('')
+
+// Per-category introduction editor state (keyed by category id)
+const categoryIntroEdits = ref<Record<number, string>>({})
+const categoryIntroSaving = ref<Record<number, boolean>>({})
+
+// Pre-populate introduction edits from the loaded category list
+watch(categories, (cats) => {
+  cats.forEach(c => {
+    if (!(c.id in categoryIntroEdits.value)) {
+      categoryIntroEdits.value[c.id] = c.introduction ?? ''
+    }
+  })
+})
+
+const saveCategoryIntro = async (cat: PracticeCategory) => {
+  categoryIntroSaving.value[cat.id] = true
+  try {
+    await setCategoryIntroduction(cat.id, categoryIntroEdits.value[cat.id] ?? '')
+    notify('Description saved', 'success')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to save description' })
+  } finally {
+    categoryIntroSaving.value[cat.id] = false
+  }
+}
+
+const categoryNameById = computed<Record<number, string>>(() => {
+  const map: Record<number, string> = {}
+  categories.value.forEach(c => { map[c.id] = c.name })
+  return map
+})
+
+const loadCategories = async () => {
+  try {
+    categories.value = await listCategories()
+    // Default the form to the first category when creating a new question.
+    if (!form.value.category_id && categories.value.length > 0) {
+      form.value.category_id = categories.value[0].id
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load categories' })
+  }
+}
+
+// --- Autosave for requirement textarea (TODO-060) ---
+const requirementRef = computed({
+  get: () => form.value.requirement ?? '',
+  set: (v: string) => { form.value.requirement = v }
+})
+
+const { hasDraft, restoreDraft, clearDraft } = useAutosave('sql_quiz_draft.practiceAuthoring.requirement', requirementRef)
+const showDraftBanner = ref(false)
+
+const acceptDraft = () => { restoreDraft(); showDraftBanner.value = false }
+const dismissDraft = () => { clearDraft(); showDraftBanner.value = false }
+
+
+// Form validation for practice question (TODO-038)
+const practiceForm = useFormValidation({
+  requirement: { rules: [required('Requirement is required')], initial: '' },
+  correct_sql: { rules: [required('Correct SQL is required')], initial: '' },
+})
+watch(() => form.value.requirement, (v) => { practiceForm.values.requirement = v ?? '' })
+watch(() => form.value.correct_sql, (v) => { practiceForm.values.correct_sql = v ?? '' })
 
 const loadQuestions = async () => {
   try {
     questions.value = await lecturerListQuestions()
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load questions' })
   }
 }
 
@@ -41,9 +139,11 @@ const editQuestion = (q: PracticeQuestion) => {
   form.value = { ...q }
 }
 
+const formRef = ref<HTMLElement | null>(null)
+
 const resetForm = () => {
   form.value = {
-    category: 'General',
+    category_id: categories.value[0]?.id,
     question_type: 'QUERY',
     points: 1.0,
     strict_ordering: false,
@@ -54,8 +154,18 @@ const resetForm = () => {
   previewError.value = ''
 }
 
-const saveQuestion = async () => {
-  loading.value = true
+function newPracticeQuestion() {
+  resetForm()
+  formRef.value?.scrollIntoView({ behavior: 'smooth' })
+}
+
+const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(async () => {
+  practiceForm.markTouched('correct_sql')
+  if (!practiceForm.validateAll()) return
+  if (!form.value.category_id) {
+    notify('Please select a category. Create one first if none exist.', 'error')
+    return
+  }
   try {
     const res = await upsertQuestion(form.value)
     if (res.expected_result_status === 'captured') {
@@ -66,24 +176,24 @@ const saveQuestion = async () => {
       notify('Question saved', 'success')
     }
     await loadQuestions()
+    clearDraft()
     resetForm()
-  } catch (err: any) {
-    notify(err.message, 'error')
-  } finally {
-    loading.value = false
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to save question' })
   }
-}
+})
 
-const handleDelete = async (id: number) => {
-  if (!window.confirm('Are you sure you want to delete this question?')) return
+const { inFlight: deleteQuestionLoading, run: handleDelete } = useSingleFlight(async (id: number) => {
+  const ok = await confirm({ title: 'Delete this practice question?', body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
+  if (!ok) return
   try {
     await deleteQuestion(id)
     notify('Question deleted', 'success')
     await loadQuestions()
-  } catch (err: any) {
-    notify(err.message, 'error')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to delete question' })
   }
-}
+})
 
 const handlePreview = async () => {
   previewLoading.value = true
@@ -102,32 +212,118 @@ const handlePreview = async () => {
       previewRows.value = res.rows || []
       previewCols.value = res.columns || []
     }
-  } catch (err: any) {
-    previewError.value = err.message
-    notify(err.message, 'error')
+  } catch (err) {
+    previewError.value = (err as Error).message || 'Preview failed'
+    handleApiError(err, { fallback: 'Preview failed' })
   } finally {
     previewLoading.value = false
   }
 }
 
-const handleResetSandbox = async () => {
-  if (!window.confirm('Reset sandbox? This drops and recreates sandbox_practice schema.')) return
+// --- Category management handlers ---
+
+const { inFlight: addCategoryLoading, run: addCategory } = useSingleFlight(async () => {
+  const name = newCategoryName.value.trim()
+  if (!name) return
   try {
-    const res = await resetSandbox()
-    lastResetAt.value = res.reset_at
-    notify('Sandbox reset successfully', 'success')
-  } catch (err: any) {
-    notify(err.message, 'error')
+    const cat = await createCategory(name)
+    notify(`Category "${cat.name}" created`, 'success')
+    newCategoryName.value = ''
+    await loadCategories()
+    form.value.category_id = cat.id
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to create category' })
+  }
+})
+
+const doRenameCategory = async (cat: PracticeCategory) => {
+  const next = window.prompt('Rename category', cat.name)
+  if (next === null) return
+  const name = next.trim()
+  if (!name || name === cat.name) return
+  try {
+    await renameCategory(cat.id, name)
+    notify('Category renamed', 'success')
+    await loadCategories()
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to rename category' })
   }
 }
 
+const doDeleteCategory = async (cat: PracticeCategory) => {
+  const ok = await confirm({ title: `Delete "${cat.name}"?`, body: 'The category and its database will be removed.', confirmLabel: 'Delete', danger: true })
+  if (!ok) return
+  try {
+    await deleteCategory(cat.id, false)
+    notify('Category deleted', 'success')
+    await Promise.all([loadCategories(), loadQuestions()])
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      const force = await confirm({ title: `Delete "${cat.name}" and its questions?`, body: UI_COPY.DELETE_CATEGORY_CONFIRM, confirmLabel: 'Delete everything', danger: true })
+      if (!force) return
+      try {
+        await deleteCategory(cat.id, true)
+        notify('Category and its questions deleted', 'success')
+        await Promise.all([loadCategories(), loadQuestions()])
+      } catch (err2) {
+        handleApiError(err2, { fallback: 'Failed to delete category' })
+      }
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to delete category' })
+  }
+}
+
+const openImport = (cat: PracticeCategory) => {
+  importCategoryId.value = cat.id
+  importSql.value = ''
+}
+
+const cancelImport = () => {
+  importCategoryId.value = null
+  importSql.value = ''
+}
+
+const { inFlight: importLoading, run: doImport } = useSingleFlight(async () => {
+  if (importCategoryId.value === null || !importSql.value.trim()) return
+  const id = importCategoryId.value
+  try {
+    await importCategorySchema(id, importSql.value, false)
+    notify('Database imported', 'success')
+    cancelImport()
+    await loadCategories()
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      const ok = await confirm({ title: 'Replace existing database?', body: UI_COPY.REPLACE_CATEGORY_DB_CONFIRM, confirmLabel: 'Replace', danger: true })
+      if (!ok) return
+      try {
+        await importCategorySchema(id, importSql.value, true)
+        notify('Database replaced', 'success')
+        cancelImport()
+        await loadCategories()
+      } catch (err2) {
+        handleApiError(err2, { fallback: 'Failed to import database' })
+      }
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to import database' })
+  }
+})
+
 onMounted(() => {
   loadQuestions()
+  loadCategories()
+  showDraftBanner.value = hasDraft()
 })
 </script>
 
 <template>
   <div class="practice-authoring">
+    <div class="page-header">
+      <h1>Practice Authoring</h1>
+      <p class="page-subtitle">Maintain practice categories, import per-category schemas, and author practice questions.</p>
+    </div>
+    <BackLink to="/lecturer" label="Back to Lecturer Dashboard" />
     <!-- Section A: Question List -->
     <div class="card" style="margin-bottom: var(--space-4);">
       <h2>Practice Questions</h2>
@@ -147,7 +343,7 @@ onMounted(() => {
         <tbody>
           <tr v-for="q in questions" :key="q.id">
             <td>{{ q.id }}</td>
-            <td style="font-weight: 700; font-size: 0.8rem;">{{ q.category }}</td>
+            <td style="font-weight: 700; font-size: 0.8rem;">{{ q.category_name || categoryNameById[q.category_id] || q.category }}</td>
             <td>{{ q.requirement }}</td>
             <td>
               <span class="badge badge-info">{{ q.question_type }}</span>
@@ -168,7 +364,7 @@ onMounted(() => {
             <td>
               <div style="display: flex; gap: var(--space-1);">
                 <button class="btn btn-secondary btn-sm" @click="editQuestion(q)">Edit</button>
-                <button class="btn btn-secondary btn-sm" @click="handleDelete(q.id)">Delete</button>
+                <button class="btn btn-secondary btn-sm" :disabled="deleteQuestionLoading" @click="handleDelete(q.id)">Delete</button>
               </div>
             </td>
           </tr>
@@ -176,17 +372,116 @@ onMounted(() => {
       </table>
     </div>
 
-    <!-- Section B: Create/Edit Form -->
-    <div class="card" style="margin-bottom: var(--space-4);">
+
+    <!-- Section B: Manage Categories -->
+    <div v-if="showCategoryPanel" class="card" ref="categoryPanelRef">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h2 style="margin: 0;">{{ UI_COPY.MANAGE_CATEGORIES }}</h2>
+        <button class="btn btn-secondary btn-sm" @click="showCategoryPanel = false">Close</button>
+      </div>
+      <p class="muted">Each category owns its own database (schema), kept separate from exams. Import a <code>.sql</code> per category.</p>
+
+      <!-- New category -->
+      <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">
+        <input v-model="newCategoryName" class="input" placeholder="New category name" style="flex: 1;" @keyup.enter="addCategory" />
+        <button class="btn btn-primary" :disabled="addCategoryLoading || !newCategoryName.trim()" @click="addCategory">
+          {{ UI_COPY.NEW_CATEGORY }}
+        </button>
+      </div>
+
+      <table v-if="categories.length > 0" class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Schema</th>
+            <th>Questions</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template v-for="c in categories" :key="c.id">
+            <tr>
+              <td style="font-weight: 700;">{{ c.name }}</td>
+              <td><code>{{ c.schema_name }}</code></td>
+              <td>{{ c.question_count }}</td>
+              <td>
+                <div style="display: flex; gap: var(--space-1); flex-wrap: wrap;">
+                  <button class="btn btn-secondary btn-sm" @click="doRenameCategory(c)">{{ UI_COPY.RENAME_CATEGORY }}</button>
+                  <button class="btn btn-secondary btn-sm" @click="openImport(c)">{{ UI_COPY.IMPORT_CATEGORY_DB }}</button>
+                  <button class="btn btn-secondary btn-sm" @click="doDeleteCategory(c)" style="border-color: var(--color-danger); color: var(--color-danger);">{{ UI_COPY.DELETE_CATEGORY }}</button>
+                </div>
+              </td>
+            </tr>
+            <!-- Per-category description editor row -->
+            <tr>
+              <td colspan="4" style="padding: var(--space-3); background: var(--color-surface-muted);">
+                <label style="display: block; font-size: 0.8rem; font-weight: 700; margin-bottom: var(--space-1); color: var(--color-text-muted);">Description (shown to students on the intro page)</label>
+                <div style="display: flex; gap: var(--space-2); align-items: flex-end;">
+                  <textarea
+                    v-model="categoryIntroEdits[c.id]"
+                    class="input"
+                    rows="3"
+                    style="flex: 1; resize: vertical; min-height: 60px;"
+                    :placeholder="'Write a description for the ' + c.name + ' category...'"
+                  ></textarea>
+                  <button
+                    class="btn btn-primary btn-sm"
+                    :disabled="categoryIntroSaving[c.id]"
+                    @click="saveCategoryIntro(c)"
+                    style="white-space: nowrap;"
+                  >{{ categoryIntroSaving[c.id] ? 'Saving...' : 'Save Description' }}</button>
+                </div>
+                <IntroImagesEditor scope="category" :owner-id="c.id" />
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <p v-else class="muted">No categories yet. Create one above.</p>
+
+      <!-- Inline import editor -->
+      <div v-if="importCategoryId !== null" style="margin-top: var(--space-4);">
+        <h3>Import database into "{{ categoryNameById[importCategoryId ?? 0] }}"</h3>
+        <p class="muted">Paste a SQL script using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
+        <SqlEditor v-model="importSql" height="200px" />
+        <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+          <button class="btn btn-primary" :disabled="importLoading || !importSql.trim()" @click="doImport">
+            <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : UI_COPY.IMPORT_CATEGORY_DB }}
+          </button>
+          <button class="btn btn-secondary" @click="cancelImport">Cancel</button>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Section C: Create/Edit Form -->
+    <div class="card" style="margin-bottom: var(--space-4);" ref="formRef">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4);">
-        <h2>{{ form.id ? 'Edit' : 'Create' }} Question</h2>
-        <button class="btn btn-secondary" @click="resetForm">Reset Form</button>
+        <div style="display: flex; align-items: center; gap: var(--space-3);">
+          <h2 style="margin: 0;">{{ form.id ? 'Edit' : 'Create' }} Practice Question</h2>
+          <span v-if="form.id" class="badge badge-info" style="font-size: 0.8rem;">Editing #{{ form.id }}</span>
+          <span v-else class="muted" style="font-size: 0.85rem;">New question</span>
+        </div>
+        <div style="display: flex; gap: var(--space-2);">
+          <!-- New Practice Question is disabled when already in create mode (no form.id) -->
+          <button class="btn btn-primary" :disabled="!form.id" @click="newPracticeQuestion">
+            New Practice Question
+          </button>
+          <button class="btn btn-secondary" @click="resetForm">Reset Form</button>
+        </div>
       </div>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4);">
         <div class="field">
           <label>Category</label>
-          <input v-model="form.category" class="input" placeholder="e.g. Basic Query operation" />
+          <div style="display: flex; gap: var(--space-2); align-items: center;">
+            <select v-model.number="form.category_id" class="input" style="flex: 1;">
+              <option v-if="categories.length === 0" :value="undefined" disabled>No categories — create one</option>
+              <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
+            </select>
+            <button type="button" class="btn btn-secondary btn-sm" @click="toggleCategoryPanel">
+              {{ UI_COPY.MANAGE_CATEGORIES }}
+            </button>
+          </div>
         </div>
         <div class="field">
           <label>Question Type</label>
@@ -199,9 +494,19 @@ onMounted(() => {
           <label>Target Table (DML only)</label>
           <input v-model="form.target_table" class="input" placeholder="e.g. employee" />
         </div>
+        <div v-if="showDraftBanner" class="draft-banner">
+          A draft from your previous session is available.
+          <button type="button" class="btn btn-sm" @click="acceptDraft">Restore</button>
+          <button type="button" class="btn btn-sm" @click="dismissDraft">Discard</button>
+        </div>
         <div class="field" style="grid-column: span 2;">
           <label>Requirement</label>
-          <textarea v-model="form.requirement" class="input" rows="3"></textarea>
+          <textarea v-model="form.requirement" class="input" rows="3"
+            :aria-invalid="practiceForm.touched.requirement && !!practiceForm.errors.requirement"
+            aria-describedby="err-practice-req"
+            @blur="practiceForm.markTouched('requirement')"
+          ></textarea>
+          <FieldError :message="practiceForm.touched.requirement ? practiceForm.errors.requirement : ''" id="err-practice-req" />
         </div>
         <div class="field">
           <label>Points</label>
@@ -224,15 +529,16 @@ onMounted(() => {
           @update:modelValue="form.correct_sql = $event" 
           height="200px" 
         />
+        <FieldError id="practice-correct-sql-error" :message="practiceForm.touched.correct_sql ? practiceForm.errors.correct_sql : ''" />
       </div>
 
       <div style="display: flex; gap: var(--space-2); margin-top: var(--space-4);">
         <button 
           class="btn btn-primary" 
           @click="saveQuestion" 
-          :disabled="loading"
+          :disabled="saveQuestionLoading"
         >
-          {{ loading ? 'Saving...' : 'Save Question' }}
+          <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : 'Save Question' }}
         </button>
         <button 
           class="btn btn-secondary" 
@@ -252,55 +558,29 @@ onMounted(() => {
         <ResultTable :rows="previewRows" :columns="previewCols" />
       </div>
     </div>
-
-    <!-- Section C: Reset Sandbox -->
-    <div class="card">
-      <h2>Reset Practice Sandbox</h2>
-      <p class="muted">Drops and recreates sandbox_practice schema, re-cloning from public.*.</p>
-      <div style="display: flex; align-items: center; gap: var(--space-4);">
-        <button class="btn btn-secondary" @click="handleResetSandbox" style="border-color: var(--color-danger); color: var(--color-danger);">
-          Reset Sandbox
-        </button>
-        <span v-if="lastResetAt" class="muted">Last reset: {{ lastResetAt }}</span>
-      </div>
-    </div>
   </div>
 </template>
 
 <style scoped>
-.practice-authoring {
-  max-width: 1000px;
-  margin: 0 auto;
-  padding: var(--space-4);
-}
+.practice-authoring { /* sits inside .cms-main */ }
 .card {
-  border: 2px solid var(--color-border);
+  border: 1px solid var(--color-border);
   background: var(--color-surface);
-  padding: var(--space-6);
-  border-radius: 0;
+  padding: var(--space-5);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
 }
 h2 {
   margin-top: 0;
-  margin-bottom: var(--space-4);
-  font-size: 1.5rem;
-  font-weight: 800;
-  letter-spacing: -0.01em;
+  margin-bottom: var(--space-3);
+  font-size: 1.1rem;
+  font-weight: 700;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-border-soft);
 }
 h3 {
-  font-size: 1.1rem;
-  margin-bottom: var(--space-2);
-  font-weight: 800;
-}
-.data-table {
-  border: 2px solid var(--color-border);
-}
-.data-table th, .data-table td {
-  border: 1px solid var(--color-border);
-  font-weight: 600;
-}
-.data-table th {
-  background: var(--color-surface-muted);
-  color: var(--color-text);
+  font-size: 0.98rem;
+  margin-bottom: 6px;
   font-weight: 700;
 }
 .input {
@@ -342,5 +622,19 @@ h3 {
   border: 1px solid var(--color-border);
   border-radius: 0;
   font-weight: 700;
+}
+
+.draft-banner {
+  border: 1px dashed var(--color-border);
+  background: var(--color-surface-muted);
+  font-family: var(--font-mono);
+  padding: var(--space-2) var(--space-3);
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+  font-size: 0.85rem;
+  grid-column: span 2;
 }
 </style>

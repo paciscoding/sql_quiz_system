@@ -1,14 +1,19 @@
 erDiagram
-    %% All system tables live in the `app` schema.
-    %% Curriculum tables (e.g. Elmasri company) live in `public` and are
-    %% cloned into per-student `student_{id}` schemas via
-    %% CREATE TABLE ... (LIKE public.x INCLUDING ALL) + INSERT SELECT.
-
-    APP_SYSTEM_USERS ||--o{ APP_EXAMINATIONS : "creates"
-    APP_SYSTEM_USERS ||--o{ APP_SYSTEM_USERS : "manages"
-    APP_SYSTEM_USERS ||--o{ APP_EXAM_STUDENTS : "enrolls"
-    APP_EXAMINATIONS ||--o{ APP_QUESTIONS : "contains"
-    APP_EXAMINATIONS ||--o{ APP_EXAM_STUDENTS : "has"
+    APP_SYSTEM_USERS ||--o{ APP_EXAMINATIONS     : "creates"
+    APP_SYSTEM_USERS ||--o{ APP_SYSTEM_USERS     : "manages"
+    APP_SYSTEM_USERS ||--o{ APP_EXAM_STUDENTS    : "enrolls"
+    APP_SYSTEM_USERS ||--o{ APP_QUESTIONS        : "authors"
+    APP_SYSTEM_USERS ||--o{ APP_SUBMISSIONS      : "submits"
+    APP_EXAMINATIONS ||--o{ APP_QUESTIONS        : "contains"
+    APP_EXAMINATIONS ||--o{ APP_EXAM_STUDENTS    : "has"
+    APP_EXAMINATIONS ||--o{ APP_SUBMISSIONS      : "scopes"
+    APP_EXAMINATIONS ||--o| APP_EXAM_SANDBOXES   : "owns"
+    APP_QUESTIONS    ||--o{ APP_SUBMISSIONS      : "answered_by"
+    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_QUESTIONS : "created_by"
+    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_ATTEMPTS  : "student_id"
+    APP_PRACTICE_QUESTIONS ||--o{ APP_PRACTICE_ATTEMPTS : "practice_question_id"
+    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_CATEGORIES : "created_by"
+    APP_PRACTICE_CATEGORIES ||--o{ APP_PRACTICE_QUESTIONS : "category_id"
 
     APP_SYSTEM_USERS {
         int id PK
@@ -17,6 +22,12 @@ erDiagram
         string role
         int created_by FK
         timestamp created_at
+        string student_number
+        string student_id_ext
+        string sec_lec
+        string sec_lab
+        string first_name
+        string last_name
     }
 
     APP_EXAMINATIONS {
@@ -25,21 +36,92 @@ erDiagram
         boolean is_active
         int created_by FK
         timestamp created_at
+        timestamp activated_at
+        timestamp archived_at
+        boolean block_practice_during_exam
     }
 
     APP_QUESTIONS {
         int id PK
         int exam_id FK
+        int created_by FK
+        string question_type
         string target_table
         string correct_sql
-        string question_type
         double points
+        string requirement
         boolean strict_ordering
         boolean strict_attributes
-        boolean strict_record_order
+        jsonb expected_result
+        jsonb expected_columns
+        string expected_result_status
+        timestamp expected_result_captured_at
+        text capture_error
+        timestamp created_at
+        timestamp updated_at
     }
 
     APP_EXAM_STUDENTS {
-        int exam_id PK_FK
-        int student_id PK_FK
+        int exam_id PK
+        int student_id PK
+        int assigned_by FK
+        timestamp assigned_at
+    }
+
+    APP_SUBMISSIONS {
+        bigint id PK
+        int exam_id FK
+        int student_id FK
+        int question_id FK
+        text sql_text
+        boolean is_correct
+        double score
+        jsonb validation_details
+        timestamp submitted_at
+    }
+
+    APP_EXAM_SANDBOXES {
+        int exam_id PK
+        string schema_name
+        timestamp created_at
+        timestamp dropped_at
+    }
+
+    APP_PRACTICE_CATEGORIES {
+        int id PK
+        string name UK
+        string schema_name UK
+        int created_by FK
+        timestamp created_at
+        timestamp updated_at
+    }
+    APP_PRACTICE_QUESTIONS {
+        int id PK
+        int created_by FK
+        int category_id FK
+        string category "legacy, deprecated"
+        text target_table
+        text correct_sql
+        text question_type
+        text requirement
+        numeric points
+        boolean strict_ordering
+        boolean strict_attrs
+        jsonb expected_result
+        jsonb expected_columns
+        text expected_result_status
+        text capture_error
+        timestamp expected_result_captured_at
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    APP_PRACTICE_ATTEMPTS {
+        int id PK
+        int student_id FK
+        int practice_question_id FK
+        text sql_text
+        boolean is_correct
+        jsonb validation_details
+        timestamp submitted_at
     }

@@ -14,7 +14,19 @@ type examActiveChecker interface {
 	IsAnyExamActive(ctx context.Context) (bool, error)
 }
 
+// practiceFreezeChecker reports whether practice should be frozen right now,
+// honoring the per-exam block_practice_during_exam toggle.
+type practiceFreezeChecker interface {
+	IsPracticeFrozen(ctx context.Context) (bool, error)
+}
+
 var cache struct {
+	mu      sync.Mutex
+	expires time.Time
+	value   bool
+}
+
+var practiceCache struct {
 	mu      sync.Mutex
 	expires time.Time
 	value   bool
@@ -59,9 +71,56 @@ func ExamFreezeMiddleware(checker examActiveChecker) gin.HandlerFunc {
 	}
 }
 
-// InvalidateExamFreezeCache invalidates the exam freeze cache.
+// PracticeFreezeMiddleware blocks practice routes with 423 only when an active
+// exam has its block_practice_during_exam toggle on. Unlike ExamFreezeMiddleware
+// (which freezes on ANY active exam), practice is live during exams by default;
+// this is the toggle-aware gate wired onto the practice student group. Results
+// are cached for `ttl` and invalidated by InvalidateExamFreezeCache.
+func PracticeFreezeMiddleware(checker practiceFreezeChecker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		practiceCache.mu.Lock()
+		if time.Now().Before(practiceCache.expires) {
+			frozen := practiceCache.value
+			practiceCache.mu.Unlock()
+			if frozen {
+				c.AbortWithStatusJSON(http.StatusLocked, gin.H{"error": "practice_unavailable_during_exam"})
+				return
+			}
+			c.Next()
+			return
+		}
+		practiceCache.mu.Unlock()
+
+		frozen, err := checker.IsPracticeFrozen(c.Request.Context())
+		if err != nil {
+			log.Printf("PracticeFreezeMiddleware: failed to check practice freeze: %v", err)
+			// Fail open: practice stays available if the check errors, since the
+			// default posture is live-during-exams.
+			c.Next()
+			return
+		}
+
+		practiceCache.mu.Lock()
+		practiceCache.value = frozen
+		practiceCache.expires = time.Now().Add(ttl)
+		practiceCache.mu.Unlock()
+
+		if frozen {
+			c.AbortWithStatusJSON(http.StatusLocked, gin.H{"error": "practice_unavailable_during_exam"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// InvalidateExamFreezeCache invalidates both the exam-active and practice-freeze
+// caches. Called whenever an exam's active state or practice-freeze toggle
+// changes so the gates re-evaluate on the next request.
 func InvalidateExamFreezeCache() {
 	cache.mu.Lock()
 	cache.expires = time.Time{}
 	cache.mu.Unlock()
+	practiceCache.mu.Lock()
+	practiceCache.expires = time.Time{}
+	practiceCache.mu.Unlock()
 }

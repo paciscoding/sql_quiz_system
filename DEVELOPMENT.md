@@ -60,11 +60,19 @@ bun run dev
 ## Database Layout (Quick Reference)
 The backend assumes three logical schemas inside the `sql_quiz` database:
 
-- `app.*` — system tables (`system_users`, `examinations`, `questions`, `exam_students`). Created automatically on backend startup by `InitializeSystemTables`.
-- `public.*` — lecturer-imported curriculum (e.g. the Elmasri company schema). Treated as the clone template.
-- `student_{id}.*` — per-student sandbox, populated lazily on first submission and reused thereafter.
+- `app.*` — system tables, created/migrated by `InitializeSystemTables` on backend startup. All DDL there must be idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`):
+  - `app.system_users` — identity (admin / lecturer / student) keyed by a `role` discriminator.
+  - `app.examinations` — exam definitions with `is_active`, `activated_at`, `archived_at` lifecycle flags.
+  - `app.questions` — question definitions **plus the cached Correct Result** (`expected_result jsonb`, `expected_columns jsonb`, `expected_result_status`, `expected_result_captured_at`, `capture_error`).
+  - `app.exam_students` — enrollment junction with `assigned_by`, `assigned_at`.
+  - `app.submissions` — durable per-attempt record (`sql_text`, `is_correct`, `score`, `validation_details`, `submitted_at`).
+  - `app.exam_sandboxes` — bookkeeping for per-exam DML sandbox schemas (`exam_id PK`, `schema_name`, `created_at`, `dropped_at`). One row per exam; pure-SELECT exams don't have a row.
+- `public.*` — lecturer-imported curriculum. Treated as a frozen clone template during the active window. SELECT submissions read from here directly under role `exam_student_readonly`; mutations (via `ImportSchema`) are blocked while any exam is active.
+- `sandbox_exam_{examID}.*` — shared per-exam DML sandbox cloned from `public.*` at Phase 1 activation (only when the exam has DML questions). All enrolled students of that exam read and write the same physical tables here under role `exam_student`; cross-student isolation is via the global in-process FIFO `SubmissionQueue` (single worker goroutine, channel capacity 256, 30 s per-job timeout) plus mandatory savepoint rollback. Dropped at Phase 3.
 
-When writing repository methods, qualify system-table queries with `app.` and curriculum queries with `public.` (or `student_{id}.` when running through the sandbox).
+For full details on what each phase reads / writes from these tables, see `ARCHITECTURE.md § Phase Lifecycle`.
+
+When writing repository methods, qualify system-table queries with `app.`, curriculum queries with `public.` (and student SELECTs that read it under `exam_student_readonly`), and student DML queries with the dynamic `sandbox_exam_{examID}` schema. Always quote schema and table names through `pgx.Identifier{}.Sanitize()`.
 
 ## Coding Conventions
 ...
@@ -76,8 +84,19 @@ When writing repository methods, qualify system-table queries with `app.` and cu
 
 ### Frontend (Vue 3)
 - **Composition API:** Use `<script setup>`.
-- **Styling:** Vanilla CSS or scoped styles within components.
+- **Styling:** Vanilla CSS or scoped styles within components. Brutalist monotone aesthetic; `prefers-reduced-motion` honored on all animated elements.
+- **Layout:**
+  - `frontend/src/composables/` — reusable behaviour (`useFormValidation`, `useSingleFlight`, `useAutosave`, `useKeyboardShortcut`, `useFocusTrap`).
+  - `frontend/src/services/` — singletons / module-state (`auth`, `confirm_service`, `error_handler`, `notification_service`).
+  - `frontend/src/utils/` — pure helpers (`format_date`, `format_sql`).
+  - `frontend/src/constants/` — governed copy (`ui_copy.ts`).
+  - `frontend/src/components/` — Vue components (views + shared building blocks).
+- **Validation:** every `<form>` that uses `useFormValidation` must carry the `novalidate` attribute so the composable owns error display; do not add HTML5 `required`/`minlength`.
+- **Error handling:** mutation/fetch catch blocks route through `services/error_handler.ts > handleApiError`. `!response.ok` branches throw via `toApiError`. Form-level inline errors (LoginView) are the documented exception.
+- **Router:** ADMIN is a wildcard via `Rule 3` short-circuit in `beforeEach`. Use `meta: { adminBlocked: true }` for routes that must reject ADMIN (e.g. STUDENT-only screens that record per-user analytics).
+- **State:** auth state lives in `services/auth.ts` (`useAuth()`); never read `localStorage` from a component or guard.
 
 ## Testing Strategy
 - **API Testing:** Use the Bruno files located in `/api_tests`.
 - **Database:** Test submissions against a local `test_sandbox` schema before committing logic.
+- **Frontend tests:** Vitest + `@vue/test-utils` + `happy-dom`. Run with `cd frontend && bun run test` (or `npx vitest run`). Test files live in `frontend/src/__tests__/`, mirroring `composables/`, `services/`, `utils/`, and `components/`. Current count: **22 files, 198 cases.** `vite.config.ts` imports `defineConfig` from `vitest/config` so `vue-tsc -b` accepts the `test` block; do not change that import.

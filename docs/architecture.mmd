@@ -17,20 +17,23 @@ graph TD
     end
 
     subgraph Concurrency
-        QuizCtrl --> LockMgr[LockManager]
-        LockMgr -->|pg_advisory_lock<br/>FNV(student_id)| DB
+        QuizCtrl -->|DML only| Queue[SubmissionQueue<br/>1 worker · cap 256 · 30s timeout]
+        QuizCtrl -.->|SELECT: lock-free,<br/>30s context.WithTimeout| Logic
     end
 
     subgraph Docker Container
         Backend -->|SQL| DB[(PostgreSQL)]
-        DB -->|app schema| AppDB[System Tables<br/>users / exams / questions]
-        DB -->|public schema| MainDB[Lecturer Curriculum<br/>clone template]
-        DB -.->|LIKE INCLUDING ALL<br/>+ INSERT SELECT| StudentDB[Student Sandbox<br/>student_id schema]
+        DB -->|app schema| AppDB[System Tables<br/>users / exams / questions / submissions / exam_sandboxes]
+        DB -->|public schema, frozen on activate| MainDB[Lecturer Curriculum<br/>clone template · SELECT-only via exam_student_readonly]
+        DB -.->|cloned once at activation<br/>LIKE INCLUDING ALL + INSERT SELECT| ExamDB[Per-exam DML Sandbox<br/>sandbox_exam_{examID}<br/>shared across all enrolled students]
+        DB -->|per-category schema, lecturer-imported| PracticeDB[Practice Category DBs<br/>practice_cat_{categoryID}<br/>isolated from public · SELECT + DML]
     end
 
     subgraph Evaluation Logic
         Backend --> Logic[Validation Engine]
-        Logic -->|InitializeSandbox<br/>idempotent| StudentDB
-        Logic -->|ResetTable target<br/>before DML| StudentDB
-        Logic -->|Result Comparison| MainDB
+        Queue -->|serialised DML| Logic
+        Logic -->|BEGIN; SAVEPOINT student_eval;<br/>… ROLLBACK TO SAVEPOINT; COMMIT| ExamDB
+        Logic -->|SELECT under exam_student_readonly| MainDB
+        Logic -->|practice SELECT + DML<br/>savepoint-rollback| PracticeDB
+        Logic -->|cached expected_result comparison| AppDB
     end

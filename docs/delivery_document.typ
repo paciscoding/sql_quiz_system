@@ -10,8 +10,8 @@
 )
 
 #set text(
-  font: "linux libertine",
-  size: 11pt
+  font: "Times New Roman",
+  size: 12pt
 )
 
 #align(center)[
@@ -26,7 +26,7 @@
 #v(2em)
 
 = Introduction
-The SQL Quiz System is a robust, scalable platform designed for computer science examinations. It facilitates real-time evaluation of PostgreSQL commands (Query, Insert, Update, and Delete) for up to 150 concurrent students while ensuring data integrity and strict security sandboxing.
+The SQL Quiz System is a robust, scalable platform designed for computer science examinations. It facilitates real-time evaluation of PostgreSQL commands (Query and DML) for up to 150 concurrent students while ensuring data integrity and strict security sandboxing through a four-phase lifecycle.
 
 = Architecture Overview
 The system utilizes a modern, containerized stack to ensure consistent performance and simplified deployment:
@@ -44,51 +44,41 @@ The system utilizes a modern, containerized stack to ensure consistent performan
 = Database Schema
 The system manages exams and users through a relational schema designed for role-based access and data isolation. The database is split across three logical schemas:
 
-- *`app`* hosts the system tables (`system_users`, `examinations`, `questions`, `exam_students`) used by the application backend.
-- *`public`* holds the lecturer-imported curriculum (e.g. the Elmasri company schema) and is treated as a read-only clone template.
-- *`student_{id}`* is created on first submission for each student and contains a copy of every `public` table.
-
-Keeping the system tables in their own namespace lets the entire `public` schema be cloned wholesale into student sandboxes without any hardcoded exclusion list — every curriculum table the lecturer imports is automatically available to students.
+- *`app`* hosts the system tables (`system_users`, `examinations`, `questions`, `exam_students`, `submissions`, `exam_sandboxes`) used by the application backend.
+- *`public`* holds the lecturer-imported curriculum and is treated as a read-only template; it is frozen during active examinations.
+- *`sandbox_exam_{examID}`* is a shared sandbox cloned from `public` at activation for DML operations.
 
 #figure(
   image("database_schema.png", width: 100%),
   caption: [Database Entity-Relationship Diagram],
 )
 
-== Sandbox Lifecycle
-- *Initialisation:* `InitializeSandbox(student_id)` is idempotent. It inspects `pg_catalog.pg_tables` and only clones tables that are missing from the student's schema, so subsequent submissions skip the work entirely.
-- *Cloning Strategy:* New tables are created with `CREATE TABLE student_{id}.x (LIKE public.x INCLUDING ALL)` followed by `INSERT INTO student_{id}.x SELECT * FROM public.x`. This preserves primary keys, NOT NULL, defaults, and indexes — all of which were silently lost by the older `CREATE TABLE … AS SELECT` approach.
-- *Between-submission Reset:* For DML questions the controller calls `ResetTable(schema, target)` before evaluation, rebuilding only the question's target table from `public` while leaving the rest of the sandbox untouched.
+= Phase Lifecycle
+The system operates through a strict four-phase lifecycle to ensure validation accuracy and system stability:
 
-= Evaluation Logic
-The core of the system is its validation engine, which ensures that student submissions are not only syntactically correct but also produce the exact intended side-effects on the database.
+== Phase 0 — Correct Result Capture
+On question creation, the teacher's SQL is executed against `public` inside a transaction. The result-set (Query) or post-mutation table state (DML) is captured and cached in `app.questions`.
 
-== DML Validation Process (Insert/Update/Delete)
-To validate changes to the data, the system employs a "State Comparison" model:
-1. *State Capture:* The system records the current state of the database.
-2. *Lecturer Baseline:* The system applies the lecturer's "correct" SQL and captures the resulting "Diff".
-3. *Student Comparison:* The student's SQL is applied to the original state.
-4. *Verification:* The system compares the student's diff against the lecturer's baseline row-by-row.
+== Phase 1 — Activation Gate
+Activation requires all questions to have valid cached results. A shared DML sandbox is cloned from `public` at this stage.
 
-#figure(
-  image("dml_validation.png", width: 90%),
-  caption: [DML Validation Sequence Flow],
-)
+== Phase 2 — Transactional Evaluation
+Evaluation occurs through two optimized paths:
+1. *Query Path:* Lock-free reads against `public` under a read-only role.
+2. *DML Path:* FIFO queued execution against the shared exam sandbox with savepoint-rollback semantics to ensure isolation between students.
 
-== Query Validation (Select)
-Queries are checked against the lecturer's result set with optional strictness for:
-- Command keyword ordering.
-- Attribute (Column) naming precision.
-- Result set sorting (Record Order).
+== Phase 3 — Deactivation and Cleanup
+On deactivation, the shared sandbox schema is dropped and final scores are archived.
+
+= Query Validation (Select)
+Queries are checked against the cached ground truth with optional strictness for:
+- *Row Ordering:* Student results must match the teacher's order if enabled.
+- *Exact Attributes:* Column names must match the teacher's exactly if enabled.
 
 = Security and Isolation
-To prevent unauthorized database operations and ensure a fair testing environment:
-- *Authentication:* A hierarchical RBAC system (Admin, Lecturer, Student) implemented using JWT tokens.
-- *Command Filtering:* Only CRUD operations are permitted. Destructive commands (DROP, TRUNCATE, etc.) are blocked by a restricted PostgreSQL role.
-- *Sandbox Isolation:* Each student operates within their own dedicated database schema.
-- *Concurrency Management:* Submissions are serialised per student through `LockManager`, which acquires a Postgres session-level advisory lock (`pg_advisory_lock`, keyed by an FNV hash of the student ID) for the duration of each evaluation. Because the lock lives in the database itself, the "one submission at a time per student" guarantee continues to hold even when multiple backend instances are deployed for horizontal scaling, and no per-student state is retained in process memory.
+- *Identity Integrity:* Student identity is derived strictly from the JWT context.
+- *Sandbox Isolation:* DML submissions share one per-exam sandbox with serialised FIFO queueing and savepoint rollback. SELECT submissions read frozen `public` directly under a read-only Postgres role.
+- *Concurrency Management:* A single in-process FIFO `SubmissionQueue` manages all DML evaluations.
 
 = Implementation Status
-- *Core Stack:* Finalized.
-- *Validation Logic:* Implementation complete, including Strict Mode options.
-- *Lecturer Management:* Implementation complete, featuring dynamic SQL schema import and question management.
+The system is fully implemented and verified according to the architectural specification. Core features including the Phase Lifecycle, DML Sandboxing, Submission Queueing, and Student Roster Import are complete.
