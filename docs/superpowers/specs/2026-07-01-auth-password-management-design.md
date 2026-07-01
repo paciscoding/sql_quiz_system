@@ -54,10 +54,17 @@ CREATE TABLE IF NOT EXISTS app.password_events (
 CREATE INDEX IF NOT EXISTS idx_password_events_user ON app.password_events(user_id, created_at DESC);
 ```
 
-New column (needed for the email stub + future delivery; nullable):
+New column (dormant — reserved for future email delivery; stays NULL for now,
+no capture UI or roster wiring):
 
 ```sql
 ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS email TEXT;
+```
+
+Token-invalidation column (see §5b):
+
+```sql
+ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
 ```
 
 ## 4. Encryption
@@ -87,6 +94,23 @@ ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS email TEXT;
 All new admin routes use `RoleMiddleware(models.RoleAdmin)`. Reuses existing
 `AuthMiddleware`.
 
+## 5b. Immediate token invalidation on password change/reset
+
+Passwords changing must instantly evict existing sessions (incl. a compromised
+one), not wait for the 24h JWT expiry.
+
+- `system_users.token_version` (int, default 0) is the source of truth.
+- Login embeds the user's current `token_version` in the JWT claims.
+- `AuthMiddleware` reads `token_version` from the validated claims and compares it
+  to the user's current `token_version` (fetched per request; a small cached
+  lookup is acceptable). Mismatch → `401` → client must re-login.
+- Any `self_change` and `admin_reset` **increments** `token_version`, so all
+  previously-issued tokens for that user are rejected immediately. `create` sets
+  version 0 (no prior tokens exist).
+- Side effect (intended): changing your own password logs out your other devices.
+
+Repository: `BumpTokenVersion(ctx, userID)`; login and middleware read the value.
+
 ## 6. Manual == Bulk parity (single source of truth)
 
 Both the CSV importer and the new single-student endpoint call **one** service
@@ -101,8 +125,7 @@ StudentUpsert(row StudentRow) -> (created|updated, error)
   keeping two code paths in sync.
 - Password on create = student_number (unchanged from current bulk behaviour);
   on conflict, demographics update and password hash is preserved (unchanged).
-- Roster parser gains an optional `email` column (alias-tolerant), passed through
-  to the same upsert.
+- No email capture: the `email` column stays NULL; roster parser unchanged.
 
 ## 7. Email (TODO stub)
 
@@ -120,11 +143,11 @@ StudentUpsert(row StudentRow) -> (created|updated, error)
 
 ## 8. Frontend (`AdminView.vue`, `services/auth.ts`)
 
-- **Create staff** form: username + role (LECTURER/ADMIN) + optional email; on
-  success, a reveal panel shows the generated password with **Copy** and
-  **Email** (email button calls the stub; shows "email delivery pending").
+- **Create staff** form: username + role (LECTURER/ADMIN) only (no password
+  field); on success, a reveal panel shows the generated password with **Copy**
+  and **Email** (email button calls the stub; shows "email delivery pending").
 - **Add student** form: roster fields (student_number, id_ext, sec_lec, sec_lab,
-  first/last name, optional email); posts to `/students`.
+  first/last name); posts to `/students`.
 - **Per-user Reset** action → confirm dialog → reveal panel with new password.
 - **Password history** drawer per user (admin) → `GET .../password-events`,
   shows source/actor/time/value; renders the "key not configured" state when
@@ -135,9 +158,9 @@ StudentUpsert(row StudentRow) -> (created|updated, error)
 
 Keeps: bcrypt login hashing, no plaintext in normal responses, role hierarchy,
 admin-only gating. Adds: reversible **encrypted** password-event store (explicit
-tradeoff), crypto/rand generation, admin-only access with access logging.
-Explicitly deferred (noted, not built): JWT invalidation on reset, login
-rate-limiting.
+tradeoff), crypto/rand generation, admin-only access with access logging, and
+**immediate token invalidation** on change/reset (§5b). Explicitly deferred
+(noted, not built): login rate-limiting.
 
 ## 10. Testing (TDD)
 
@@ -150,8 +173,9 @@ rate-limiting.
 - changelog: 403 for non-admin; returns decrypted values.
 - **Parity**: single `/students` create and a one-row bulk import yield an
   identical `system_users` row (field-by-field).
+- **Token invalidation**: a token minted before a reset is rejected (401) after
+  `admin_reset`/`self_change` bumps `token_version`; a freshly minted token works.
 
 ## 11. Out of scope
 
-Real SMTP/email transport; JWT revocation on reset; login throttling;
-forced-first-login change.
+Real SMTP/email transport; login throttling; forced-first-login change.
