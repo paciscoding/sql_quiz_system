@@ -1,0 +1,15 @@
+# Build stage
+FROM oven/bun:alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies
+COPY package.json bun.lock ./
+RUN bun install
+
+# Copy source code and build
+COPY . .
+
+EXPOSE 80
+
+CMD ["bun", "run", "dev"]

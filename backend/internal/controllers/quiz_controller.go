@@ -349,9 +349,18 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 		vCols = []string{}
 	}
 
+	// Neutralize correctness so students cannot infer right/wrong during a test
+	// run. Syntax errors are preserved verbatim so students still see SQL errors.
+	status := vResult.Status
+	feedback := vResult.Feedback
+	if status == "correct" || status == "incorrect" {
+		status = "preview"
+		feedback = ""
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"status":    vResult.Status,
-		"feedback":  vResult.Feedback,
+		"status":    status,
+		"feedback":  feedback,
 		"rows":      vRows,
 		"columns":   vCols,
 		"row_count": vCount,

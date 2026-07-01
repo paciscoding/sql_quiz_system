@@ -20,6 +20,14 @@ type Examination struct {
 	// Introduction is a lecturer-authored free-text description of the exam
 	// curriculum, shown to enrolled students on the mandatory intro page.
 	Introduction string `json:"introduction"`
+	// CurriculumSchema is the PostgreSQL schema that holds this exam's curriculum
+	// tables. Defaults to 'public'; updated to curriculum_exam_{id} when a
+	// lecturer imports a per-exam curriculum via ImportSchemaIntoExamCurriculum.
+	CurriculumSchema string `json:"curriculum_schema"`
+	// Readiness counts — populated only by the lecturer list path.
+	QuestionCount   int     `json:"question_count"`
+	TotalPoints     float64 `json:"total_points"`
+	UncapturedCount int     `json:"uncaptured_count"`
 }
 
 type ExamStudentRequest struct {

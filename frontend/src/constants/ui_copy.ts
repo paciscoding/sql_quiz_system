@@ -34,6 +34,13 @@ export const UI_COPY = {
   SET_END_TIME: 'Set End Time',
   NEW_PRACTICE_QUESTION: 'New Practice Question',
   EXPORT_SCORES: 'Export Scores (CSV)',
+  RENAME_EXAM: 'Rename',
+  DELETE_EXAM: 'Delete',
+  DELETE_EXAM_CONFIRM: 'This permanently removes the exam and its questions, roster, and submissions. Continue?',
+
+  // Schema / curriculum import
+  IMPORT_EXAM_SCHEMA: 'Import Schema & Data',
+  REPLACE_EXAM_SCHEMA_CONFIRM: 'This exam already has a curriculum schema. Importing will drop the existing tables and replace them with the new data. An active exam cannot be re-imported. Continue?',
 
   // Practice categories
   MANAGE_CATEGORIES: 'Manage Categories',

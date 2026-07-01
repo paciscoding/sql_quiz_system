@@ -130,4 +130,47 @@ describe('App.vue', () => {
     // We verify the test runs without throwing at minimum.
     expect(wrapper.exists()).toBe(true)
   })
+
+  it('pressing Enter on the brand navigates home', async () => {
+    const router = createStubRouter()
+    const pushSpy = vi.spyOn(router, 'push')
+    const wrapper = mount(App, {
+      global: { plugins: [router] },
+    })
+    await router.isReady()
+    await flushPromises()
+
+    const brand = wrapper.find('.cms-brand')
+    expect(brand.exists()).toBe(true)
+
+    await brand.trigger('keydown.enter')
+    expect(pushSpy).toHaveBeenCalledWith('/')
+  })
+
+  it('renders a skip-to-main-content link as the first focusable element', async () => {
+    const router = createStubRouter()
+    const wrapper = mount(App, {
+      global: { plugins: [router] },
+    })
+    await router.isReady()
+    await flushPromises()
+
+    const skipLink = wrapper.find('a.skip-link')
+    expect(skipLink.exists()).toBe(true)
+    expect(skipLink.attributes('href')).toBe('#content')
+    expect(skipLink.text()).toBe('Skip to main content')
+  })
+
+  it('locale select is disabled (non-deceptive control)', async () => {
+    const router = createStubRouter()
+    const wrapper = mount(App, {
+      global: { plugins: [router] },
+    })
+    await router.isReady()
+    await flushPromises()
+
+    const select = wrapper.find('.locale-select')
+    expect(select.exists()).toBe(true)
+    expect(select.attributes('disabled')).toBeDefined()
+  })
 })

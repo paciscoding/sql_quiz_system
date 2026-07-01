@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import LoginView from './components/LoginView.vue'
 import StudentView from './components/StudentView.vue'
-import LecturerView from './components/LecturerView.vue'
+import LecturerView from './components/lecturer/LecturerView.vue'
 import AdminView from './components/AdminView.vue'
 import { useAuth } from './services/auth'
 
@@ -63,6 +63,12 @@ const routes: RouteRecordRaw[] = [
     name: 'lecturer-practice',
     component: () => import('./components/PracticeAuthoring.vue'),
     meta: { requiresAuth: true, allowedRoles: ['LECTURER'] }
+  },
+  {
+    path: '/lecturer/results',
+    name: 'lecturer-results',
+    component: () => import('./components/lecturer/LecturerResults.vue'),
+    meta: { requiresAuth: true, allowedRoles: ['ADMIN', 'LECTURER'] }
   },
   {
     path: '/dashboard',

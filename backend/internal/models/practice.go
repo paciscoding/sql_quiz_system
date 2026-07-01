@@ -42,6 +42,7 @@ type PracticeQuestion struct {
 	Points                   float64         `json:"points"`
 	StrictOrdering           bool            `json:"strict_ordering"`
 	StrictAttrs              bool            `json:"strict_attrs"`
+	StrictColumnOrder        bool            `json:"strict_column_order"`
 	ExpectedResult           json.RawMessage `json:"expected_result,omitempty"`
 	ExpectedColumns          json.RawMessage `json:"expected_columns,omitempty"`
 	ExpectedResultStatus     string          `json:"expected_result_status"`
@@ -62,7 +63,7 @@ func (pq *PracticeQuestion) AsQuestion() *Question {
 		CorrectSQL:               pq.CorrectSQL,
 		Points:                   pq.Points,
 		Requirement:              pq.Requirement,
-		StrictMode:               StrictMode{Ordering: pq.StrictOrdering, Attributes: pq.StrictAttrs},
+		StrictMode:               StrictMode{Ordering: pq.StrictOrdering, Attributes: pq.StrictAttrs, ColumnOrder: pq.StrictColumnOrder},
 		ExpectedResult:           pq.ExpectedResult,
 		ExpectedColumns:          pq.ExpectedColumns,
 		ExpectedResultStatus:     pq.ExpectedResultStatus,

@@ -173,6 +173,8 @@ func main() {
 			staff.GET("/lecturer/exams", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ListExaminations)
 			staff.POST("/lecturer/exams", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.CreateExamination)
 			staff.GET("/lecturer/exams/:id/submissions", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ListSubmissions)
+			staff.PUT("/lecturer/exams/:id", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RenameExamination)
+			staff.DELETE("/lecturer/exams/:id", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeleteExamination)
 			staff.PUT("/lecturer/exams/:id/activate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ActivateExamination)
 			staff.PUT("/lecturer/exams/:id/deactivate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeactivateExamination)
 			staff.PUT("/lecturer/exams/:id/practice-freeze", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.SetPracticeFreeze)
@@ -181,6 +183,8 @@ func main() {
 			staff.POST("/lecturer/exams/:id/intro-images", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.UploadExamIntroImage)
 			staff.DELETE("/lecturer/exams/:id/intro-images/:imageId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeleteExamIntroImage)
 			staff.PUT("/lecturer/exams/:id/intro-images/order", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ReorderExamIntroImages)
+			// Per-exam curriculum schema import. Mirrors the practice category import endpoint.
+			staff.POST("/lecturer/exams/:id/curriculum/import", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportExamCurriculum)
 			staff.GET("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamRoster)
 			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)

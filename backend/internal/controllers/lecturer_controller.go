@@ -34,6 +34,26 @@ func statusForRepoErr(err error) int {
 	}
 }
 
+// LecturerExaminationResponse extends ExaminationResponse with per-exam readiness
+// aggregates that are only meaningful to the lecturer/admin view.
+type LecturerExaminationResponse struct {
+	ID               int        `json:"id"`
+	Title            string     `json:"title"`
+	IsActive         bool       `json:"is_active"`
+	CreatedBy        int        `json:"created_by"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ActivatedAt      *time.Time `json:"activated_at,omitempty"`
+	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
+	ScheduledStartAt *time.Time `json:"scheduled_start_at,omitempty"`
+	ScheduledEndAt   *time.Time `json:"scheduled_end_at,omitempty"`
+	EffectiveState   string     `json:"effective_state"`
+	Introduction     string     `json:"introduction"`
+	CurriculumSchema string     `json:"curriculum_schema"`
+	QuestionCount    int        `json:"question_count"`
+	TotalPoints      float64    `json:"total_points"`
+	UncapturedCount  int        `json:"uncaptured_count"`
+}
+
 type LecturerController struct {
 	repo          *repository.PostgresRepository
 	importService *services.StudentImportService
@@ -55,14 +75,14 @@ func (ctrl *LecturerController) SetStudentImportService(importService *services.
 }
 
 func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
-	exams, err := ctrl.repo.GetAllExaminations(c.Request.Context())
+	exams, err := ctrl.repo.GetAllExaminationsWithCounts(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	resp := make([]ExaminationResponse, 0, len(exams))
+	resp := make([]LecturerExaminationResponse, 0, len(exams))
 	for _, e := range exams {
-		resp = append(resp, ExaminationResponse{
+		resp = append(resp, LecturerExaminationResponse{
 			ID:               e.ID,
 			Title:            e.Title,
 			IsActive:         e.IsActive,
@@ -74,6 +94,10 @@ func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
 			ScheduledEndAt:   e.ScheduledEndAt,
 			EffectiveState:   repository.ExaminationEffectiveState(e).Phase,
 			Introduction:     e.Introduction,
+			CurriculumSchema: e.CurriculumSchema,
+			QuestionCount:    e.QuestionCount,
+			TotalPoints:      e.TotalPoints,
+			UncapturedCount:  e.UncapturedCount,
 		})
 	}
 	c.JSON(http.StatusOK, resp)
@@ -183,6 +207,81 @@ func (ctrl *LecturerController) DeactivateExamination(c *gin.Context) {
 
 	middleware.InvalidateExamFreezeCache()
 	c.JSON(http.StatusOK, gin.H{"message": "Examination deactivated and sandboxes cleaned up"})
+}
+
+// RenameExamination handles PUT /api/v1/lecturer/exams/:id
+// Renames an examination. Allowed regardless of active state.
+func (ctrl *LecturerController) RenameExamination(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	var req struct {
+		Title string `json:"title"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "title is required"})
+		return
+	}
+
+	if err := ctrl.repo.UpdateExaminationTitle(c.Request.Context(), id, title); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Exam renamed"})
+}
+
+// DeleteExamination handles DELETE /api/v1/lecturer/exams/:id
+// Permanently deletes an examination and all dependents (submissions, enrollments,
+// intro images, questions, sandbox schema). Requires the exam to be inactive first.
+func (ctrl *LecturerController) DeleteExamination(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+
+	// Fetch the exam to check active state.
+	exam, err := ctrl.repo.GetExamByID(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if repository.ExaminationEffectiveState(exam).ActiveNow {
+		c.JSON(http.StatusConflict, gin.H{"error": "deactivate the exam before deleting"})
+		return
+	}
+
+	if err := ctrl.repo.DeleteExamination(c.Request.Context(), id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Exam deleted"})
 }
 
 // SetPracticeFreeze toggles the per-exam block_practice_during_exam flag. When
@@ -357,12 +456,17 @@ func (ctrl *LecturerController) DeleteQuestion(c *gin.Context) {
 
 // PreviewCorrectSQL lets the lecturer dry-run their `correct_sql` for a
 // candidate question and inspect the resulting rows BEFORE saving. The repo
-// runs everything inside a rolled-back transaction so public.* stays clean.
+// runs everything inside a rolled-back transaction so the schema stays clean.
+//
+// Optional field exam_id: when present and > 0, the preview runs against that
+// exam's curriculum schema instead of 'public'. Absent (or 0) keeps the
+// existing 'public' behaviour byte-for-byte.
 func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	var req struct {
 		Type        string `json:"type"`
 		TargetTable string `json:"target_table"`
 		CorrectSQL  string `json:"correct_sql"`
+		ExamID      int    `json:"exam_id"` // optional; 0 = use public schema
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -373,7 +477,7 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		return
 	}
 
-	rows, err := ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
+	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, req.ExamID)
 	if err != nil {
 		// Surface engine errors with status='error' so the frontend can render
 		// the message inline (this is expected during authoring).
@@ -392,6 +496,52 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		"rows":    rows,
 		"columns": cols,
 	})
+}
+
+// ImportExamCurriculum handles POST /api/v1/lecturer/exams/:id/curriculum/import
+// Loads a SQL script into a per-exam curriculum schema. The exam's
+// curriculum_schema column is updated to curriculum_exam_{id} on success.
+// Query param confirm_replace=true drops and recreates the schema first.
+func (ctrl *LecturerController) ImportExamCurriculum(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	lecturer := userVal.(models.User)
+
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+		return
+	}
+	var req struct {
+		SQL string `json:"sql"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.SQL) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sql is required"})
+		return
+	}
+	confirmReplace := c.Query("confirm_replace") == "true"
+
+	if err := ctrl.repo.ImportSchemaIntoExamCurriculum(
+		c.Request.Context(), id, req.SQL, lecturer.ID, confirmReplace,
+	); err != nil {
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		case errors.Is(err, repository.ErrSchemaQualifiedName):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrExamActive):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrExamCurriculumNotEmpty):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Curriculum imported into exam"})
 }
 
 func (ctrl *LecturerController) ImportSchema(c *gin.Context) {
@@ -583,7 +733,7 @@ func (ctrl *LecturerController) UploadExamIntroImage(c *gin.Context) {
 	// Validate MIME type via magic bytes.
 	magic := make([]byte, 8)
 	if _, err := io.ReadFull(file, magic); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "could not read image"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "the image file is empty or truncated"})
 		return
 	}
 	var detectedMime string
@@ -593,7 +743,7 @@ func (ctrl *LecturerController) UploadExamIntroImage(c *gin.Context) {
 	case len(magic) >= 3 && magic[0] == 0xFF && magic[1] == 0xD8 && magic[2] == 0xFF:
 		detectedMime = "image/jpeg"
 	default:
-		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "only image/png and image/jpeg are accepted"})
+		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "the uploaded file is not a valid PNG or JPEG — it may be renamed, corrupted, or an unsupported format (e.g. GIF, WebP, HEIC). Re-export it as PNG or JPEG and try again."})
 		return
 	}
 

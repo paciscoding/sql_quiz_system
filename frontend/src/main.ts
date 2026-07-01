@@ -3,6 +3,10 @@ import './style.css'
 import App from './App.vue'
 import router from './router'
 import { useAuth } from './services/auth'
+import { installAuthFetchInterceptor } from './services/session'
+
+// Install the global 401 interceptor before hydrating auth state or mounting.
+installAuthFetchInterceptor()
 
 // Seed auth state from localStorage before mounting so router guards
 // and components see isLoggedIn as true synchronously on hard refresh.

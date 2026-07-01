@@ -18,6 +18,7 @@ const form = useFormValidation({
 import { ref } from 'vue'
 import { UI_COPY } from '../constants/ui_copy'
 const error = ref('')
+const showPassword = ref(false)
 
 const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () => {
   error.value = ''
@@ -64,8 +65,9 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
 
       <form @submit.prevent="handleLogin" novalidate>
         <div class="field">
-          <label>Username</label>
+          <label for="login-username">Username <span class="req" aria-hidden="true">*</span></label>
           <input
+            id="login-username"
             class="input"
             v-model="form.values.username"
             autocomplete="username"
@@ -78,17 +80,26 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
           <FieldError :message="form.touched.username ? form.errors.username : ''" id="err-username" />
         </div>
         <div class="field">
-          <label>Password</label>
-          <input
-            class="input"
-            v-model="form.values.password"
-            type="password"
-            autocomplete="current-password"
-            :aria-invalid="form.touched.password && !!form.errors.password"
-            :aria-describedby="'err-password'"
-            @blur="form.markTouched('password')"
-            @input="form.touched.password && form.validateField('password')"
-          />
+          <label for="login-password">Password <span class="req" aria-hidden="true">*</span></label>
+          <div class="pw-wrap">
+            <input
+              id="login-password"
+              class="input"
+              v-model="form.values.password"
+              :type="showPassword ? 'text' : 'password'"
+              autocomplete="current-password"
+              :aria-invalid="form.touched.password && !!form.errors.password"
+              :aria-describedby="'err-password'"
+              @blur="form.markTouched('password')"
+              @input="form.touched.password && form.validateField('password')"
+            />
+            <button
+              type="button"
+              class="pw-toggle btn btn-ghost"
+              :aria-label="showPassword ? 'Hide password' : 'Show password'"
+              @click="showPassword = !showPassword"
+            >{{ showPassword ? 'Hide' : 'Show' }}</button>
+          </div>
           <FieldError :message="form.touched.password ? form.errors.password : ''" id="err-password" />
         </div>
 
@@ -96,7 +107,7 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
           <Spinner v-if="loginLoading" size="sm" inline :invert="true" />{{ loginLoading ? UI_COPY.LOGIN_LOADING : UI_COPY.LOGIN }}
         </button>
 
-        <p v-if="error" style="margin-top: var(--space-3); text-align: center;">
+        <p v-if="error" role="alert" style="margin-top: var(--space-3); text-align: center;">
           <span class="badge badge-danger">{{ error }}</span>
         </p>
       </form>
@@ -110,12 +121,36 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
   justify-content: center;
   align-items: flex-start;
   min-height: calc(100vh - var(--layout-header-h) - 80px);
+  min-height: calc(100dvh - var(--layout-header-h) - 80px);
   padding: var(--space-7) var(--space-4);
 }
+.req { color: var(--color-danger); }
+.pw-wrap { display: flex; gap: var(--space-2); }
+.pw-wrap .input { flex: 1; }
 .login-card {
   width: 100%;
-  max-width: 420px;
+  max-width: 520px;
+  margin-inline: auto;
   padding: var(--space-6);
+}
+/* Desktop: give the card a roomier footprint so it doesn't read as a mobile column. */
+@media (min-width: 768px) {
+  .login-shell {
+    align-items: center;
+    padding: var(--space-7) var(--space-5);
+  }
+  .login-card {
+    max-width: 560px;
+    padding: var(--space-7);
+  }
+}
+@media (max-width: 767.98px) {
+  .login-shell {
+    padding: var(--space-5) var(--space-3);
+  }
+  .login-card {
+    padding: var(--space-5);
+  }
 }
 .login-brand {
   display: flex;

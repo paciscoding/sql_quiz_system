@@ -16,11 +16,13 @@ type ValidationResult struct {
 	Feedback          string          `json:"feedback"`
 	IsCorrect         bool            `json:"is_correct"`
 	ValidationDetails json.RawMessage `json:"validation_details,omitempty"`
+	Columns           []string        `json:"-"`
 }
 
 type StrictMode struct {
-	Ordering   bool `json:"ordering"`
-	Attributes bool `json:"attributes"`
+	Ordering    bool `json:"ordering"`
+	Attributes  bool `json:"attributes"`
+	ColumnOrder bool `json:"column_order"`
 }
 
 type Submission struct {
@@ -52,6 +54,11 @@ type Question struct {
 	CreatedBy                 int             `json:"created_by"`
 	CreatedAt                 time.Time       `json:"created_at"`
 	UpdatedAt                 time.Time       `json:"updated_at"`
+	// CurriculumSchema is the schema that holds the exam's reference database for
+	// this question (populated by GetQuestion only, from the exam's curriculum_schema
+	// column). Defaults to 'public' when not set — the pre-curriculum-import
+	// behaviour is unchanged. Omitted from JSON (used internally by the evaluator).
+	CurriculumSchema          string          `json:"curriculum_schema,omitempty"`
 }
 
 type StudentExamResult struct {

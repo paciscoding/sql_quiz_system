@@ -341,3 +341,78 @@ func TestValidationService_SandboxPracticeSchema(t *testing.T) {
 		}
 	})
 }
+
+// TestValidationService_StrictColumnOrder covers the independent Column Order
+// grading gate. The row values are identical in every subtest (so the value/set
+// comparison always passes); only the column ORDER and the StrictMode.ColumnOrder
+// flag vary, isolating the new gate.
+func TestValidationService_StrictColumnOrder(t *testing.T) {
+	mock := &MockExecutor{}
+	service := NewValidationService(mock)
+	ctx := context.Background()
+
+	teacherData := []map[string]interface{}{{"name": "Alice", "age": 30}}
+	teacherJSON, _ := json.Marshal(teacherData)
+	teacherCols, _ := json.Marshal([]string{"name", "age"})
+	// Identical row content the student returns; value comparison passes regardless of order.
+	studentJSON, _ := json.Marshal(teacherData)
+
+	base := models.Question{
+		ID:              1,
+		CorrectSQL:      "SELECT name, age FROM users",
+		Type:            "QUERY",
+		Points:          10.0,
+		ExpectedResult:  teacherJSON,
+		ExpectedColumns: teacherCols,
+	}
+
+	withCols := func(cols []string) func(ctx context.Context, studentID int, q models.Question, sql, schema string) (models.ValidationResult, error) {
+		return func(ctx context.Context, studentID int, q models.Question, sql, schema string) (models.ValidationResult, error) {
+			return models.ValidationResult{Status: "success", ValidationDetails: studentJSON, Columns: cols}, nil
+		}
+	}
+
+	t.Run("ColumnOrder on, order matches -> correct", func(t *testing.T) {
+		q := base
+		q.StrictMode.ColumnOrder = true
+		mock.EvaluateFunc = withCols([]string{"name", "age"})
+		result, _ := service.Validate(ctx, 1, q, "SELECT name, age FROM users", "sandbox_exam_1")
+		if !result.IsCorrect || result.Score != 10.0 {
+			t.Errorf("Expected correct with matching column order, got %+v", result)
+		}
+	})
+
+	t.Run("ColumnOrder on, order differs -> incorrect with column-order feedback", func(t *testing.T) {
+		q := base
+		q.StrictMode.ColumnOrder = true
+		mock.EvaluateFunc = withCols([]string{"age", "name"})
+		result, _ := service.Validate(ctx, 1, q, "SELECT age, name FROM users", "sandbox_exam_1")
+		if result.IsCorrect || result.Score != 0 {
+			t.Errorf("Expected incorrect for wrong column order, got %+v", result)
+		}
+		if !strings.Contains(strings.ToLower(result.Feedback), "column order") {
+			t.Errorf("Expected column-order feedback, got %q", result.Feedback)
+		}
+	})
+
+	t.Run("ColumnOrder off, order differs -> still correct (gate not applied)", func(t *testing.T) {
+		q := base
+		q.StrictMode.ColumnOrder = false
+		mock.EvaluateFunc = withCols([]string{"age", "name"})
+		result, _ := service.Validate(ctx, 1, q, "SELECT age, name FROM users", "sandbox_exam_1")
+		if !result.IsCorrect {
+			t.Errorf("Expected correct when ColumnOrder is off regardless of order, got %+v", result)
+		}
+	})
+
+	t.Run("ColumnOrder on but ExpectedColumns empty -> gate skipped (legacy safe)", func(t *testing.T) {
+		q := base
+		q.StrictMode.ColumnOrder = true
+		q.ExpectedColumns = nil // legacy question captured before ordered-capture existed
+		mock.EvaluateFunc = withCols([]string{"age", "name"})
+		result, _ := service.Validate(ctx, 1, q, "SELECT age, name FROM users", "sandbox_exam_1")
+		if !result.IsCorrect {
+			t.Errorf("Expected correct (gate skipped) when ExpectedColumns is empty, got %+v", result)
+		}
+	})
+}

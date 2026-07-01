@@ -1,0 +1,524 @@
+{
+  "project": "sql_quiz_system",
+  "feature": "student-bulk-import-and-results-view",
+  "plan_source": "user-request-2026-05-16",
+  "user_brief": "Lecturer can import student information from .csv or .xlsx file. Required columns: Student number, SECLEC, SECLAB, Student_id, First Name, Last Name. Schema for student information may need to change. Additionally, once a student finishes a quiz or practice assignment, the student should be able to see their results.",
+  "context_notes": {
+    "current_student_schema": "app.system_users(id SERIAL, username TEXT UNIQUE, password_hash TEXT, role TEXT, created_by INT, created_at TIMESTAMPTZ). No first_name/last_name/section/student_number columns today.",
+    "existing_student_results_endpoints": {
+      "practice": "GET /api/v1/practice/attempts \u2014 already returns the calling student's own practice attempts (practice_controller.go:158).",
+      "quiz_exam": "MISSING for student side. Only lecturer side has GET submissions-by-exam (lecturer_controller.go:167). Students currently cannot list their own exam submissions or per-question results."
+    },
+    "submission_table": "app.submissions(exam_id, student_id, question_id, sql_text, is_correct, score, validation_details, submitted_at)",
+    "existing_bulk_pattern": "No CSV/XLSX import code exists in the repo today. AddStudentsToExam takes []int already-existing user IDs.",
+    "frontend_stack": "Vue 3 + Bun + TS. Components live under frontend/src/components/. Lecturer authoring view: LecturerView.vue + PracticeAuthoring.vue. Student views: StudentView.vue, PracticeView.vue.",
+    "auth_model": "JWT via AuthMiddleware; role checked via RoleMiddleware(models.RoleAdmin|RoleLecturer|RoleStudent)."
+  },
+  "arch_decisions": [
+    {
+      "id": "ARCH-001",
+      "title": "Student profile fields live on app.system_users (sidecar rejected)",
+      "summary": "Add nullable columns student_number, student_id_ext, sec_lec, sec_lab, first_name, last_name directly on app.system_users; do not create a student_profiles sidecar table.",
+      "rationale": "Every relevant lookup the system already does (auth, list-students, assign-to-exam, submissions join) goes through system_users.id. A sidecar would force every list/select to LEFT JOIN, and there is no second user-type that needs different profile shapes. Nullable columns keep ADMIN/LECTURER rows valid without backfill. The two external identifiers (student_number \u2014 institution enrollment number, student_id_ext \u2014 separate external id) are stored as distinct columns with their own UNIQUE constraints. Renaming the external one to student_id_ext avoids confusion with system_users.id which is referenced everywhere as student_id.",
+      "decision": "Append the following idempotent DDL inside InitializeSystemTables.extraMigrations: ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS student_number TEXT; ADD COLUMN IF NOT EXISTS student_id_ext TEXT; ADD COLUMN IF NOT EXISTS sec_lec TEXT; ADD COLUMN IF NOT EXISTS sec_lab TEXT; ADD COLUMN IF NOT EXISTS first_name TEXT; ADD COLUMN IF NOT EXISTS last_name TEXT. Add CREATE UNIQUE INDEX IF NOT EXISTS idx_system_users_student_number ON app.system_users(student_number) WHERE student_number IS NOT NULL; same partial UNIQUE for student_id_ext. Extend models.User with matching pointer-string fields so existing non-student rows serialize as null.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/repository/postgres.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/models/user.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/docs/database_schema.mmd"
+      ],
+      "acceptance_criteria": [
+        "Migrations run twice in a row without error (idempotent).",
+        "Existing admin/lecturer rows survive the migration with NULL profile columns.",
+        "Two students cannot share the same non-null student_number, and likewise for student_id_ext.",
+        "GET /api/v1/users/students returns the new fields when populated."
+      ],
+      "file_scope_estimate": 3,
+      "complexity": "medium",
+      "affects": [
+        "backend",
+        "schema",
+        "migration"
+      ]
+    },
+    {
+      "id": "ARCH-002",
+      "title": "Default credentials policy: username = student_number, password = student_number",
+      "summary": "Imported students are created with username = student_number (institution enrollment number) and an initial bcrypt-hashed password equal to the same string. They can change it via the existing /users/password endpoint.",
+      "rationale": "Student_number is required and unique in the upload contract, is what students physically remember, and is already enforced unique by ARCH-001. Using it as both username and seed password makes the lecturer's roster ready-to-distribute. The system already has ChangePasswordRequest and ChangePassword wired, so the post-login flow is unchanged. Rejected alternatives: (a) random temporary password \u2014 requires an out-of-band channel the system doesn't have; (b) student_id_ext as username \u2014 it is a secondary identifier in the spec and not all institutions print it on student cards.",
+      "decision": "Import service constructs models.User{Username: row.StudentNumber, Password: bcrypt(row.StudentNumber), Role: RoleStudent, CreatedBy: lecturer.ID, FirstName, LastName, StudentNumber, StudentIDExt, SecLec, SecLab}. If row.StudentNumber is blank, the row is rejected with a per-row error. MANUAL.md must document that students should change their password on first login.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/services/student_import_service.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/MANUAL.md"
+      ],
+      "acceptance_criteria": [
+        "After import, a student can log in with credentials (student_number, student_number) and receive a JWT.",
+        "After login, the same student can call POST /users/password to change it.",
+        "Import rejects rows with empty student_number, surfacing the row index in the errors array."
+      ],
+      "file_scope_estimate": 2,
+      "complexity": "low",
+      "affects": [
+        "backend",
+        "auth",
+        "import"
+      ]
+    },
+    {
+      "id": "ARCH-003",
+      "title": "Roster parser: excelize for XLSX, encoding/csv for CSV, header-driven column mapping",
+      "summary": "A new package backend/internal/services/roster_parser parses an uploaded file into []ParsedStudentRow. Format is detected by filename extension (.xlsx vs .csv); content-type is used only as a fallback. Header row is required; column matching is case-insensitive with a fixed alias table.",
+      "rationale": "github.com/xuri/excelize/v2 is the de-facto Go XLSX library, pure Go, no cgo. encoding/csv is stdlib. Detecting by extension is deterministic and avoids fighting browser content-type quirks (Excel files routinely arrive as application/octet-stream). Header-driven mapping insulates the parser from column reordering by the lecturer. Alias table accepts: 'Student number'|'student_number'|'studentnumber'|'Student No', 'SECLEC'|'sec_lec'|'lecture_section', 'SECLAB'|'sec_lab'|'lab_section', 'Student_id'|'student id'|'student_id_ext'|'external_id', 'First Name'|'first_name'|'firstname'|'given name', 'Last Name'|'last_name'|'lastname'|'surname'|'family name'. Unknown headers are ignored, missing required headers fail the whole import with a clear top-level error (NOT a per-row error).",
+      "decision": "Add module github.com/xuri/excelize/v2 to go.mod. New file roster_parser.go exports ParseRoster(filename string, r io.Reader) ([]ParsedStudentRow, error). Returns (nil, err) when required headers are missing. Each row's row_number in the returned slice is 1-based and refers to the spreadsheet row (header is row 1, first data row is 2) so per-row errors are addressable in the UI. Whitespace is trimmed; rows where all six columns are empty are silently skipped (trailing-blank-rows resilience).",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/services/roster_parser.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/services/roster_parser_test.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/go.mod",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/go.sum"
+      ],
+      "acceptance_criteria": [
+        "ParseRoster on a .csv with the six required headers in any order yields N rows in source order with correct field mapping.",
+        "ParseRoster on a .xlsx produced by Excel/LibreOffice with the same headers yields identical results.",
+        "Missing a required header column returns (nil, error containing the missing header name).",
+        "Empty trailing rows are skipped, not returned as blank-error rows.",
+        "Header matching is case-insensitive and tolerant of underscore/space variants per the alias table."
+      ],
+      "file_scope_estimate": 4,
+      "complexity": "medium",
+      "affects": [
+        "backend",
+        "import",
+        "deps"
+      ]
+    },
+    {
+      "id": "ARCH-004",
+      "title": "Import endpoint: POST /api/v1/lecturer/students/import (multipart, per-row outcome)",
+      "summary": "New lecturer endpoint accepts multipart/form-data with a 'file' part and returns an import report. Upsert by student_number: insert if absent, UPDATE name/section/student_id_ext if a student with that student_number already exists.",
+      "rationale": "Idempotency by student_number lets lecturers re-upload a corrected roster without manual cleanup. Per-row outcome reporting lets the lecturer fix only the offending rows. The endpoint sits next to the existing /lecturer/users/bulk plumbing but is distinct: bulk takes structured JSON of {username, password, role}, import takes a file and synthesizes those internally per ARCH-002.",
+      "decision": "Route: POST /api/v1/lecturer/students/import (multipart, RoleMiddleware(RoleAdmin, RoleLecturer)). Field name 'file'. Max size enforced via gin r.MaxMultipartMemory (default is fine for rosters under a few MB; document 10MB cap). Handler flow: (1) save uploaded file to memory buffer, (2) call services.ParseRoster, (3) call StudentImportService.Import(ctx, lecturer, rows) which performs per-row work inside a single pgx transaction with savepoints. On savepoint failure the row is rolled back (savepoint released) and its error pushed to the report; the outer transaction commits at the end. Response JSON: {total, created, updated, skipped, errors:[{row, student_number, message}]}. HTTP 200 even with per-row errors; HTTP 400 only when the file itself is unparseable (missing required headers, unsupported format).",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/controllers/lecturer_controller.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/services/student_import_service.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/repository/postgres.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/cmd/main.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/API_SPEC.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/api_tests/Lecturer/Import-Students.bru"
+      ],
+      "acceptance_criteria": [
+        "POST with a valid CSV containing N new students returns 200 with total=N, created=N, updated=0, skipped=0, errors=[].",
+        "Re-POSTing the same file returns 200 with created=0, updated=N (idempotent).",
+        "POST with one row whose student_number is blank returns 200 with that row in errors[] and the other rows created.",
+        "POST without the file part returns 400.",
+        "POST as a STUDENT returns 403 from RoleMiddleware.",
+        "Per-row repository UPSERT uses ON CONFLICT (student_number) DO UPDATE."
+      ],
+      "file_scope_estimate": 6,
+      "complexity": "high",
+      "affects": [
+        "backend",
+        "import",
+        "api",
+        "routing"
+      ]
+    },
+    {
+      "id": "ARCH-005",
+      "title": "Repository: UpsertStudentByNumber + extended ListStudents projection",
+      "summary": "Add PostgresRepository.UpsertStudentByNumber(ctx, tx, row) which performs the savepointed insert-or-update keyed on student_number, and extend GetAllUsersByRole (or add ListStudentsDetailed) to return the new profile columns so /api/v1/users/students surfaces them.",
+      "rationale": "Keeping all SQL in the repository layer matches the existing pattern (controllers never write SQL). Taking pgx.Tx as a parameter lets the import service drive savepoints at row granularity. Extending the existing list rather than adding a parallel endpoint keeps the frontend simple \u2014 the lecturer's existing student picker just gains more columns.",
+      "decision": "Signature: func (r *PostgresRepository) UpsertStudentByNumber(ctx context.Context, tx pgx.Tx, in StudentImportRow, creatorID int) (outcome string, userID int, err error) where outcome \u2208 {\"created\",\"updated\"}. SQL: INSERT INTO app.system_users (username, password_hash, role, created_by, student_number, student_id_ext, sec_lec, sec_lab, first_name, last_name) VALUES (...) ON CONFLICT (student_number) WHERE student_number IS NOT NULL DO UPDATE SET student_id_ext=EXCLUDED.student_id_ext, sec_lec=EXCLUDED.sec_lec, sec_lab=EXCLUDED.sec_lab, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name RETURNING id, (xmax = 0) AS inserted. (xmax=0 trick distinguishes INSERT from UPDATE.) Update password_hash is INTENTIONALLY OMITTED on the UPDATE path so existing students don't have their chosen passwords reset by a re-import. Modify GetAllUsersByRole's SELECT to also pull the six new columns and the User model JSON serialization to include them with omitempty.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/repository/postgres.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/models/user.go"
+      ],
+      "acceptance_criteria": [
+        "UpsertStudentByNumber called twice for the same student_number returns outcome='created' then outcome='updated'.",
+        "Second call does NOT overwrite password_hash (verified by GetUserByID before/after).",
+        "GetAllUsersByRole(RoleStudent) returns the six new fields populated for imported students and null for legacy rows.",
+        "Calling UpsertStudentByNumber inside a transaction with a savepoint released on failure does not bleed across rows."
+      ],
+      "file_scope_estimate": 2,
+      "complexity": "medium",
+      "affects": [
+        "backend",
+        "repository",
+        "import"
+      ]
+    },
+    {
+      "id": "ARCH-006",
+      "title": "Student exam-results endpoints (per-exam summary + per-question detail)",
+      "summary": "Add two student-scoped endpoints under /api/v1/quiz: GET /quiz/exams/:id/results returning the student's latest-per-question submissions for one exam, and GET /quiz/results returning a per-exam summary aggregated for the calling student. Results are ALWAYS visible to the owning student regardless of exam activation state (mirrors the immediate is_correct feedback the student already saw at submit time).",
+      "rationale": "Practice already has GET /practice/attempts. Quiz/exam side has no student-facing view at all today. Adding it under the existing /quiz group reuses the AuthMiddleware+RoleMiddleware(RoleStudent) chain already wired in cmd/main.go. 'Latest per question' is the metric that matches existing lecturer-side scoring assumptions in app.submissions's idx_submissions_lookup (which is ordered by submitted_at DESC). Always-visible is consistent with the fact that SubmitAnswer returns is_correct synchronously; gating after deactivation would only frustrate students whose exam is still active.",
+      "decision": "Routes (added inside the existing quiz group): quiz.GET('/exams/:id/results', QuizController.GetExamResults) and quiz.GET('/results', QuizController.GetMyResultsSummary). GetExamResults: verifies IsStudentEnrolledInExam, then SELECTs from app.submissions joined to app.questions for that exam where student_id = current user; for each question_id keeps the row with MAX(submitted_at) (DISTINCT ON pattern), returns [{question_id, requirement, type, points, sql_text, is_correct, score, submitted_at, validation_details}]. validation_details is passed through as-is \u2014 it is already sanitized for student consumption per the existing SubmitAnswer flow. GetMyResultsSummary: returns [{exam_id, exam_title, is_active, question_count, answered_count, correct_count, total_score, max_score}] for every exam the student is enrolled in. New repository methods: GetStudentExamResults(ctx, studentID, examID) and GetStudentResultsSummary(ctx, studentID).",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/controllers/quiz_controller.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/repository/postgres.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/models/submission.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/cmd/main.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/API_SPEC.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/api_tests/Quiz/My-Exam-Results.bru",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/api_tests/Quiz/My-Results-Summary.bru"
+      ],
+      "acceptance_criteria": [
+        "GET /quiz/exams/:id/results as a non-enrolled student returns 403.",
+        "GET /quiz/exams/:id/results returns at most one entry per question_id (the latest submission).",
+        "If the student has zero submissions for the exam, returns 200 with [].",
+        "GET /quiz/results enumerates every exam where the calling student is in app.exam_students, including those with no submissions yet (answered_count=0, total_score=0).",
+        "Endpoints work whether the exam is active or archived."
+      ],
+      "file_scope_estimate": 6,
+      "complexity": "high",
+      "affects": [
+        "backend",
+        "quiz",
+        "api",
+        "routing"
+      ]
+    },
+    {
+      "id": "ARCH-007",
+      "title": "Frontend: BulkImportStudents panel + StudentResults view + Practice attempts wiring confirmed",
+      "summary": "Add a new BulkImportStudents.vue component used as a panel inside LecturerView.vue (no new route). Add a new StudentResults.vue route /student/results showing per-exam summary cards and a drill-down to per-question detail using ResultTable for validation_details rendering. PracticeView.vue already shows attempts (confirmed at line 246-260) \u2014 no change needed there beyond a minor polish.",
+      "rationale": "Keeping the import inside LecturerView avoids router churn and matches the existing 'all lecturer admin lives on one page' UX. A dedicated /student/results route is justified because the existing StudentView is exam-in-progress oriented (question, editor, preview) and shoehorning results into it would crowd the screen. Reusing ResultTable for the validation_details.actual_rows/expected_rows shape keeps style consistent. No XLSX parsing on the frontend \u2014 the file is uploaded as-is to the backend, which is the only place that needs excelize. This removes the need to add an npm dep.",
+      "decision": "New components: frontend/src/components/BulkImportStudents.vue \u2014 file input (accept='.csv,.xlsx'), submit button, results table rendering {total, created, updated, skipped, errors}; mounted inside LecturerView.vue under the existing 'Students' section. frontend/src/components/StudentResults.vue \u2014 fetches /api/v1/quiz/results for the dashboard, lets the user click an exam to load /api/v1/quiz/exams/:id/results; reuses ResultTable.vue for any tabular validation_details payload. Router additions: { path: '/student/results', name: 'student-results', component: StudentResults, meta: { role: 'STUDENT' } }. App.vue nav: add a 'Results' router-link visible when user.role==='STUDENT'. Practice attempts: verify the existing list in PracticeView shows is_correct + submitted_at + the practice question requirement, add minimal styling only if missing.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/BulkImportStudents.vue",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/StudentResults.vue",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/LecturerView.vue",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/PracticeView.vue",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/StudentView.vue",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/App.vue",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/router.ts",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/services/api.ts"
+      ],
+      "acceptance_criteria": [
+        "A lecturer can pick a .csv/.xlsx file in the new panel, click Import, and see a per-row outcome table.",
+        "Errors array renders one row per failure with the spreadsheet row number and the message.",
+        "A student logged in can navigate to /student/results, see a card per enrolled exam with correct/total counts, click in, and see a list of their latest answers per question.",
+        "PracticeView still shows the existing Attempt History list (no regression).",
+        "No new npm dependency is required (frontend does not parse XLSX)."
+      ],
+      "file_scope_estimate": 8,
+      "complexity": "high",
+      "affects": [
+        "frontend",
+        "ui",
+        "routing"
+      ]
+    },
+    {
+      "id": "ARCH-008",
+      "title": "Docs, Bruno tests, and TODO updates kept in lock-step with code",
+      "summary": "Update API_SPEC.md (new endpoints + new user fields), ARCHITECTURE.md (mention roster_parser service and student-results read path), CHANGELOG.md (one entry per dated release), MANUAL.md (lecturer import workflow + default credentials policy + student results section), docs/database_schema.mmd (six new columns on system_users), TODO.md (close items). Add Bruno tests under api_tests/Lecturer/Import-Students.bru and api_tests/Quiz/My-Exam-Results.bru + My-Results-Summary.bru.",
+      "rationale": "These artifacts are reviewed by the validator agent [6]; missing them flags as FAIL. Keeping them grouped under one ARCH entry keeps the todo decomposition flat instead of generating eight separate doc todos.",
+      "decision": "Each artifact gets a small, targeted edit (not a rewrite). API_SPEC.md: append a 'Student bulk import' section with request shape, response shape, and example error rows; append 'Student results' section with both new GET endpoints; update the GET /users/students entry to list the new fields. ARCHITECTURE.md: add a paragraph under the lecturer flow describing the import pipeline (upload -> excelize/csv parser -> per-row upsert in a savepointed tx). CHANGELOG.md: one new entry dated 2026-05-16 with 'Added: lecturer bulk roster import, student exam-results endpoints; Changed: app.system_users now carries student profile columns.' MANUAL.md: a new 'Importing a class roster' subsection in the lecturer guide and a 'Viewing your results' subsection in the student guide. docs/database_schema.mmd: add the six columns under system_users. Bruno tests: minimal happy-path + 403-as-student case.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/API_SPEC.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/ARCHITECTURE.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/CHANGELOG.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/MANUAL.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/docs/database_schema.mmd",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/TODO.md",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/api_tests/Lecturer/Import-Students.bru",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/api_tests/Quiz/My-Exam-Results.bru",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/api_tests/Quiz/My-Results-Summary.bru"
+      ],
+      "acceptance_criteria": [
+        "API_SPEC.md documents request/response of POST /lecturer/students/import including the per-row errors[] shape.",
+        "API_SPEC.md documents GET /quiz/exams/:id/results and GET /quiz/results.",
+        "docs/database_schema.mmd renders the six new columns on system_users.",
+        "Three new Bruno files exist and target the new endpoints with valid Authorization placeholders.",
+        "CHANGELOG.md has a new dated entry covering both features."
+      ],
+      "file_scope_estimate": 9,
+      "complexity": "low",
+      "affects": [
+        "docs",
+        "api_tests"
+      ]
+    },
+    {
+      "id": "ARCH-009",
+      "title": "Testing strategy: parser unit tests + import service tests (mocked repo) + student-results repo test optional",
+      "summary": "Go table-driven tests for roster_parser covering CSV + XLSX happy paths and the major failure modes. Service-level tests for StudentImportService using a mock repository (in-package interface). Repository tests for the new queries are deferred \u2014 they require a live postgres and the codebase addressing testcontainers for that layer.",
+      "rationale": "Parser is pure logic and the highest-value place to lock down behavior with cheap tests. Service tests prove the per-row savepoint semantics without needing a DB by injecting a fake. Repository SQL is exercised indirectly by the Bruno tests in ARCH-008 \u2014 adding testcontainers here would balloon scope. The regression-tester agent [7] will fill in any gaps after implementation.",
+      "decision": "Add roster_parser_test.go with: (a) CSV with all six columns in order; (b) CSV with columns shuffled; (c) CSV with header aliases; (d) CSV missing 'Last Name' header \u2014 expect error; (e) CSV with one empty row in the middle \u2014 expect it skipped, others returned; (f) XLSX byte fixture (built once in TestMain via excelize and saved to a temp file or kept in-memory via excelize NewFile/SaveAs). Add student_import_service_test.go with: (a) all rows new -> all created; (b) duplicate of one existing -> updated, others created; (c) one row blank student_number -> per-row error, others succeed. Define a minimal interface { UpsertStudentByNumber, WithTransaction } in the service package that PostgresRepository already satisfies; the test substitutes a fake. No new test for ListStudents extension \u2014 covered by the Bruno smoke test.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/services/roster_parser_test.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/services/student_import_service_test.go"
+      ],
+      "acceptance_criteria": [
+        "go test ./internal/services/... passes locally.",
+        "Parser tests cover all six cases above; each is its own subtest via t.Run.",
+        "Service test fake's UpsertStudentByNumber records calls and lets each subtest stub outcome/error per call.",
+        "No test imports a real *PostgresRepository."
+      ],
+      "file_scope_estimate": 2,
+      "complexity": "medium",
+      "affects": [
+        "backend",
+        "tests"
+      ]
+    },
+    {
+      "id": "ARCH-010",
+      "title": "Admin Role Expansion: User Management",
+      "summary": "Add full user management capabilities for Admins including creating Admins, listing all users, updating, and deleting.",
+      "rationale": "Fulfills the critique that Admins should be able to create other Admins and manipulate existing accounts. A full set of CRUD endpoints for users under the /users group is required, protected by RoleAdmin.",
+      "decision": "1. In backend/internal/repository/postgres.go, add GetAllUsers, UpdateUser, and DeleteUser methods.\n2. In backend/internal/controllers/user_controller.go, add GetAllUsers, UpdateUser, and DeleteUser handlers.\n3. In backend/cmd/main.go, register GET /api/v1/users/all, PUT /api/v1/users/:id, DELETE /api/v1/users/:id with RoleMiddleware(RoleAdmin).\n4. In frontend/src/components/AdminView.vue, include ADMIN in the role creation dropdown. Add a 'User Management' section that lists all users and provides Edit/Delete actions.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/repository/postgres.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/controllers/user_controller.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/cmd/main.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/AdminView.vue"
+      ],
+      "acceptance_criteria": [
+        "Admin can select ADMIN role when creating an account in AdminView.",
+        "Admin can view a list of all users.",
+        "Admin can update a user's details and role.",
+        "Admin can delete a user.",
+        "These endpoints return 403 for non-Admin users."
+      ],
+      "file_scope_estimate": 4,
+      "complexity": "medium",
+      "affects": [
+        "backend",
+        "frontend",
+        "api",
+        "auth"
+      ]
+    },
+    {
+      "id": "ARCH-011",
+      "title": "Admin Bulk Import Access",
+      "summary": "Expose the Bulk Import Students functionality to Admins in the frontend.",
+      "rationale": "Fulfills the critique that Admins should be able to bulk import students via CSV. The backend route POST /api/v1/lecturer/students/import already permits RoleAdmin; only frontend integration is required.",
+      "decision": "In frontend/src/components/AdminView.vue, import and render the <BulkImportStudents /> component, allowing Admins to upload and process CSV/XLSX rosters exactly like Lecturers.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/AdminView.vue"
+      ],
+      "acceptance_criteria": [
+        "AdminView includes the Bulk Import Student panel.",
+        "Admin can successfully upload a roster file and see the results."
+      ],
+      "file_scope_estimate": 1,
+      "complexity": "low",
+      "affects": [
+        "frontend",
+        "ui"
+      ]
+    },
+    {
+      "id": "ARCH-012",
+      "title": "Lecturer Exam Question Management UI",
+      "summary": "Provide a list and edit/delete capability for Exam Questions in the Lecturer view.",
+      "rationale": "Practice questions are fully editable via PracticeAuthoring, but Exam questions in LecturerView are blind (overwrite by typing ID). Fulfills critique that lecturers should be able to update quiz questions interactively.",
+      "decision": "1. In backend/internal/controllers/lecturer_controller.go, add GetExamQuestions handler (returns full question details including correct_sql) and DeleteQuestion handler.\n2. In backend/internal/repository/postgres.go, add DeleteQuestion method.\n3. In backend/cmd/main.go, register GET /api/v1/lecturer/exams/:id/questions and DELETE /api/v1/lecturer/questions/:id under staff group.\n4. In frontend/src/components/LecturerView.vue, under the 'Questions' tab, add a list of questions for a selected exam. Add 'Edit' (populates the form) and 'Delete' buttons.",
+      "affected_files": [
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/repository/postgres.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/internal/controllers/lecturer_controller.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/backend/cmd/main.go",
+        "/run/media/adamas/large_files/main_project/sql_quiz_system/frontend/src/components/LecturerView.vue"
+      ],
+      "acceptance_criteria": [
+        "Lecturer can view a list of all questions in an exam.",
+        "Lecturer can click 'Edit' to load the question into the form.",
+        "Lecturer can delete a question.",
+        "Saving an edited question updates the existing question correctly (via the existing ON CONFLICT DO UPDATE logic)."
+      ],
+      "file_scope_estimate": 4,
+      "complexity": "medium",
+      "affects": [
+        "backend",
+        "frontend",
+        "api",
+        "ui"
+      ]
+    }
+  ],
+  "todos": [],
+  "in_progress": [],
+  "completed": [
+    {
+      "id": "TODO-007",
+      "files_changed": [
+        "backend/internal/services/student_import_service.go"
+      ],
+      "notes": "Implemented StudentImportService with ImportRepo interface, per-row savepoints, and bcrypt hashing for default passwords. go build ./backend/internal/services/... passes."
+    },
+    {
+      "id": "TODO-001",
+      "files_changed": [
+        "backend/internal/models/user.go"
+      ],
+      "notes": "Added six pointer-typed student profile fields (StudentNumber, StudentIDExt, SecLec, SecLab, FirstName, LastName) to models.User with exact omitempty JSON tags. go build ./... confirmed passing."
+    },
+    {
+      "id": "TODO-005",
+      "files_changed": [
+        "backend/go.mod",
+        "backend/go.sum",
+        "backend/internal/services/roster_parser.go"
+      ],
+      "notes": "Added github.com/xuri/excelize/v2 v2.10.1 to go.mod via go get; also added indirect deps (efp, nfp, mscfb, msoleps, tiendc/go-deepcopy). Created a minimal roster_parser.go stub that imports excelize to anchor the dependency through go mod tidy (stub will be replaced by TODO-006). go build ./... succeeds."
+    },
+    {
+      "id": "TODO-015",
+      "files_changed": [
+        "frontend/src/components/StudentResults.vue"
+      ],
+      "notes": "Created StudentResults.vue: two-view SFC (exam card grid -> per-question drill-down) with Bearer-token fetch calls to /api/v1/quiz/results and /api/v1/quiz/exams/:id/results, ResultTable reuse for validation_details, empty-state, loading states, back button. bun run build succeeded."
+    },
+    {
+      "id": "TODO-013",
+      "files_changed": [
+        "frontend/src/components/BulkImportStudents.vue"
+      ],
+      "notes": "Created BulkImportStudents.vue with file input (accept=.csv/.xlsx), multipart POST to /api/v1/lecturer/students/import, summary grid (Total/Created/Updated/Skipped), per-row errors table, loading state, and HTTP 400 top-level error display. Build passes with zero errors."
+    },
+    {
+      "id": "TODO-019",
+      "files_changed": [
+        "API_SPEC.md",
+        "docs/database_schema.mmd"
+      ],
+      "notes": "Appended endpoint 4.5 (GET /users/students with six new profile fields), endpoint 25 (POST /lecturer/students/import with ImportReport shape), endpoints 26-27 (GET /quiz/exams/:id/results and GET /quiz/results); added six new columns to APP_SYSTEM_USERS in database_schema.mmd."
+    },
+    {
+      "id": "TODO-020",
+      "files_changed": [
+        "ARCHITECTURE.md",
+        "CHANGELOG.md",
+        "MANUAL.md",
+        "TODO.md"
+      ],
+      "notes": "Added Roster Import Pipeline bullet under ARCHITECTURE.md Implementation Details section 5; prepended [2026-05-16] changelog entry at top of CHANGELOG.md covering bulk import and student results; added Step 3b Importing a Class Roster and Viewing Your Results subsections to MANUAL.md; appended DONE [2026-05-16] section to TODO.md."
+    },
+    {
+      "id": "TODO-021",
+      "files_changed": [
+        "api_tests/Lecturer/Import-Students.bru",
+        "api_tests/Quiz/My-Exam-Results.bru",
+        "api_tests/Quiz/My-Results-Summary.bru"
+      ],
+      "notes": "Created three Bruno test files matching existing {{baseUrl}}/{{token}} conventions; multipart POST uses @file() for file upload; results summary asserts res.body.exams is an array (not bare array per spec note); 403-variant omitted as a separate test block since Bruno does not natively support multi-scenario blocks within one file without scripting."
+    },
+    {
+      "id": "TODO-016",
+      "files_changed": [
+        "frontend/src/router.ts",
+        "frontend/src/App.vue"
+      ],
+      "notes": "Implemented inline by orchestrator after the dispatched codex agent hit a stream-idle timeout. Added /student/results route (lazy import) and a STUDENT-only Results router-link next to Practice. bun run build green."
+    },
+    {
+      "id": "TODO-002",
+      "files_changed": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "notes": "Appended 6 ALTER TABLE ADD COLUMN IF NOT EXISTS + 2 partial UNIQUE indexes to extraMigrations (postgres.go:625-632). Codex stalled after writing the edit; orchestrator verified the file state and go build ./... passes."
+    },
+    {
+      "id": "TODO-012",
+      "summary": "Registered student quiz results routes in backend/cmd/main.go."
+    },
+    {
+      "id": "TODO-008",
+      "files_changed": [
+        "backend/internal/controllers/lecturer_controller.go"
+      ],
+      "notes": "Added ImportStudents multipart handler to LecturerController with file-part validation, ParseRoster integration, StudentImportService dispatch, and ImportReport JSON response."
+    },
+    {
+      "id": "TODO-014",
+      "summary": "Embedded BulkImportStudents under LecturerView assignments as a collapsible Import Roster panel; existing student list remains unchanged."
+    },
+    {
+      "id": "TODO-003",
+      "summary": "Extended GetAllUsersByRole to select and scan student_number, student_id_ext, sec_lec, sec_lab, first_name, and last_name in backend/internal/repository/postgres.go."
+    },
+    {
+      "id": "TODO-011",
+      "summary": "Added QuizController.GetExamResults and GetMyResultsSummary with enrollment gating and nil-slice normalization."
+    },
+    {
+      "id": "TODO-004",
+      "summary": "Added UpsertStudentByNumber to postgres.go with pgx.Tx upsert keyed on student_number, xmax-based created/updated detection, and password_hash left untouched on conflict; added StudentImportRow to models/user.go. go test ./internal/... passes with GOCACHE=/tmp/gocache."
+    },
+    {
+      "id": "TODO-017",
+      "summary": "Verified existing table-driven tests in roster_parser_test.go which already cover the six specified cases. All tests passed successfully."
+    },
+    {
+      "id": "TODO-018",
+      "notes": "Implemented local fakeImportRepo and fakeTx in student_import_service_test.go with three subtests covering created, updated, and blank StudentNumber flows; verified with go test ./internal/services/... -run TestStudentImportService."
+    },
+    {
+      "id": "TODO-006",
+      "files_changed": [
+        "backend/internal/services/roster_parser.go",
+        "backend/internal/services/roster_parser_test.go"
+      ],
+      "notes": "Verified roster_parser.go already implements the logic. Marked as completed."
+    },
+    {
+      "id": "TODO-009",
+      "files_changed": [
+        "backend/cmd/main.go",
+        "backend/internal/services/student_import_service.go",
+        "backend/internal/services/student_import_service_test.go"
+      ],
+      "notes": "Fixed wiring by updating student_import_service.go to use models.StudentImportRow and modifying controllers.NewLecturerController call."
+    },
+    {
+      "id": "TODO-022",
+      "files_changed": ["backend/internal/repository/postgres.go"],
+      "notes": "Implemented GetAllUsers, UpdateUser, and DeleteUser repository methods."
+    },
+    {
+      "id": "TODO-023",
+      "files_changed": ["backend/internal/controllers/user_controller.go", "backend/internal/services/auth_service.go"],
+      "notes": "Implemented GetAllUsers, UpdateUser, and DeleteUser handlers and service methods."
+    },
+    {
+      "id": "TODO-024",
+      "files_changed": ["backend/cmd/main.go"],
+      "notes": "Registered Admin user management routes."
+    },
+    {
+      "id": "TODO-025",
+      "files_changed": ["frontend/src/components/AdminView.vue"],
+      "notes": "Built Admin User Management UI with list, edit, and delete functionality."
+    },
+    {
+      "id": "TODO-026",
+      "files_changed": ["frontend/src/components/AdminView.vue"],
+      "notes": "Exposed BulkImportStudents to Admins."
+    },
+    {
+      "id": "TODO-027",
+      "files_changed": ["backend/internal/repository/postgres.go"],
+      "notes": "Implemented DeleteQuestion repository method."
+    },
+    {
+      "id": "TODO-028",
+      "files_changed": ["backend/internal/controllers/lecturer_controller.go"],
+      "notes": "Implemented GetExamQuestions and DeleteQuestion handlers."
+    },
+    {
+      "id": "TODO-029",
+      "files_changed": ["backend/cmd/main.go"],
+      "notes": "Registered Lecturer exam question management routes."
+    },
+    {
+      "id": "TODO-030",
+      "files_changed": ["frontend/src/components/LecturerView.vue"],
+      "notes": "Built Lecturer Exam Question Management UI with list, edit, and delete functionality."
+    }
+  ],
+  "failed": [],
+  "agent_notes": {
+    "orchestrator": "Completed expansion tasks (TODO-022 to TODO-030) covering Admin CRUD and Lecturer Q management. All builds pass."
+  }
+}

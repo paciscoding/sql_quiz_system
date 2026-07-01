@@ -1,0 +1,980 @@
+{
+  "project": "sql_quiz_system",
+  "round": "reqbatch-2026-05-25",
+  "arch_decisions": [
+    {
+      "id": "ARCH-001",
+      "decision": "Effective-state helper: timestamp-driven lazy activation (D4). Add nullable scheduled_start_at / scheduled_end_at columns to app.examinations and introduce ONE authoritative helper, ExaminationEffectiveState(exam) -> {phase: 'inactive'|'active'|'ended', activeNow bool}, consulted by the activation gate, the submission gate, the questions gate, and the SSE push. effective active = is_active=true AND (scheduled_start_at IS NULL OR now()>=scheduled_start_at) AND (scheduled_end_at IS NULL OR now()<scheduled_end_at). 'Instant activate' = set is_active=true, activated_at=now(), scheduled_start_at=now(), scheduled_end_at=NULL. 'Activate at time, limited window' = is_active=true, scheduled_start_at=T0, scheduled_end_at=T1 (sandbox NOT cloned yet). 'Deactivate at time' = set scheduled_end_at=T1 (the lazy gate stops accepting submissions at T1 even though is_active stays true until a real deactivate drops the sandbox). 'Instant deactivate' = existing Phase 3 ArchiveExamination (is_active=false, archived_at=now(), drop sandbox). Lazy sandbox prep: on the FIRST request inside the active window that needs the sandbox (first DML submission OR first GetExamQuestions that detects examHasDMLQuestions), call InitializeExamSandbox(examID) guarded by app.exam_sandboxes (created_at IS NOT NULL, dropped_at IS NULL) so it clones at most once; InitializeExamSandbox is already idempotent. The activation PRE-FLIGHT (every question expected_result_status='captured') still runs at the moment is_active is flipped to true, regardless of scheduled_start_at, so a scheduled exam cannot be armed with uncaptured questions.",
+      "rationale": "D4 mandates no background scheduler/cron. A single pure helper computing effective state from now() vs timestamps at request time keeps all four gates consistent and avoids split-brain between a boolean and a clock. Reusing is_active as the 'armed' flag and scheduled_* as the window keeps the existing freeze logic (UpsertQuestion/ImportSchema/AssignStudents check is_active) working unchanged. Lazy sandbox prep honors the constraint that pure-SELECT exams never clone and that DML exams must have a sandbox ready on first access, without a scheduler.",
+      "affected_files": [
+        "backend/internal/models/examination.go (add ScheduledStartAt *time.Time, ScheduledEndAt *time.Time)",
+        "backend/internal/repository/postgres.go (InitializeSystemTables: ADD COLUMN IF NOT EXISTS scheduled_start_at/scheduled_end_at; new ExaminationEffectiveState helper; GetExamByID/GetAllExaminations/GetStudentExams SELECT the new columns + activated_at/archived_at; SetExaminationActive accepts a schedule; lazy EnsureExamSandboxReady(examID))",
+        "backend/internal/controllers/lecturer_controller.go (ActivateExamination reads schedule payload)",
+        "backend/internal/controllers/quiz_controller.go (SubmitAnswer/GetExamQuestions/PreviewAnswer consult effective state + trigger lazy sandbox)"
+      ],
+      "api_surface": "PUT /lecturer/exams/:id/activate payload extended to {active:true, mode:'instant'|'scheduled', scheduled_start_at?:RFC3339, scheduled_end_at?:RFC3339}. Backward compat: {active:true} with no schedule = instant. Validation: scheduled_end_at>scheduled_start_at; 400 otherwise. PUT /lecturer/exams/:id/deactivate payload optionally {mode:'instant'|'scheduled', scheduled_end_at?:RFC3339}; instant = current behavior (drop sandbox now), scheduled = set scheduled_end_at only. GET /lecturer/exams and GET /quiz/exams now return scheduled_start_at, scheduled_end_at, activated_at, archived_at and a derived effective_state field.",
+      "data_model": "ALTER TABLE app.examinations ADD COLUMN IF NOT EXISTS scheduled_start_at TIMESTAMP WITH TIME ZONE; ADD COLUMN IF NOT EXISTS scheduled_end_at TIMESTAMP WITH TIME ZONE. No new tables. exam_sandboxes unchanged (already supports lazy via created_at/dropped_at).",
+      "integration_points": "repository.SetExaminationActive (postgres.go:1057), ArchiveExamination (1095), GetExamByID (1150) MUST be widened to SELECT scheduled_*/activated_at/archived_at since GetExamByID currently returns only 5 columns and SubmitAnswer relies on exam.IsActive. examHasDMLQuestions (484), InitializeExamSandbox (369). The activation pre-flight checks already in SetExaminationActive (1062-1078) are retained.",
+      "trade_offs": "Lazy sandbox prep on first access adds latency to the first DML submission of a scheduled window (one clone of public.*). Acceptable for 90-150 students because it happens once. Alternative (clone at scheduled_start_at via cron) rejected per D4. Effective-state computed per request means a tiny clock-skew window where a student could submit microseconds after scheduled_end_at; acceptable for an exam system. is_active staying true after scheduled_end_at (until explicit deactivate) means the practice freeze stays on until the lecturer formally deactivates \u2014 documented as intended (exam not 'over' until archived)."
+    },
+    {
+      "id": "ARCH-002",
+      "decision": "SSE realtime activation push (D2, R10) \u2014 the infrastructure R9 depends on. Add a new authenticated SSE endpoint GET /api/v1/quiz/exams/:id/stream that holds an HTTP connection open and pushes a single 'exam-status' event whenever the exam's effective state (ARCH-001) transitions to active for an enrolled student. Server model: an in-process pub/sub hub (services/sse_hub.go) keyed by examID, holding a set of subscriber channels. gin handler: authenticate (see token note), verify enrollment, set headers (Content-Type: text/event-stream, Cache-Control: no-cache, Connection: keep-alive, X-Accel-Buffering: no), register a buffered channel with the hub, then loop with c.Stream / Flush emitting: (a) an immediate snapshot event computed from ExaminationEffectiveState so a client connecting AFTER activation is told 'active' at once (no race), (b) periodic ':keepalive' comments every ~20s to defeat idle proxies, (c) the 'start' event when the hub broadcasts activation. Each event carries id: <unix-ms> for Last-Event-ID. Activation trigger: ActivateExamination (instant) and the lazy gate that first observes now()>=scheduled_start_at both call hub.Broadcast(examID, statusEvent). Because scheduled activation has no background tick, the snapshot-on-connect plus a client-side fallback poll (ARCH-009) covers the gap where the window opens while a student waits with an already-open stream \u2014 the lazy trigger fires on the first enrolled student's poll/stream-reconnect, which then broadcasts to all held connections. Reconnection: EventSource auto-reconnects; server reads Last-Event-ID but state is idempotent (re-sends current snapshot), so no event log is needed. Graceful shutdown: hub closes all channels on SIGTERM (tolerant-of-restarts per constraints; clients auto-reconnect).",
+      "rationale": "D2 locks SSE. SSE removes polling for a one-way server->client 'start' signal, needs no extra infra (no Redis/Kafka), and a single Go process trivially holds 90-150 idle held connections (goroutine + channel each). WebSocket REJECTED: bidirectional, needs Upgrade handshake + nginx proxy upgrade plumbing the current config explicitly strips, and we only need one-way push. Nginx LB REJECTED: only spreads polling load, never removes the poll; SSE eliminates it. Snapshot-on-connect eliminates the activation/connection race that a naive broadcast-only design would have.",
+      "affected_files": [
+        "backend/internal/services/sse_hub.go (NEW: Hub with Subscribe(examID)->chan, Unsubscribe, Broadcast(examID, payload); mutex-guarded map[int]map[chan]struct{})",
+        "backend/internal/controllers/quiz_controller.go (NEW handler StreamExamStatus; inject hub)",
+        "backend/cmd/main.go (construct hub, pass to QuizController and LecturerController, register GET /quiz/exams/:id/stream with a token-query auth variant)",
+        "backend/internal/controllers/lecturer_controller.go (ActivateExamination + lazy-activation path call hub.Broadcast)",
+        "frontend/nginx.conf (NEW location for the stream path: proxy_buffering off, proxy_cache off, proxy_read_timeout 1h, chunked_transfer_encoding off, proxy_set_header Connection '')"
+      ],
+      "api_surface": "GET /api/v1/quiz/exams/:id/stream?access_token=<jwt> (STUDENT, enrolled). Response: text/event-stream. Events: event: exam-status\\nid: <unixms>\\ndata: {\"exam_id\":1,\"effective_state\":\"inactive|active|ended\",\"server_time\":\"RFC3339\"}. Comment keepalives ': ping' every 20s. 401 if token invalid, 403 if not enrolled, 404 if exam missing.",
+      "data_model": "None. Hub state is purely in-process and ephemeral (tolerant of restarts per constraints).",
+      "integration_points": "authService.ValidateToken (auth_service.go:175) is called DIRECTLY in the stream handler because EventSource cannot set an Authorization header \u2014 token passes as ?access_token= query param. This mirrors the existing export-scores pattern which already passes ?token= (LecturerView.vue:520). ExaminationEffectiveState (ARCH-001) for the snapshot. IsStudentEnrolledInExam (postgres.go:1143). gin's c.Stream/c.SSEvent or manual Writer.Flush.",
+      "trade_offs": "Token-in-query-string is logged by proxies/access logs; mitigated because JWTs are short-lived and the surface is read-only status. Alternative (cookie auth) rejected to avoid CSRF/cookie plumbing not present elsewhere. In-process hub means a backend restart drops all streams; acceptable because EventSource auto-reconnects and snapshot-on-connect re-syncs. Holding ~150 goroutines is negligible. Scheduled activation with zero background tick means a purely-waiting cohort is only nudged when the first enrolled student's fallback poll (ARCH-009) crosses scheduled_start_at and fires the lazy trigger+broadcast \u2014 documented; the client fallback poll bounds worst-case latency to the poll interval."
+    },
+    {
+      "id": "ARCH-003",
+      "decision": "Student 3-state quiz flow: select -> waiting -> active (R9). Rework StudentView.vue into an explicit state machine: SELECT (student picks an exam from exams they are ENROLLED in, active or not), WAITING (chosen exam not yet effectively active -> show a waiting panel that opens the SSE stream from ARCH-002 and a Start button that is disabled until the 'active' event arrives), ACTIVE (Start pressed -> fetch questions and render the existing authoring/submit UI unchanged). The current immediate-questions behavior is removed; questions are only fetched after the exam is effectively active and the student clicks Start. Requires a new student endpoint to list enrolled exams INCLUDING inactive ones (current GET /quiz/exams returns only is_active=TRUE via GetStudentExams), because the student must select an exam to wait on before it is active.",
+      "rationale": "R9 mandates the waiting gate. GetStudentExams filtering to is_active=TRUE makes a pre-activation selection impossible, so a roster-style enrolled-exams endpoint is required. Driving WAITING->ACTIVE off the SSE event (not manual refresh) is the entire point of D2/R10.",
+      "affected_files": [
+        "frontend/src/components/StudentView.vue (state machine: phase ref 'select'|'waiting'|'active'; WAITING panel; EventSource lifecycle via new composable; Start gate)",
+        "frontend/src/composables/useExamStream.ts (NEW: wraps EventSource, exposes effectiveState ref + connected + reconnect; closes on unmount)",
+        "frontend/src/router.ts (no change; /student stays)",
+        "backend/internal/controllers/quiz_controller.go (NEW GetEnrolledExams handler OR widen GetExams with a query flag)",
+        "backend/internal/repository/postgres.go (NEW GetStudentEnrolledExams returning all enrolled exams + effective_state, not just active)"
+      ],
+      "api_surface": "GET /api/v1/quiz/exams?include_inactive=true (STUDENT) -> returns ALL enrolled exams with {id,title,is_active,effective_state,scheduled_start_at,scheduled_end_at}. Default (no flag) keeps current active-only behavior for backward compat. GetExamQuestions (GET /quiz/exams/:id/questions) gate changes from is_active to ExaminationEffectiveState.activeNow (ARCH-001) and triggers lazy sandbox prep.",
+      "data_model": "None beyond ARCH-001 columns.",
+      "integration_points": "GetStudentExams (postgres.go:1177) \u2014 add a variant without the is_active filter. quizCtrl.GetExams (quiz_controller.go:30). The WAITING panel consumes useExamStream (ARCH-002). Submit/preview flow and progress tracking in StudentView are reused unchanged once in ACTIVE.",
+      "trade_offs": "Exposing inactive enrolled exams to students is a minor info disclosure (they learn an exam exists before it starts) \u2014 intended by R9. Keeping the default endpoint active-only avoids breaking any other caller. ACTIVE state still re-validates server-side on every submit (effective state gate), so a client that forces ACTIVE early still gets 403 on submit."
+    },
+    {
+      "id": "ARCH-004",
+      "decision": "Question-ID dropdown: pick existing vs create-new (R1) + override confirm dialog (R2). Replace the raw numeric Question ID input (LecturerView.vue:598) with a dropdown whose options are 'Create new question' plus every existing question in the selected exam (sourced from the already-fetched examQuestions list -> GET /lecturer/exams/:id/questions, no new endpoint). Selecting an existing question loads it into the form (reuse editQuestion). 'Create new' clears the form and assigns the next free ID (max(existing ids)+1, suggested but editable). On Save, if the chosen/typed ID already exists in examQuestions AND the form was opened as 'create new' (i.e. the save would overwrite a different question via the ON CONFLICT(id) DO UPDATE upsert), gate the save behind useConfirm() with a danger dialog naming the question being overwritten; proceed only on confirm. Editing an existing question (loaded via the dropdown) saves without the override warning since overwrite is the explicit intent.",
+      "rationale": "R1 wants reuse-or-create UX; the data already exists client-side so no endpoint is needed. R2 requires a pre-overwrite warning because CreateQuestion upserts via ON CONFLICT(id) DO UPDATE (postgres.go:902) and the current form silently resets, making accidental ID collisions a silent data-loss path. useConfirm/ConfirmDialogHost is the established pattern.",
+      "affected_files": [
+        "frontend/src/components/LecturerView.vue (replace #Question ID input with select; add nextFreeId computed; gate saveQuestion (line 396) behind confirm when overwriting)",
+        "frontend/src/constants/ui_copy.ts (optional: add CREATE_NEW_QUESTION label)"
+      ],
+      "api_surface": "None. Reuses GET /lecturer/exams/:id/questions (already fetched into examQuestions).",
+      "data_model": "None.",
+      "integration_points": "examQuestions ref + fetchExamQuestions (LecturerView.vue:100), editQuestion (147), saveQuestion (396), useConfirm (confirm_service.ts).",
+      "trade_offs": "Override detection is client-side (examQuestions may be stale if two lecturers edit concurrently); the backend ON CONFLICT still applies, so worst case is a missed warning, not data corruption beyond what exists today. A server-side 'exists' check could be added but is out of scope for 90-150-student single-lecturer-at-a-time usage."
+    },
+    {
+      "id": "ARCH-005",
+      "decision": "Scheduled activation/deactivation UI (R3, pairs with ARCH-001). In LecturerView.vue Exams tab, replace the single Activate/Deactivate toggle button with an activation control offering: 'Activate now' vs 'Activate at a time (with optional end time)' using datetime-local pickers, and on the deactivate side 'Deactivate now' vs 'Deactivate at a time'. The control posts the extended payloads defined in ARCH-001 to /activate and /deactivate. Display the effective_state badge (inactive/scheduled/active/ended) and the scheduled window using utils/format_date.ts. Reuse useConfirm for instant deactivate (destructive: drops sandbox).",
+      "rationale": "R3 requires the four activation/deactivation modes; the UI must produce the schedule payloads ARCH-001 defines. Reusing format_date and useConfirm matches existing patterns.",
+      "affected_files": [
+        "frontend/src/components/LecturerView.vue (toggleExamActive at line 341 rewritten to build the mode/schedule payload; Exams-tab template at 753-779 gains pickers + state badges)",
+        "frontend/src/constants/ui_copy.ts (labels for ACTIVATE_NOW/ACTIVATE_SCHEDULED/DEACTIVATE_NOW/DEACTIVATE_SCHEDULED)"
+      ],
+      "api_surface": "Consumes the extended PUT /activate and /deactivate from ARCH-001. No new endpoints.",
+      "data_model": "None beyond ARCH-001.",
+      "integration_points": "toggleExamActive (LecturerView.vue:341), fetchExams (301), format_date.ts, useConfirm.",
+      "trade_offs": "datetime-local emits local-time strings without timezone; the client must convert to RFC3339/UTC before sending. Documented as an implementation requirement to avoid off-by-timezone scheduling bugs."
+    },
+    {
+      "id": "ARCH-006",
+      "decision": "Exam roster monitoring + unassign (R4). Add GET /lecturer/exams/:id/students returning the enrolled roster with a count, and DELETE /lecturer/exams/:id/students/:studentId to unassign one student (allowed only while the exam is not active, mirroring the AssignStudents freeze). In LecturerView.vue's enrollment panel, render the current roster (student_number, name, assigned_at) with an assigned-count header and a Remove button per row gated by useConfirm.",
+      "rationale": "R4 requires visibility of who is assigned and the ability to remove a seat. Today exam_students only supports insert-ON-CONFLICT-DO-NOTHING (postgres.go:1124) with no list/remove. Freeze-while-active keeps roster immutable during an exam, consistent with AddStudentsToExam's guard.",
+      "affected_files": [
+        "backend/internal/repository/postgres.go (NEW GetExamRoster(examID)->[]{student fields, assigned_at}; NEW RemoveStudentFromExam(examID, studentID) with is-active guard returning ErrExamActive)",
+        "backend/internal/controllers/lecturer_controller.go (NEW GetExamRoster, RemoveStudentFromExam handlers)",
+        "backend/cmd/main.go (register GET + DELETE routes under staff group, RoleMiddleware(Admin,Lecturer))",
+        "frontend/src/components/LecturerView.vue (roster table + count + per-row remove in the enrollment panel)"
+      ],
+      "api_surface": "GET /lecturer/exams/:id/students -> {count:int, students:[{student_id,student_number,first_name,last_name,sec_lec,sec_lab,assigned_at}]}. DELETE /lecturer/exams/:id/students/:studentId -> 200 {message} or 409 ErrExamActive while active.",
+      "data_model": "None. Uses existing app.exam_students (exam_id, student_id, assigned_by, assigned_at) joined to app.system_users.",
+      "integration_points": "AddStudentsToExam guard pattern (postgres.go:1124), ErrExamActive (postgres.go:17), statusForRepoErr (lecturer_controller.go:20), StudentMultiSelect already shows assignable students. assignStudents (LecturerView.vue:372) should refetch the roster after assign.",
+      "trade_offs": "Removing a student who already submitted leaves their app.submissions rows orphaned-but-present (FK to exam_students is not enforced; submissions FK to examinations/users only). This is acceptable and intentional \u2014 historical submissions are retained; the roster just controls who can newly submit. Documented so the validator does not flag dangling submissions as a bug."
+    },
+    {
+      "id": "ARCH-007",
+      "decision": "Rename exam enrollment feature to avoid collision with practice 'assignment' naming (R5). Rename the exam student-assignment tab/feature from 'Assignments'/'Assign Students to Exam' to 'Exam Roster' (tab) / 'Enroll Students in Exam' (panel heading). Keep the action verb button as 'Enroll Students' (was 'Assign Students'). Leave all practice-assignment naming untouched. This is a labels-and-constants-only change; endpoints and DB stay the same to avoid churn (the /students endpoints keep their paths).",
+      "rationale": "R5 wants the exam feature renamed so 'assignment' is unambiguous (practice uses it). 'Roster/Enroll' is the clearest non-colliding term and aligns with the existing GetStudentEnrolledExams/exam_students vocabulary. Changing only labels avoids breaking API contracts.",
+      "affected_files": [
+        "frontend/src/constants/ui_copy.ts (ASSIGN_STUDENTS 'Assign Students' -> add ENROLL_STUDENTS 'Enroll Students'; keep ASSIGN_STUDENTS if referenced elsewhere or repoint)",
+        "frontend/src/components/LecturerView.vue (tab label 'Assignments'->'Exam Roster' at line 548; activeTab key 'assignments' may stay as an internal key or be renamed to 'roster' (also update localStorage key handling at 531-539); panel <h2>'Assign Students to Exam'->'Enroll Students in Exam' at 782; button text at 796-797)"
+      ],
+      "api_surface": "None changed.",
+      "data_model": "None.",
+      "integration_points": "UI_COPY (ui_copy.ts:30 ASSIGN_STUDENTS), activeTab union type + localStorage 'lecturerTab' (LecturerView.vue:531). If the activeTab key is renamed, the persisted localStorage value must be migrated/defaulted to avoid a blank tab on first load.",
+      "trade_offs": "Renaming the activeTab internal key risks a stale localStorage value; safer to keep the internal key 'assignments' and change only user-visible strings. Recommend keeping the key, changing labels only \u2014 lowest risk."
+    },
+    {
+      "id": "ARCH-008",
+      "decision": "Explicit 'Create new practice' button in PracticeAuthoring.vue (R6). Add a primary 'New Practice Question' button that clears the form to a fresh blank (reuse the existing resetForm, which already nulls id and resets defaults) and scrolls to the form, making create-vs-edit explicit rather than relying on form.id auto-detection. Keep 'Reset Form'. When a question is loaded via editQuestion, show an 'Editing #<id>' indicator so the lecturer knows they are in edit mode; New Practice Question exits it.",
+      "rationale": "R6 wants an explicit create affordance. The form already auto-detects create/edit by form.id and resetForm already exists, so this is a thin UI addition with a clear-to-new behavior.",
+      "affected_files": [
+        "frontend/src/components/PracticeAuthoring.vue (add New Practice Question button bound to resetForm + scroll; add editing indicator from form.id)",
+        "frontend/src/constants/ui_copy.ts (optional NEW_PRACTICE_QUESTION label)"
+      ],
+      "api_surface": "None.",
+      "data_model": "None.",
+      "integration_points": "resetForm (PracticeAuthoring.vue:73), editQuestion (69), form.id detection in saveQuestion path (upsertQuestion).",
+      "trade_offs": "Minimal. No backend impact."
+    },
+    {
+      "id": "ARCH-009",
+      "decision": "SSE client fallback poll + Nginx SSE passthrough (supports ARCH-002/003). The frontend useExamStream composable also runs a low-frequency fallback poll (e.g. every 15s) of GET /quiz/exams?include_inactive=true (or a lightweight GET /quiz/exams/:id status) ONLY while in WAITING state, so that: (a) if the SSE connection fails behind a hostile proxy the student still transitions, and (b) for a SCHEDULED window with no background tick, the first enrolled student's poll crossing scheduled_start_at fires the lazy activation trigger which broadcasts to all held SSE connections. Nginx gains a dedicated location ~ ^/api/v1/quiz/exams/[0-9]+/stream block with proxy_buffering off, proxy_cache off, proxy_read_timeout 3600s, chunked_transfer_encoding off, and the same proxy_pass to backend:8080. The general /api/ block is unchanged.",
+      "rationale": "SSE through Nginx requires proxy_buffering off and a long read timeout or the stream is buffered/closed. The fallback poll is the safety net D2's held-connection model needs given D4's no-scheduler constraint: someone has to cross the timestamp boundary, and the waiting students polling at 15s is the trigger source. Bounded worst-case waiting latency = poll interval.",
+      "affected_files": [
+        "frontend/nginx.conf (NEW regex location for the stream path; ordering before the generic /api/ block)",
+        "frontend/src/composables/useExamStream.ts (fallback poll while WAITING; stop on ACTIVE/unmount)"
+      ],
+      "api_surface": "Reuses GET /quiz/exams?include_inactive=true (ARCH-003).",
+      "data_model": "None.",
+      "integration_points": "nginx.conf /api/ block (frontend/nginx.conf:33), useExamStream (ARCH-003), the lazy-activation trigger in the effective-state gate (ARCH-001).",
+      "trade_offs": "A 15s fallback poll from ~150 waiting students is ~10 req/s \u2014 negligible and only during the pre-start waiting window, far below the polling load D2 sought to avoid (which was continuous per-student polling throughout). Choosing a shorter interval lowers latency at the cost of more requests; 15s is a reasonable default the implementor may tune."
+    },
+    {
+      "id": "ARCH-010",
+      "decision": "Lecturer ImportSchema re-opened to LECTURER role with guardrails (D3, R8). Change the route RoleMiddleware on POST /lecturer/import-schema from RoleMiddleware(RoleAdmin) to RoleMiddleware(RoleAdmin, RoleLecturer) (cmd/main.go:152). Guardrails: (1) keep the existing 'no exam active' phase gate unchanged; (2) the import only touches public.* and never app.* or sandbox schemas (already true in ExecuteSchemaScript); (3) add an audit log row (app.schema_import_audit: id, imported_by, imported_at, byte_size, table_count) recording WHO imported; (4) the LecturerView 'Initialize Exam Database' tab already exists (LecturerView.vue:553) but its handler must gate the destructive import behind a useConfirm danger dialog before POSTing; (5) DROP of the app schema remains impossible because ExecuteSchemaScript runs the script against public and the restricted path never grants app DDL. The security trade-off is explicitly documented in ARCHITECTURE.md (a previously admin-only destructive surface is now lecturer-accessible).",
+      "rationale": "D3 locks this re-opening. The frontend tab already exists; only the backend RoleMiddleware forbids it. Audit + confirm dialog are the requested guardrails to compensate for widening a deliberately-hardened surface.",
+      "affected_files": [
+        "backend/cmd/main.go (line 152: add models.RoleLecturer to the import-schema RoleMiddleware)",
+        "backend/internal/repository/postgres.go (InitializeSystemTables: CREATE TABLE IF NOT EXISTS app.schema_import_audit; ExecuteSchemaScript (282) writes an audit row with importer id + counts)",
+        "backend/internal/controllers/lecturer_controller.go (ImportSchema (265) passes the JWT user id into the repo for the audit row)",
+        "frontend/src/components/LecturerView.vue (handleImportSchema (455) gated behind useConfirm danger dialog)",
+        "ARCHITECTURE.md (document the security trade-off and audit table)"
+      ],
+      "api_surface": "POST /lecturer/import-schema now accepts LECTURER tokens (was 403). Response unchanged. Phase gate (409 if any exam active) unchanged.",
+      "data_model": "CREATE TABLE IF NOT EXISTS app.schema_import_audit (id SERIAL PRIMARY KEY, imported_by INTEGER REFERENCES app.system_users(id), imported_at TIMESTAMPTZ DEFAULT now(), byte_size INTEGER, table_count INTEGER). Idempotent.",
+      "integration_points": "RoleMiddleware (user_controller.go:180), ImportSchema controller (lecturer_controller.go:265), ExecuteSchemaScript (postgres.go:282), the existing Schema tab (LecturerView.vue:545,553), statusForRepoErr for the active-exam 409.",
+      "trade_offs": "SECURITY TRADE-OFF (explicit per D3): a lecturer can now wipe and recreate public.* (the curriculum) \u2014 a destructive operation previously restricted to admins after a hardening pass. Mitigations: still blocked while any exam is active; confirm dialog; audit trail of who imported; app.* schema remains untouchable. Residual risk accepted by the user. Alternative (separate lecturer-scoped import that only adds tables) rejected as out of scope for D1's build-everything-now directive."
+    },
+    {
+      "id": "ARCH-011",
+      "decision": "Lecturer score-clarity UI improvement (R7 \u2014 presentation only, verify-and-enhance). The data layer is complete: GetConsolidatedScores (postgres.go:1827) already returns per-exam columns, practice total, and grand total; /quiz/results and /practice/summary feed the student views. The gap is clarity: the consolidated table shows raw earned points with no max/denominator and no per-exam max. Scope a focused UI enhancement: in LecturerView Results tab, render each exam column as 'earned / max' (max = sum of points of that exam's questions) and a percentage, and add a per-student expand/drill-down is OPTIONAL (open question). Add max-score context to StudentResults if missing. NO data-layer rebuild. To compute per-exam max cleanly, add a lightweight GET /lecturer/exams/max-scores (or extend GetConsolidatedScores) returning {exam_title: max_points}.",
+      "rationale": "Requirement says scores are 'unable to see clearly'. Investigation confirms the data is all present (ARCHITECTURE.md Scoring section + GetConsolidatedScores). Per the brief, scope a focused clarity ARCH entry rather than rebuilding the data layer. The only missing datum for clarity is the per-exam max denominator.",
+      "affected_files": [
+        "frontend/src/components/LecturerView.vue (Results tab table at 806-840: show earned/max + pct per exam column)",
+        "frontend/src/components/StudentResults.vue (ensure max-score denominators are shown; verify against /quiz/results which already returns max_score per ExamResultSummary)",
+        "backend/internal/repository/postgres.go (OPTIONAL: GetExamMaxScores or extend consolidated payload with per-exam max)",
+        "backend/internal/controllers/lecturer_controller.go (OPTIONAL endpoint)"
+      ],
+      "api_surface": "OPTIONAL GET /lecturer/exams/max-scores -> {exam_title: max_points}. Existing /lecturer/scores, /quiz/results (returns max_score), /practice/summary unchanged.",
+      "data_model": "None.",
+      "integration_points": "GetConsolidatedScores (postgres.go:1827), ExamResultSummary.MaxScore (already populated, submission.go:77), consolidatedScores table render (LecturerView.vue:806).",
+      "trade_offs": "Adding a max-scores endpoint is one extra query; alternative is folding max into GetConsolidatedScores (fewer round trips, but touches a hot path). Implementor's judgment. Keeping it additive avoids regressing the existing CSV export which already works off earned totals."
+    }
+  ],
+  "todos": [],
+  "in_progress": [],
+  "completed": [
+    {
+      "id": "TODO-001",
+      "arch_ref": "ARCH-001",
+      "title": "Add scheduled_start_at / scheduled_end_at columns to app.examinations (DDL)",
+      "description": "In backend/internal/repository/postgres.go InitializeSystemTables, add two idempotent ALTER TABLE entries to the extraMigrations slice (after the existing activated_at/archived_at entries): 'ALTER TABLE app.examinations ADD COLUMN IF NOT EXISTS scheduled_start_at TIMESTAMP WITH TIME ZONE' and 'ALTER TABLE app.examinations ADD COLUMN IF NOT EXISTS scheduled_end_at TIMESTAMP WITH TIME ZONE'. Also add these two columns to the CREATE TABLE IF NOT EXISTS block for app.examinations (around line 510) so fresh installs get them in the initial DDL. No other files changed.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "Running InitializeSystemTables on an existing DB adds scheduled_start_at and scheduled_end_at to app.examinations without error. SELECT scheduled_start_at, scheduled_end_at FROM app.examinations LIMIT 1 succeeds. On a fresh DB the CREATE TABLE block includes both columns. No other behavior changed.",
+      "assigned_to": "codex-cli",
+      "reason": "DDL-only single-file change to InitializeSystemTables (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-002",
+      "arch_ref": "ARCH-001",
+      "title": "Extend Examination model and add ExaminationEffectiveState pure helper",
+      "description": "Two changes: (a) In backend/internal/models/examination.go add two fields to the Examination struct: ScheduledStartAt *time.Time with json tag 'scheduled_start_at,omitempty' and ScheduledEndAt *time.Time with json tag 'scheduled_end_at,omitempty'. ActivatedAt and ArchivedAt are already present. (b) In backend/internal/repository/postgres.go add a package-level pure function ExaminationEffectiveState(exam models.Examination) that returns a struct (define an EffectiveState type with fields Phase string and ActiveNow bool). Phase values: 'inactive' (is_active=false), 'scheduled' (is_active=true but now < scheduled_start_at), 'active' (is_active=true and window is open), 'ended' (is_active=true but now >= scheduled_end_at). Logic: if !exam.IsActive return {Phase:'inactive', ActiveNow:false}. now := time.Now().UTC(). windowOpen := exam.ScheduledStartAt == nil || !now.Before(*exam.ScheduledStartAt). windowAlive := exam.ScheduledEndAt == nil || now.Before(*exam.ScheduledEndAt). if windowOpen && windowAlive return {Phase:'active', ActiveNow:true}. if !windowOpen return {Phase:'scheduled', ActiveNow:false}. return {Phase:'ended', ActiveNow:false}. No DB calls.",
+      "file_scope": [
+        "backend/internal/models/examination.go",
+        "backend/internal/repository/postgres.go"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-001"
+      ],
+      "done_when": "models.Examination has ScheduledStartAt and ScheduledEndAt *time.Time fields. ExaminationEffectiveState compiles with no warnings. Given is_active=true and scheduled_start_at 1 hour from now: Phase='scheduled', ActiveNow=false. Given is_active=true, scheduled_start_at in the past, no end: Phase='active', ActiveNow=true. Given is_active=true, scheduled_end_at in the past: Phase='ended', ActiveNow=false. Given is_active=false: Phase='inactive', ActiveNow=false.",
+      "assigned_to": "codex-cli",
+      "reason": "Model struct extension + pure helper function across 2 files (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-003",
+      "arch_ref": "ARCH-001",
+      "title": "Widen GetExamByID, GetAllExaminations, GetStudentExams SELECTs to include new timestamp columns",
+      "description": "In backend/internal/repository/postgres.go update three functions. (1) GetExamByID (around line 1150): change SELECT to 'SELECT id, title, is_active, created_by, created_at, scheduled_start_at, scheduled_end_at, activated_at, archived_at FROM app.examinations WHERE id=$1' and Scan 9 values into e.ID, e.Title, e.IsActive, e.CreatedBy, e.CreatedAt, e.ScheduledStartAt, e.ScheduledEndAt, e.ActivatedAt, e.ArchivedAt. (2) GetAllExaminations (around line 1157): same 9-column SELECT and Scan. (3) GetStudentExams (around line 1177): same 9-column SELECT and Scan (join with exam_students alias unchanged). All four nullable timestamp pointers (*time.Time) must be scanned correctly \u2014 pgx nullable timestamps scan into *time.Time natively.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-002"
+      ],
+      "done_when": "All three functions compile. Calling GetExamByID for an exam with a non-null scheduled_start_at returns a non-nil ScheduledStartAt pointer. Existing callers (SubmitAnswer, PreviewAnswer, GetExamQuestions, AddStudentsToExam) still compile without modification. GetAllExaminations returns ActivatedAt and ArchivedAt where present.",
+      "assigned_to": "codex-cli",
+      "reason": "Mechanical SELECT/Scan widening in one file across 3 functions (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-004",
+      "arch_ref": "ARCH-001",
+      "title": "Extend SetExaminationActive to accept schedule timestamps and add EnsureExamSandboxReady helper",
+      "description": "In backend/internal/repository/postgres.go: (a) Change SetExaminationActive signature to SetExaminationActive(ctx context.Context, id int, active bool, scheduledStartAt *time.Time, scheduledEndAt *time.Time) error. When active=true: run existing pre-flight checks (question count, capture status) unchanged. Validate: if both scheduledStartAt and scheduledEndAt are non-nil and !scheduledEndAt.After(*scheduledStartAt) return an error 'scheduled_end_at must be after scheduled_start_at'. If scheduledStartAt is nil set it to pointer to time.Now().UTC() (instant mode). UPDATE app.examinations SET is_active=TRUE, activated_at=NOW(), archived_at=NULL, scheduled_start_at=$2, scheduled_end_at=$3 WHERE id=$1. Then compute effective state: if ExaminationEffectiveState returns ActiveNow=true and examHasDMLQuestions is true, call InitializeExamSandbox. For scheduled-future exams (ActiveNow=false) skip sandbox clone. When active=false delegate to ArchiveExamination unchanged (signature unchanged). (b) Add EnsureExamSandboxReady(ctx context.Context, examID int) error: check SELECT created_at FROM app.exam_sandboxes WHERE exam_id=$1 AND dropped_at IS NULL \u2014 if row exists with non-null created_at return nil. Otherwise check examHasDMLQuestions: if false return nil. Call InitializeExamSandbox. Add also SetScheduledEndAt(ctx, examID int, scheduledEndAt *time.Time) error: UPDATE app.examinations SET scheduled_end_at=$1 WHERE id=$2.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "complexity": "medium",
+      "depends_on": [
+        "TODO-003"
+      ],
+      "done_when": "SetExaminationActive compiles with 5-arg signature. Calling with active=true, nil, nil sets scheduled_start_at=now(). Calling with active=true and future scheduledStartAt stores that value and does not create a sandbox (ActiveNow=false). EnsureExamSandboxReady returns nil if sandbox already exists, calls InitializeExamSandbox otherwise. SetScheduledEndAt updates only scheduled_end_at. Validation error returned when scheduledEndAt <= scheduledStartAt.",
+      "assigned_to": "codex-cli",
+      "reason": "Signature extension and EnsureExamSandboxReady helper in single repo file (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-005",
+      "reason": "merge conflict: buildExamStatusEvent fmt.Sprintf format string literal stripped \u2014 lecturer_controller.go:46 has fmt.Sprintf(, instead of fmt.Sprintf(\"<format-string>\",; causes syntax error and prevents go build",
+      "status": "completed",
+      "orchestrator_fix": "merge-check BLOCKER (truncated fmt.Sprintf format string) fixed inline by orchestrator 2026-05-25: TODO-005 buildExamStatusEvent format string restored (4-arg: UnixMilli,examID,phase,server_time); TODO-009 quiz_controller GetExamQuestions lazy broadcast now reuses buildExamStatusEvent(examID,\"active\") instead of a truncated inline Sprintf. go build ./... and go vet ./... pass."
+    },
+    {
+      "id": "TODO-006",
+      "arch_ref": "ARCH-001",
+      "title": "Replace bare is_active checks with ExaminationEffectiveState in quiz gates; add effective_state to exam list responses",
+      "description": "In backend/internal/controllers/quiz_controller.go: (1) GetExamQuestions (around line 43): after GetExamByID, compute state := repository.ExaminationEffectiveState(exam). Replace 'if err != nil || !exam.IsActive' with 'if !state.ActiveNow'. Then call ctrl.repo.EnsureExamSandboxReady(ctx, examID) before fetching questions (triggers lazy sandbox prep for DML exams). (2) SubmitAnswer (around line 134): compute state := repository.ExaminationEffectiveState(exam) and replace the is_active check with !state.ActiveNow. (3) PreviewAnswer (around line 214): same replacement. In backend/internal/controllers/lecturer_controller.go ListExaminations: after fetching exams, build a response slice of structs {id, title, is_active, effective_state (Phase string), scheduled_start_at, scheduled_end_at, activated_at, archived_at} rather than returning raw Examination slices. In backend/internal/controllers/quiz_controller.go GetExams: same \u2014 build a response slice including effective_state. Define a small ExaminationResponse struct in each controller file (or a shared one in models if preferred \u2014 implementor's choice, must be consistent).",
+      "file_scope": [
+        "backend/internal/controllers/quiz_controller.go",
+        "backend/internal/controllers/lecturer_controller.go"
+      ],
+      "complexity": "medium",
+      "depends_on": [
+        "TODO-005"
+      ],
+      "done_when": "GET /quiz/exams/:id/questions returns 403 for a scheduled exam whose window has not opened. It returns questions for an exam whose window is open. POST /quiz/submit and /quiz/preview gate on effective state. GET /lecturer/exams and GET /quiz/exams each return an effective_state string field on every exam object. Project compiles with no unused-import errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Replace is_active checks with EffectiveState helper across 2 controller files + build response structs (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-007",
+      "arch_ref": "ARCH-002",
+      "title": "Create SSE hub in-process pub/sub service (backend/internal/services/sse_hub.go)",
+      "description": "Create new file backend/internal/services/sse_hub.go in package services. Define: type Hub struct with a sync.RWMutex and subs map[int]map[chan string]struct{}. Implement: func NewHub() *Hub (initializes the map). func (h *Hub) Subscribe(examID int) chan string \u2014 acquires write lock, lazily creates inner map for examID, makes a buffered channel with capacity 4, registers it, releases lock, returns channel. func (h *Hub) Unsubscribe(examID int, ch chan string) \u2014 write lock, delete from map, close the channel, release lock. func (h *Hub) Broadcast(examID int, payload string) \u2014 read lock to get subscriber map copy, release lock, then non-blocking send to each channel (select with default to skip full channels). func (h *Hub) Close() \u2014 write lock, iterate all channels across all exams, close each, clear the map. No external imports beyond sync.",
+      "file_scope": [
+        "backend/internal/services/sse_hub.go"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "sse_hub.go compiles as package services. Subscribe returns a channel that receives the string sent via Broadcast(examID). Unsubscribe removes the channel. After Unsubscribe, Broadcast does not attempt to send to the closed channel. Close empties all subscriptions. Running with -race flag: no data races detected. No dependency on TODO-001 through TODO-006.",
+      "assigned_to": "codex-cli",
+      "reason": "New single-file SSE hub service with mutex-guarded pub/sub (antigravity lane parked -> forced to codex-cli)",
+      "validator": "FAIL->FIXED",
+      "orchestrator_fix": "validator found send-on-closed-channel race in sse_hub.go (Broadcast released RLock before sending; Unsubscribe closed after unlock). Fixed inline 2026-05-25 (Codex rate-limited): Broadcast now holds RLock across the non-blocking send loop; Unsubscribe/Close close channels under the write lock with an idempotent membership guard. go build/vet OK; services tests green (no -race); standard correct RWMutex pattern."
+    },
+    {
+      "id": "TODO-008",
+      "arch_ref": "ARCH-002",
+      "title": "Add SSE StreamExamStatus handler and inject Hub + AuthService into QuizController",
+      "description": "In backend/internal/controllers/quiz_controller.go: (a) Add hub *services.Hub and authService *services.AuthService fields to QuizController. Update NewQuizController signature to NewQuizController(valService *services.ValidationService, submissionQueue *services.SubmissionQueue, repo *repository.PostgresRepository, hub *services.Hub, authService *services.AuthService) *QuizController. (b) Add StreamExamStatus(c *gin.Context) handler: parse exam ID from c.Param('id'). Authenticate via c.Query('access_token') \u2014 call ctrl.authService.ValidateToken(token): if error return 401. Call ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID): if not enrolled return 403. Call ctrl.repo.GetExamByID(ctx, examID): if error return 404. Set headers: Content-Type: text/event-stream, Cache-Control: no-cache, X-Accel-Buffering: no. Compute ExaminationEffectiveState and send immediate snapshot: write 'event: exam-status\\nid: <unix-ms>\\ndata: {\"exam_id\":<id>,\"effective_state\":\"<phase>\",\"server_time\":\"<RFC3339>\"}\\n\\n' to c.Writer then c.Writer.Flush(). Subscribe to hub: ch := ctrl.hub.Subscribe(examID). Defer ctrl.hub.Unsubscribe(examID, ch). Start ticker := time.NewTicker(20 * time.Second). Loop: select on ch (emit exam-status event), ticker.C (write ': ping\\n\\n' and Flush), c.Request.Context().Done() (return). In backend/cmd/main.go: construct hub := services.NewHub(); defer hub.Close(). Update NewQuizController call. Register GET /api/v1/quiz/exams/:id/stream on v1 directly (NOT inside the quiz group that uses AuthMiddleware) \u2014 authentication is done inside the handler.",
+      "file_scope": [
+        "backend/internal/controllers/quiz_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "complexity": "high",
+      "depends_on": [
+        "TODO-006",
+        "TODO-007"
+      ],
+      "done_when": "GET /api/v1/quiz/exams/1/stream?access_token=<valid-student-jwt> returns 200 with Content-Type: text/event-stream and immediately emits an exam-status SSE event. Invalid token returns 401. Non-enrolled student returns 403. Connection stays open; ': ping' comment arrives every ~20s. Project compiles with the updated NewQuizController signature and hub registered in main.",
+      "assigned_to": "codex-cli",
+      "reason": "SSE handler wired into QuizController + main.go registration, high complexity but forced (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-010",
+      "arch_ref": "ARCH-009",
+      "title": "Add Nginx SSE passthrough location block (frontend/nginx.conf)",
+      "description": "In frontend/nginx.conf insert a new regex location block immediately before the 'location /api/' block. The new block: 'location ~ ^/api/v1/quiz/exams/[0-9]+/stream { proxy_pass http://backend:8080; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; proxy_buffering off; proxy_cache off; proxy_read_timeout 3600s; chunked_transfer_encoding off; proxy_set_header Connection ''; }'. The regex location must appear BEFORE 'location /api/' so Nginx matches it first. No other changes to the file.",
+      "file_scope": [
+        "frontend/nginx.conf"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "nginx -t passes on the modified config. The regex location block for the stream path appears before the generic /api/ block in the file. The block contains proxy_buffering off, proxy_read_timeout 3600s, and proxy_set_header Connection ''. The existing /api/ block is unchanged.",
+      "assigned_to": "codex-cli",
+      "reason": "Single nginx.conf edit inserting one location block (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-011",
+      "arch_ref": "ARCH-002",
+      "title": "Create useExamStream composable (frontend/src/composables/useExamStream.ts) \u2014 SSE only",
+      "description": "Create frontend/src/composables/useExamStream.ts. Export useExamStream(examId: Ref<number | null>) returning {effectiveState: Ref<'inactive'|'scheduled'|'active'|'ended'>, connected: Ref<boolean>, close: () => void}. Implementation: hold an EventSource ref and a close function. When examId changes to a non-null value, close any existing stream, then open: new EventSource('/api/v1/quiz/exams/' + examId.value + '/stream?access_token=' + (localStorage.getItem('sql_quiz_token') ?? '')). On EventSource onopen: set connected=true. On EventSource onerror: set connected=false (EventSource auto-reconnects). On message listener for event type 'exam-status': parse event.data as JSON, update effectiveState.value from the effective_state field. When examId changes to null: close stream, reset effectiveState='inactive', connected=false. On onUnmounted: close stream. The close() function closes the EventSource and clears the ref. Use watch(examId, ...) with immediate:true for the open/close logic. This TODO does NOT include the fallback poll (added in TODO-013).",
+      "file_scope": [
+        "frontend/src/composables/useExamStream.ts"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-010"
+      ],
+      "done_when": "useExamStream.ts compiles with no TypeScript errors. The composable opens an EventSource to the correct URL when examId is non-null. When the server emits an exam-status event with effective_state=active, effectiveState.value becomes 'active'. Changing examId closes the old EventSource and opens a new one. onUnmounted closes the stream. connected reflects the EventSource open/error state.",
+      "assigned_to": "codex-cli",
+      "reason": "New single-file Vue composable wrapping EventSource (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-012",
+      "arch_ref": "ARCH-003",
+      "title": "Add GetStudentEnrolledExams repo method and widen GET /quiz/exams to support include_inactive flag",
+      "description": "In backend/internal/repository/postgres.go add GetStudentEnrolledExams(ctx context.Context, studentID int) ([]models.Examination, error): SELECT id, title, is_active, created_by, created_at, scheduled_start_at, scheduled_end_at, activated_at, archived_at FROM app.examinations e JOIN app.exam_students es ON e.id=es.exam_id WHERE es.student_id=$1 ORDER BY e.created_at DESC \u2014 no is_active filter. Scan 9 columns into Examination struct. In backend/internal/controllers/quiz_controller.go GetExams: check c.Query('include_inactive') == 'true'. If true, call ctrl.repo.GetStudentEnrolledExams(ctx, student.ID). If false, call existing ctrl.repo.GetStudentExams(ctx, student.ID). In both branches build the ExaminationResponse slice (with effective_state field, as established in TODO-006) and return it.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go",
+        "backend/internal/controllers/quiz_controller.go"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-006"
+      ],
+      "done_when": "GET /quiz/exams returns only active enrolled exams (backward compat, no include_inactive). GET /quiz/exams?include_inactive=true returns all enrolled exams (active and inactive) with effective_state on each. A student not enrolled in an exam never sees it. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "New repo method + query-flag branch in GetExams controller across 2 files (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-013",
+      "arch_ref": "ARCH-009",
+      "title": "Add 15-second fallback poll to useExamStream composable",
+      "description": "Extend frontend/src/composables/useExamStream.ts (from TODO-011). Add an interval-based fallback poll: when the stream opens and effectiveState is 'inactive' or 'scheduled', start a setInterval at 15000ms that calls GET /api/v1/quiz/exams?include_inactive=true with Authorization header (Bearer token from localStorage). Parse the response array, find the exam matching examId.value, read its effective_state field. If the polled effective_state is 'active' or 'ended', update effectiveState.value and clear the interval. The interval is also cleared when effectiveState becomes 'active' (from the SSE event), on close(), and on onUnmounted. Declare intervalId: ReturnType<typeof setInterval> | null = null inside the composable scope. The poll is separate from the SSE connection \u2014 both run in parallel; whichever fires first wins.",
+      "file_scope": [
+        "frontend/src/composables/useExamStream.ts"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-012",
+        "TODO-011"
+      ],
+      "done_when": "useExamStream polls GET /quiz/exams?include_inactive=true every 15s while effectiveState is inactive or scheduled. When the polled response shows effective_state=active for the watched exam, effectiveState.value updates and the interval stops. The interval also stops on SSE-driven active transition, close(), and unmount. No interval leaks on repeated examId changes.",
+      "assigned_to": "codex-cli",
+      "reason": "Extend existing composable with setInterval fallback poll in single file (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-014",
+      "arch_ref": "ARCH-003",
+      "title": "Rework StudentView.vue into 3-state SELECT / WAITING / ACTIVE flow",
+      "description": "Rewrite frontend/src/components/StudentView.vue to use an explicit phase ref<'select'|'waiting'|'active'> (default 'select'). SELECT phase: fetch enrolled exams via GET /quiz/exams?include_inactive=true on mount. Display each exam as a card with title, effective_state badge (inactive=grey, scheduled=blue, active=green, ended=orange), and a 'Select' button. Clicking Select: if exam.effective_state === 'active' go directly to ACTIVE; else go to WAITING. WAITING phase: import and use useExamStream(selectedExamId). Display waiting panel with exam title, effective_state from the composable, and a 'Start Exam' button that is disabled while effectiveState.value !== 'active'. Clicking Start: transition to ACTIVE, fetch questions via GET /quiz/exams/:id/questions (same as current), render existing submit/preview UI. Back button from WAITING/ACTIVE returns to SELECT and calls close() on the stream composable. Keep ALL existing ACTIVE phase logic intact: question selection, sqlText, result, progress tracking, submit, preview, keyboard shortcuts, autosave. The existing Examination interface must gain effective_state: string, scheduled_start_at: string|null, scheduled_end_at: string|null.",
+      "file_scope": [
+        "frontend/src/components/StudentView.vue",
+        "frontend/src/composables/useExamStream.ts"
+      ],
+      "complexity": "high",
+      "depends_on": [
+        "TODO-013"
+      ],
+      "done_when": "StudentView shows SELECT phase with enrolled exams (including inactive) on load. Selecting an inactive/scheduled exam enters WAITING; Start button disabled. SSE event or fallback poll transitioning to active enables Start. Clicking Start enters ACTIVE and fetches questions. Selecting an already-active exam skips WAITING and goes directly to ACTIVE. All submit/preview/progress behavior in ACTIVE is unchanged. Project compiles with no TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Large StudentView.vue rewrite to 3-state machine, high complexity but forced (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-015",
+      "arch_ref": "ARCH-004",
+      "title": "Replace Question ID numeric input with dropdown + override confirm dialog in LecturerView Questions tab",
+      "description": "In frontend/src/components/LecturerView.vue Questions tab form (around line 596): (a) Replace the 'Question ID' numeric input with a <select>. Options: one option with value='' and label 'Create new question', plus one option per item in examQuestions.value with value=q.id and label 'Q<id> \u2014 <req.slice(0,50)>'. Add a computed nextFreeId = computed(() => examQuestions.value.length === 0 ? 1 : Math.max(...examQuestions.value.map(q => q.id)) + 1). When 'Create new' is selected (value=''): set question.value.id to nextFreeId.value, clear form fields to blank, set isEditMode=false. When an existing question option is selected: call editQuestion(that question object), set isEditMode=true. (b) Add an isEditMode = ref(false) that is set to false on resetForm/blankQuestion and true when editQuestion is called. (c) In saveQuestion (around line 396): before the fetch, if !isEditMode.value and examQuestions.value.some(q => q.id === question.value.id) then call await confirm({title:'Overwrite existing question?', body:'Question #' + question.value.id + ' already exists and will be overwritten.', confirmLabel:'Overwrite', danger:true}) \u2014 if result is false return without saving.",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "complexity": "medium",
+      "depends_on": [],
+      "done_when": "The Question ID field is a dropdown. 'Create new question' option is present and sets the ID to nextFreeId. Selecting an existing question loads it. Saving a genuinely new ID (no collision) saves without dialog. Saving with a collision in create-new mode shows the confirm dialog; cancel aborts; confirm proceeds. Editing a loaded question saves without a dialog. Project compiles with no TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Replace numeric input with dropdown + confirm guard in single LecturerView.vue (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-016",
+      "arch_ref": "ARCH-005",
+      "title": "Add scheduled activation/deactivation UI controls and effective_state badges to LecturerView Exams tab",
+      "description": "In frontend/src/components/LecturerView.vue update the Exams tab (around lines 753-779): (a) Update the Examination interface in the script to add effective_state: string, scheduled_start_at: string|null, scheduled_end_at: string|null. (b) Per exam: show an effective_state badge next to the title (badge class mapping: inactive=grey/default, scheduled=badge-info, active=badge-success, ended=badge-warning). (c) Replace the single toggle button with activation controls: for exams with effective_state 'inactive' or 'scheduled', show: a radio group 'Activate now' vs 'Schedule activation' \u2014 when 'Schedule activation' chosen, show a datetime-local input for scheduled_start_at and an optional datetime-local for scheduled_end_at. A button 'Activate' fires activateExam(e.id, mode, scheduledStartAt, scheduledEndAt). For 'active' exams: button 'Deactivate now' (fires deactivateExamInstant, guarded by useConfirm danger dialog \u2014 this drops the sandbox) and button 'Set end time' that shows a datetime-local for scheduled_end_at and fires deactivateExamScheduled(e.id, scheduledEndAt). For 'ended' exams: only 'Deactivate now'. (d) Add functions activateExam(id, mode, start?, end?) and deactivateExamInstant(id) and deactivateExamScheduled(id, endAt). Convert datetime-local values to RFC3339 UTC via new Date(localStr).toISOString() before sending. (e) Add UI_COPY entries: ACTIVATE_NOW, SCHEDULE_ACTIVATION, DEACTIVATE_NOW, SET_END_TIME. Remove or leave toggleExamActive (keep it if it is referenced in the Questions tab quick-toggle \u2014 which it is at line 581; keep it for that inline toggle and add new functions for the Exams tab).",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue",
+        "frontend/src/constants/ui_copy.ts"
+      ],
+      "complexity": "high",
+      "depends_on": [
+        "TODO-006"
+      ],
+      "done_when": "The Exams tab shows effective_state badges. Inactive/scheduled exams have Activate-now and Schedule-activation options. Activating with a future time sends {active:true, mode:'scheduled', scheduled_start_at:<ISO>} to the backend. Active exams show Deactivate-now (with confirm) and Set-end-time options. Deactivate-now sends instant archive request. Set-end-time sends {mode:'scheduled', scheduled_end_at:<ISO>}. After any action fetchExams is called. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "Activation UI controls + effective_state badges in LecturerView.vue + ui_copy.ts, high complexity but forced (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-017",
+      "arch_ref": "ARCH-006",
+      "title": "Add RosterStudent model and GetExamRoster / RemoveStudentFromExam repo methods",
+      "description": "In backend/internal/models/examination.go add: type RosterStudent struct with fields StudentID int json:'student_id', Username string json:'username', StudentNumber string json:'student_number', FirstName string json:'first_name', LastName string json:'last_name', SecLec string json:'sec_lec', SecLab string json:'sec_lab', AssignedAt time.Time json:'assigned_at'. In backend/internal/repository/postgres.go add two functions: (1) GetExamRoster(ctx context.Context, examID int) ([]models.RosterStudent, error): SELECT su.id, su.username, COALESCE(su.student_number,''), COALESCE(su.first_name,''), COALESCE(su.last_name,''), COALESCE(su.sec_lec,''), COALESCE(su.sec_lab,''), es.assigned_at FROM app.exam_students es JOIN app.system_users su ON es.student_id=su.id WHERE es.exam_id=$1 ORDER BY su.student_number ASC NULLS LAST, su.username ASC. Scan into RosterStudent slice. (2) RemoveStudentFromExam(ctx context.Context, examID, studentID int) error: call GetExamByID then ExaminationEffectiveState \u2014 if ActiveNow return fmt.Errorf('%w: cannot remove student while exam is effectively active', ErrExamActive). Else DELETE FROM app.exam_students WHERE exam_id=$1 AND student_id=$2.",
+      "file_scope": [
+        "backend/internal/models/examination.go",
+        "backend/internal/repository/postgres.go"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-003"
+      ],
+      "done_when": "RosterStudent struct exists in models. GetExamRoster returns enrolled students with all fields. RemoveStudentFromExam deletes the row when exam is not effectively active, returns ErrExamActive when it is. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "New model struct + 2 repo methods across 2 files (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-018",
+      "arch_ref": "ARCH-006",
+      "title": "Add GetExamRoster and RemoveStudentFromExam controller handlers and register routes",
+      "description": "In backend/internal/controllers/lecturer_controller.go add two handlers: (1) GetExamRoster(c *gin.Context): parse :id as examID int (400 on parse error). Call ctrl.repo.GetExamRoster(ctx, examID). Return JSON {count: len(students), students: students} with 200, or 500 on error. (2) RemoveStudentFromExam(c *gin.Context): parse :id as examID and :studentId as studentID (400 on parse error). Call ctrl.repo.RemoveStudentFromExam(ctx, examID, studentID). Map ErrExamActive to 409 via statusForRepoErr. Return 200 {message: 'Student removed from roster'} or error. In backend/cmd/main.go register in the staff group: staff.GET('/lecturer/exams/:id/students', controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamRoster) and staff.DELETE('/lecturer/exams/:id/students/:studentId', controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam). Also update AddStudentsToExam in postgres.go to guard with ExaminationEffectiveState.ActiveNow (not bare exam.IsActive) now that the struct carries the scheduled timestamps.",
+      "file_scope": [
+        "backend/internal/controllers/lecturer_controller.go",
+        "backend/internal/repository/postgres.go",
+        "backend/cmd/main.go"
+      ],
+      "complexity": "medium",
+      "depends_on": [
+        "TODO-017"
+      ],
+      "done_when": "GET /api/v1/lecturer/exams/1/students returns {count:N, students:[...]} for a valid exam. DELETE /api/v1/lecturer/exams/1/students/5 returns 200 when exam is not effectively active, 409 when effectively active. Both routes require Admin or Lecturer role. AddStudentsToExam guards via ExaminationEffectiveState. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "2 controller handlers + route registration across 3 files (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-019",
+      "arch_ref": "ARCH-006",
+      "title": "Add roster table and per-row remove button to LecturerView enrollment panel",
+      "description": "In frontend/src/components/LecturerView.vue in the 'assignments' (Exam Roster) tab panel (around line 781): (a) Add interface RosterStudent { student_id: number; username: string; student_number: string; first_name: string; last_name: string; sec_lec: string; sec_lab: string; assigned_at: string }. (b) Add rosterStudents = ref<RosterStudent[]>([]) and a fetchRoster async function that GETs /api/v1/lecturer/exams/${selectedExamId.value}/students and sets rosterStudents.value = data.students. (c) Watch selectedExamId: when it changes to a non-null value, call fetchRoster(). Also call fetchRoster() at the end of the assignStudents success handler. (d) Render an 'Enrolled: N students' count heading and a roster table with columns: Student #, Name (first + last), Sec Lec/Lab, Enrolled At, Actions. Each row has a Remove button that calls useConfirm({title:'Remove from roster?', body: student.first_name + ' ' + student.last_name, confirmLabel:'Remove', danger:true}); on confirm DELETEs /api/v1/lecturer/exams/${selectedExamId.value}/students/${student.student_id} then calls fetchRoster(). Show handleApiError on delete failure. Disable Remove buttons while exam is effectively active (show a tooltip 'Cannot remove during active exam' \u2014 check the exam's effective_state from the exams ref).",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "complexity": "medium",
+      "depends_on": [
+        "TODO-018"
+      ],
+      "done_when": "The Exam Roster tab shows a table of enrolled students with a count header. Selecting an exam fetches and displays the roster. The Remove button per row prompts for confirmation, then deletes the student and refreshes the table. After enrolling new students the table refreshes. Remove buttons are disabled while the exam is effectively active. Project compiles with no TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Roster table UI with per-row remove in single LecturerView.vue (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-020",
+      "arch_ref": "ARCH-007",
+      "title": "Rename exam enrollment labels to Exam Roster / Enroll Students in LecturerView and ui_copy.ts",
+      "description": "In frontend/src/constants/ui_copy.ts: add ENROLL_STUDENTS: 'Enroll Students' and EXAM_ROSTER: 'Exam Roster'. If ASSIGN_STUDENTS is only referenced in LecturerView enrollment context, rename its usages (do not remove the key to avoid breaking anything if referenced elsewhere \u2014 check all usages first with grep before deciding). In frontend/src/components/LecturerView.vue: (a) Tab button around line 548: change the displayed text from 'Assignments' to UI_COPY.EXAM_ROSTER (the activeTab key value 'assignments' in the :class binding and click handler stays unchanged). (b) Panel h2 heading around line 782: change 'Assign Students to Exam' to 'Enroll Students in Exam'. (c) Enroll button displayed text (around line 796): change 'Assign N Students' / 'Assigning' text to 'Enroll N Students' / 'Enrolling'. (d) Do NOT rename any internal variable (selectedStudentIds, assignStudents, assignStudentsLoading), any backend route, or any practice-feature label.",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue",
+        "frontend/src/constants/ui_copy.ts"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "Tab bar shows 'Exam Roster'. Panel heading reads 'Enroll Students in Exam'. Enroll button reads 'Enroll N Students'. ENROLL_STUDENTS and EXAM_ROSTER exist in UI_COPY. Internal activeTab key 'assignments' and localStorage key 'lecturerTab' are unchanged. Existing lecturerTab='assignments' in localStorage still opens the correct tab. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "Label-only rename in LecturerView.vue + ui_copy.ts (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-021",
+      "arch_ref": "ARCH-008",
+      "title": "Add New Practice Question button and editing indicator to PracticeAuthoring.vue",
+      "description": "In frontend/src/components/PracticeAuthoring.vue: (a) Add a template ref on the form container element (e.g. ref='formRef' on the outermost form div). (b) Add a 'New Practice Question' primary button above the form fields \u2014 bind its click to a handler that calls resetForm() and then calls formRef.value?.scrollIntoView({behavior:'smooth'}). Disable the button when form.value.id is null/undefined (already in create mode). (c) Add an editing indicator: a badge or inline text that shows 'Editing #<form.value.id>' when form.value.id is truthy, or 'New question' when form.value.id is null/undefined. Place the indicator near the form heading. (d) Optionally add NEW_PRACTICE_QUESTION: 'New Practice Question' to frontend/src/constants/ui_copy.ts. The existing 'Reset Form' button stays. editQuestion and saveQuestion logic are unchanged.",
+      "file_scope": [
+        "frontend/src/components/PracticeAuthoring.vue",
+        "frontend/src/constants/ui_copy.ts"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "PracticeAuthoring shows a 'New Practice Question' primary button. Clicking it calls resetForm() and smoothly scrolls to the form. While form.value.id is set (edit mode), 'Editing #N' is visible. After clicking New Practice Question, form.id is cleared and the indicator shows 'New question' or disappears. The Reset Form button still works. Project compiles with no TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "New button + editing indicator in single PracticeAuthoring.vue file (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-022",
+      "arch_ref": "ARCH-010",
+      "title": "Add app.schema_import_audit CREATE TABLE to InitializeSystemTables",
+      "description": "In backend/internal/repository/postgres.go InitializeSystemTables: add 'CREATE TABLE IF NOT EXISTS app.schema_import_audit (id SERIAL PRIMARY KEY, imported_by INTEGER REFERENCES app.system_users(id), imported_at TIMESTAMPTZ DEFAULT now(), byte_size INTEGER, table_count INTEGER)' to the queries slice (after the existing practice tables, before the index entries). No change to the extraMigrations slice (CREATE TABLE IF NOT EXISTS is already idempotent). No other files changed.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "After InitializeSystemTables runs on an existing DB, SELECT * FROM app.schema_import_audit succeeds. Running InitializeSystemTables twice does not error. The table has columns id, imported_by, imported_at, byte_size, table_count.",
+      "assigned_to": "codex-cli",
+      "reason": "Single CREATE TABLE IF NOT EXISTS addition in InitializeSystemTables (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-009",
+      "reason": "merge conflict: lazy-trigger hub.Broadcast in GetExamQuestions (quiz_controller.go:125) has fmt.Sprintf(, with missing format string literal \u2014 same class of truncation error as TODO-005; causes syntax error and prevents go build",
+      "status": "completed",
+      "orchestrator_fix": "merge-check BLOCKER (truncated fmt.Sprintf format string) fixed inline by orchestrator 2026-05-25: TODO-005 buildExamStatusEvent format string restored (4-arg: UnixMilli,examID,phase,server_time); TODO-009 quiz_controller GetExamQuestions lazy broadcast now reuses buildExamStatusEvent(examID,\"active\") instead of a truncated inline Sprintf. go build ./... and go vet ./... pass."
+    },
+    {
+      "id": "TODO-023",
+      "arch_ref": "ARCH-010",
+      "title": "Write audit row in ExecuteSchemaScript and thread importer user ID through ImportSchema controller",
+      "description": "In backend/internal/repository/postgres.go: change ExecuteSchemaScript signature to ExecuteSchemaScript(ctx context.Context, sql string, importedBy int) error. After the successful r.pool.Exec(ctx, sql) call, run SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname='public' to get tableCount. Then INSERT INTO app.schema_import_audit (imported_by, byte_size, table_count) VALUES ($1, $2, $3) with (importedBy, len(sql), tableCount). In backend/internal/controllers/lecturer_controller.go ImportSchema (around line 265): add 'userVal, _ := c.Get(\"user\"); lecturer := userVal.(models.User)' at the top, then pass lecturer.ID as the third argument to ctrl.repo.ExecuteSchemaScript(ctx, req.SQL, lecturer.ID). The route already uses AuthMiddleware so the user is in context.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go",
+        "backend/internal/controllers/lecturer_controller.go"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-022"
+      ],
+      "done_when": "After POST /lecturer/import-schema succeeds, a row exists in app.schema_import_audit with the correct imported_by (JWT user ID), a byte_size equal to len(posted SQL), and table_count reflecting the public schema count. Project compiles with the updated ExecuteSchemaScript signature.",
+      "assigned_to": "codex-cli",
+      "reason": "Signature extension + audit INSERT across repo + controller (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-024",
+      "arch_ref": "ARCH-010",
+      "title": "Widen import-schema route to RoleLecturer and add confirm dialog guard in LecturerView",
+      "description": "Two changes: (a) In backend/cmd/main.go line 152 (the import-schema route): change controllers.RoleMiddleware(models.RoleAdmin) to controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer). (b) In frontend/src/components/LecturerView.vue handleImportSchema function (around line 455): before the fetch call add: 'const ok = await confirm({title: \"Import schema \u2014 destructive action\", body: \"This will drop and recreate all public tables and data. This cannot be undone. Proceed?\", confirmLabel: \"Import\", danger: true}); if (!ok) return;'. The confirm service is already imported (useConfirm at line 7).",
+      "file_scope": [
+        "backend/cmd/main.go",
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-023"
+      ],
+      "done_when": "A valid Lecturer JWT can POST /api/v1/lecturer/import-schema and receives 200 (not 403). Admin tokens still work. The LecturerView Schema tab shows a confirm danger dialog before posting. Cancelling does not POST. Confirming posts. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "RoleMiddleware widening in main.go + confirm dialog in LecturerView.vue (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-025",
+      "arch_ref": "ARCH-011",
+      "title": "Add GetExamMaxScores repo method, controller handler, and route",
+      "description": "In backend/internal/repository/postgres.go add GetExamMaxScores(ctx context.Context) (map[string]float64, error): SELECT e.title, COALESCE(SUM(q.points), 0.0) FROM app.examinations e LEFT JOIN app.questions q ON q.exam_id=e.id GROUP BY e.id, e.title ORDER BY e.title. Build and return map[string]float64 keyed by title. In backend/internal/controllers/lecturer_controller.go add GetExamMaxScores(c *gin.Context) handler: call ctrl.repo.GetExamMaxScores, return {\"max_scores\": result} as JSON 200, or 500 on error. In backend/cmd/main.go register staff.GET('/lecturer/exams/max-scores', controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamMaxScores). IMPORTANT: This route must be registered BEFORE the staff.GET('/lecturer/exams/:id/...') routes to avoid Gin matching 'max-scores' as an :id parameter.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go",
+        "backend/internal/controllers/lecturer_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "GET /api/v1/lecturer/exams/max-scores returns {max_scores: {ExamTitle: maxPts, ...}}. An exam with no questions returns 0 for that title. Requires Admin or Lecturer token. Registering with a literal route segment 'max-scores' does not conflict with /:id routes. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "New repo query + controller handler + route registration across 3 files (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-026",
+      "arch_ref": "ARCH-011",
+      "title": "Show earned/max + percentage per exam column in LecturerView Results tab",
+      "description": "In frontend/src/components/LecturerView.vue Results tab (around lines 806-840): (a) Add examMaxScores = ref<Record<string, number>>({}) state. Add fetchExamMaxScores() async function: GET /api/v1/lecturer/exams/max-scores with Authorization header; on success set examMaxScores.value = data.max_scores. Call fetchExamMaxScores() inside fetchScores() (so both load when the Results tab is opened). (b) In the table header: update each exam column header from '<title>' to '<title> (max: ' + (examMaxScores.value[title]?.toFixed(0) ?? '?') + ')'. (c) In the table body per-exam cell: replace '{{ s.exam_scores[title]?.toFixed(2) ?? 0.00 }}' with a multi-line cell showing: earned/max (e.g. '45.00 / 100') and on a new line the percentage (e.g. '45%'). Computed as: const max = examMaxScores.value[title]; const earned = s.exam_scores[title] ?? 0; const pct = max > 0 ? Math.round((earned / max) * 100) : null. Display '\u2014' for pct when max is 0 or undefined.",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "complexity": "low",
+      "depends_on": [
+        "TODO-025"
+      ],
+      "done_when": "The Results tab exam column headers show the max score in parentheses. Each student-exam cell shows earned/max and a percentage. When max is 0, percentage shows '\u2014'. fetchExamMaxScores is called when the results tab opens. Project compiles with no TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Results tab UI update to show earned/max + pct in single LecturerView.vue (antigravity lane parked -> forced to codex-cli)"
+    },
+    {
+      "id": "TODO-027",
+      "arch_ref": "ARCH-011",
+      "title": "Verify StudentResults.vue max_score denominator is populated from /quiz/results endpoint",
+      "description": "In backend/internal/repository/postgres.go find GetStudentResultsSummary (called by GetMyResultsSummary). Verify the SELECT includes a max_score column computed as COALESCE(SUM(q.points), 0). If it is missing, add it: join app.questions q on q.exam_id=e.id GROUP BY e.id including SUM(q.points) as max_score. Check backend/internal/models/submission.go ExamResultSummary struct has a MaxScore field. In frontend/src/components/StudentResults.vue confirm ExamResult interface has max_score: number and the template at line 205 uses it (it already shows '{{ exam.total_score }} / {{ exam.max_score }} pts'). If everything is already correct: add a one-line comment above that template line: '<!-- max_score comes from /quiz/results ExamResultSummary.MaxScore, populated by GetStudentResultsSummary query -->'. If the query is missing max_score, fix the query and verify the ExamResultSummary Scan includes it.",
+      "file_scope": [
+        "backend/internal/repository/postgres.go",
+        "frontend/src/components/StudentResults.vue"
+      ],
+      "complexity": "low",
+      "depends_on": [],
+      "done_when": "GET /quiz/results returns max_score > 0 for an exam that has questions with points assigned. StudentResults.vue displays denominator (e.g. '45.00 / 100.00 pts'). Either a code fix was applied (query updated) or a confirming comment was added. Project compiles.",
+      "assigned_to": "codex-cli",
+      "reason": "Verify/fix max_score query in repo + StudentResults.vue denominator display (antigravity lane parked -> forced to codex-cli)"
+    }
+  ],
+  "failed": [],
+  "agent_notes": {
+    "orchestrator": "Round reqbatch-2026-05-25 started from a clean state. Prior P0/P1/P2 history (ARCH-001..032, 81 completed, 9 failed, 20 agent_notes) snapshotted to .pipelinestates/pipeline-state.json.bak.before-reqbatch-2026-05-25 to keep agent context lean. Fresh ARCH/TODO IDs for this round. Source requirements: NEW_ADDITION_REQUIREMENT.md (to be deleted after this round lands). User decisions (2026-05-25): (1) build everything now; (2) student waiting page = SSE realtime start push (not Nginx LB, not WebSocket); (3) lecturer ImportSchema = allow Lecturer role too (re-opens a deliberately-closed security surface, flag in design); (4) scheduled activation = timestamp-driven lazy (no background scheduler). PARKED-LANE RULE: antigravity-implementor is parked -> every TODO routes to codex-cli regardless of complexity.",
+    "architect": "ARCH-001..011 written for round reqbatch-2026-05-25 (10 reqs grouped: R3+D4->ARCH-001/005, R9+R10+D2->ARCH-002/003/009, R1->ARCH-004 [merged with R2], R4->ARCH-006, R5->ARCH-007, R6->ARCH-008, R8+D3->ARCH-010, R7->ARCH-011). ORDERING DEPENDENCIES (todo-creator/task-router MUST honor): (1) ARCH-001 effective-state helper + schema columns is the FOUNDATION \u2014 must land before ARCH-002 (SSE snapshot reads it), ARCH-003 (questions gate), ARCH-005 (activation UI payloads). (2) ARCH-002 SSE hub+endpoint must land before ARCH-003 waiting page and ARCH-009 nginx/poll. (3) ARCH-010 schema_import_audit DDL (idempotent, in InitializeSystemTables) must land before/with the route change. (4) ARCH-006 roster endpoints before the roster UI. All DDL goes through InitializeSystemTables as ADD COLUMN/CREATE TABLE IF NOT EXISTS (idempotent constraint). CRITICAL CODE FACTS for implementors: GetExamByID (postgres.go:1150) currently SELECTs only 5 columns and must be widened for scheduled_*/activated_at/archived_at since SubmitAnswer depends on exam state. The activate route already uses {active:bool}->SetExaminationActive (NOT the API_SPEC pre-flight shape); extend that path, do not invent a parallel one. EventSource cannot send Authorization headers -> SSE auth via ?access_token= query param calling authService.ValidateToken directly (mirrors export-scores ?token= at LecturerView.vue:520). GetStudentExams filters is_active=TRUE so a NEW enrolled-exams variant is required for the waiting-page selection. nginx /api/ block strips Connection/Upgrade and lacks proxy_buffering off -> needs a dedicated stream location. OPEN QUESTIONS surfaced to user (see agent_notes.architect_open_questions).",
+    "architect_open_questions": "OQ1 (ARCH-001/D4): When a scheduled window's scheduled_end_at passes, is_active stays TRUE (so the practice freeze stays on) until the lecturer explicitly deactivates and drops the sandbox. Confirm this is desired, OR should crossing scheduled_end_at auto-archive (drop sandbox) on the next request that observes it? Design currently keeps is_active=true (no auto-drop) to avoid a request accidentally triggering an expensive DROP SCHEMA; lecturer must deactivate to reclaim resources. OQ2 (ARCH-002/D2 + D4): For a SCHEDULED activation with NO background scheduler, students who connect their SSE stream BEFORE scheduled_start_at are only flipped to active when SOMETHING crosses the timestamp. Design relies on the ARCH-009 fallback poll (first enrolled student crossing the boundary fires the lazy trigger -> hub broadcast). Acceptable? Or does the user want a single lightweight time.AfterFunc timer armed at activation (a minimal in-process timer, not a cron) to guarantee a broadcast exactly at scheduled_start_at independent of any poll? The brief says 'no background scheduler/cron' \u2014 a one-shot timer is arguably allowed and removes fallback-poll latency; needs the user's call. OQ3 (ARCH-011/R7): Is a per-student per-question drill-down expansion wanted in the lecturer Results tab, or is 'earned/max + percentage' per exam column sufficient? Design scopes the latter as the committed change and marks drill-down optional. OQ4 (ARCH-007/R5): Confirm 'Exam Roster' / 'Enroll Students' as the new naming (vs alternatives like 'Exam Enrollment'). Recommend keeping the internal activeTab key 'assignments' unchanged to avoid stale-localStorage blank-tab regressions; only user-visible strings change.",
+    "orchestrator_oq_resolution": "OQ resolutions (user, 2026-05-25): OQ1=stop-accepting-but-keep-armed after scheduled_end_at (NO auto-archive; lecturer explicitly deactivates to drop sandbox) -> matches ARCH-001 as written. OQ2=fallback-poll-only for scheduled start (NO one-shot timer / time.AfterFunc); first enrolled student poll crossing scheduled_start_at triggers lazy activation + broadcast -> matches ARCH-002/009 as written. OQ3=per-exam earned/max + percentage is sufficient; per-question drill-down OPTIONAL/deferred (ARCH-011). OQ4=rename exam feature to Exam Roster / Enroll Students but KEEP internal activeTab key value \"assignments\" to avoid stale-localStorage blank-tab regression (ARCH-007). No architect rework required.",
+    "codex.TODO-001": "Added scheduled_start_at/scheduled_end_at to CREATE TABLE block and extraMigrations in postgres.go",
+    "codex.TODO-002": "Added ScheduledStartAt/ScheduledEndAt to Examination struct; added EffectiveState type and ExaminationEffectiveState helper to postgres.go; added RosterStudent model to examination.go",
+    "codex.TODO-003": "Widened GetExamByID, GetAllExaminations, GetStudentExams SELECT to 9 columns including scheduled_start_at/end_at/activated_at/archived_at",
+    "codex.TODO-004": "Extended SetExaminationActive to 5-arg signature with schedule support; added EnsureExamSandboxReady; added SetScheduledEndAt; updated AddStudentsToExam to use ExaminationEffectiveState",
+    "codex.TODO-005": "Updated ActivateExamination to parse mode/schedule payload and call SetExaminationActive(5 args); updated DeactivateExamination for instant vs scheduled modes; added hub stub and buildExamStatusEvent to LecturerController",
+    "codex.TODO-006": "Replaced bare is_active checks with ExaminationEffectiveState in GetExamQuestions/SubmitAnswer/PreviewAnswer; added ExaminationResponse struct with effective_state; GetExams/ListExaminations now return ExaminationResponse; added include_inactive support stub (GetStudentEnrolledExams added in TODO-012)",
+    "codex.TODO-007": "Created backend/internal/services/sse_hub.go with Hub struct, Subscribe, Unsubscribe, Broadcast, Close",
+    "codex.TODO-008": "Added StreamExamStatus handler to quiz_controller.go; updated NewQuizController to accept hub+authService; registered GET /api/v1/quiz/exams/:id/stream in main.go outside auth middleware",
+    "codex.TODO-010": "Added regex SSE location block in nginx.conf before /api/ block with proxy_buffering off, proxy_read_timeout 3600s, proxy_set_header Connection empty",
+    "codex.TODO-011": "Created useExamStream.ts composable with EventSource SSE, watch on examId, onUnmounted cleanup",
+    "codex.TODO-012": "Added GetStudentEnrolledExams repo method; GetExams already updated to use it with include_inactive=true flag (added in TODO-006)",
+    "codex.TODO-013": "Extended useExamStream.ts with 15s setInterval fallback poll; poll clears on active/ended state or unmount",
+    "codex.TODO-014": "Rewrote StudentView.vue with SELECT/WAITING/ACTIVE 3-state machine; imports useExamStream; SSE-driven Start button; all ACTIVE phase logic intact",
+    "codex.TODO-015": "Replaced Question ID numeric input with dropdown in LecturerView.vue; added isEditMode ref, nextFreeId computed, onQuestionDropdownChange handler, override confirm guard in saveQuestion",
+    "codex.TODO-016": "Extended Examination interface in LecturerView.vue; added activateExam/deactivateExamInstant/deactivateExamScheduled functions; added effective_state badges and activation UI controls to Exams tab",
+    "codex.TODO-017": "Added GetExamRoster and RemoveStudentFromExam repo methods to postgres.go; RosterStudent model already added in TODO-002",
+    "codex.TODO-018": "Added GetExamRoster and RemoveStudentFromExam controller handlers in lecturer_controller.go; registered GET+DELETE /lecturer/exams/:id/students and /students/:studentId routes in main.go",
+    "codex.TODO-019": "Added RosterStudent interface, rosterStudents ref, fetchRoster/removeStudentFromRoster functions, watch on selectedExamId; added roster table with count header and Remove button to enrollment panel; roster refreshes after enrolling",
+    "codex.TODO-020": "Renamed Assignments tab to Exam Roster (UI_COPY.EXAM_ROSTER), panel heading to Enroll Students in Exam, button to Enroll N Students; added ENROLL_STUDENTS/EXAM_ROSTER to ui_copy.ts",
+    "codex.TODO-021": "Added formRef, newPracticeQuestion function, New Practice Question button (disabled in create mode), and Editing #N indicator to PracticeAuthoring.vue",
+    "codex.TODO-022": "Added schema_import_audit CREATE TABLE IF NOT EXISTS to InitializeSystemTables queries slice",
+    "codex.TODO-009": "hub.Broadcast already wired in ActivateExamination (done in TODO-005 implementation); buildExamStatusEvent helper in lecturer_controller.go; lazy trigger broadcast in GetExamQuestions in quiz_controller.go",
+    "codex.TODO-023": "Extended ExecuteSchemaScript to accept importedBy int; writes audit row to schema_import_audit with byte_size and table_count; ImportSchema controller passes lecturer.ID",
+    "codex.TODO-024": "Widened import-schema route to RoleLecturer in main.go; added confirm danger dialog before POST in handleImportSchema in LecturerView.vue",
+    "codex.TODO-025": "Added GetExamMaxScores repo method and controller handler; registered GET /lecturer/exams/max-scores BEFORE /:id routes in main.go",
+    "codex.TODO-026": "Added examMaxScores ref + fetchExamMaxScores (called in fetchScores); Results table headers show max in parens; cells show earned/max and percentage",
+    "codex.TODO-027": "Verified: GetStudentResultsSummary already includes max_score in query; ExamResultSummary.MaxScore field exists; StudentResults.vue already shows total_score/max_score; added confirming comment",
+    "merge_check": {
+      "verdict": "CONFLICTS-FOUND",
+      "files_reviewed": 12,
+      "findings": [
+        {
+          "severity": "BLOCKER",
+          "id": "MERGE-001",
+          "file": "backend/internal/controllers/lecturer_controller.go",
+          "line": 46,
+          "todos": [
+            "TODO-005",
+            "TODO-009"
+          ],
+          "issue": "buildExamStatusEvent body is fmt.Sprintf(, \u2014 the format string literal is missing entirely. Go syntax error: unexpected comma, expected expression. The function is called at line 145 by ActivateExamination (TODO-005) and the format string is needed to produce the SSE payload. The truncation happened during the TODO-005/TODO-009 edits to the same file. go build ./... fails because of this."
+        },
+        {
+          "severity": "BLOCKER",
+          "id": "MERGE-002",
+          "file": "backend/internal/controllers/quiz_controller.go",
+          "line": 125,
+          "todos": [
+            "TODO-009"
+          ],
+          "issue": "Lazy-trigger broadcast in GetExamQuestions has ctrl.hub.Broadcast(examID, fmt.Sprintf(, examID, time.Now()...)) \u2014 format string literal missing. Go syntax error: unexpected comma, expected expression. The fmt.Sprintf used identically in StreamExamStatus at line 406 of the same file has the correct format string (\"event: exam-status\nid: %d\ndata: ...\n\n\"), confirming the string was accidentally stripped here. go build ./... fails because of this."
+        },
+        {
+          "severity": "WARNING",
+          "id": "MERGE-003",
+          "file": "backend/internal/controllers/lecturer_controller.go and backend/internal/controllers/quiz_controller.go",
+          "line": "lecturer_controller.go:60-73 vs quiz_controller.go:17-64",
+          "todos": [
+            "TODO-005",
+            "TODO-006"
+          ],
+          "issue": "ExaminationResponse struct is defined once in quiz_controller.go (line 18) in package controllers and is correctly shared by lecturer_controller.go via the same package. No duplication. However ListExaminations in lecturer_controller.go (line 60) builds the response struct inline (not via the examToResponse helper defined in quiz_controller.go at line 50), while GetExams in quiz_controller.go uses the helper. Functional difference: both produce the same shape, but if the struct grows, the inline build in lecturer_controller.go may drift. Not a compile blocker, but a consistency warning for the validator."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-004",
+          "file": "backend/internal/models/examination.go",
+          "todos": [
+            "TODO-002",
+            "TODO-017"
+          ],
+          "issue": "RosterStudent added during TODO-002 (not TODO-017 as planned). TODO-017 codex note acknowledges this. Single definition at line 22 of examination.go \u2014 no duplicate."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-005",
+          "file": "backend/cmd/main.go",
+          "line": "139 vs 147-150",
+          "todos": [
+            "TODO-008"
+          ],
+          "issue": "GET /api/v1/quiz/exams/:id/stream is registered on v1 directly (line 139, outside the quiz auth group), while quiz group (v1.Group(\"/quiz\")) registers /exams/:id/questions and /exams/:id/results. The full expanded paths are identical in prefix (/api/v1/quiz/exams/:id/) but diverge at the child segment (stream vs questions vs results). Gin httprouter handles this correctly; they share the same :id param node and branch on different child paths. No route conflict or panic at startup."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-006",
+          "file": "backend/cmd/main.go",
+          "line": 158,
+          "todos": [
+            "TODO-025"
+          ],
+          "issue": "GET /lecturer/exams/max-scores (line 158) is registered before GET /lecturer/exams/:id/questions (line 159) and all other /:id routes in the staff group. Gin uses static-before-param ordering by design so max-scores is matched as a literal segment and not confused with :id. Correct."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-007",
+          "file": "backend/internal/repository/postgres.go",
+          "todos": [
+            "TODO-001",
+            "TODO-002",
+            "TODO-003",
+            "TODO-004",
+            "TODO-012",
+            "TODO-017",
+            "TODO-022",
+            "TODO-023",
+            "TODO-025"
+          ],
+          "issue": "No duplicate type or function declarations. EffectiveState (line 38), ExaminationEffectiveState (line 50), SetExaminationActive 5-arg (line 1112), EnsureExamSandboxReady (line 1170), SetScheduledEndAt (line 1192), GetStudentEnrolledExams (line 1336), GetExamRoster (line 1363), RemoveStudentFromExam (line 1399), GetExamMaxScores (line 1308), ExecuteSchemaScript 3-arg (line 311) \u2014 each defined exactly once. SELECT statements for GetExamByID/GetAllExaminations/GetStudentExams/GetStudentEnrolledExams all include the 9-column list consistently. Scan calls match column counts."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-008",
+          "file": "backend/internal/services/sse_hub.go",
+          "todos": [
+            "TODO-007"
+          ],
+          "issue": "Hub type defined once. Concurrency: Broadcast acquires RLock, copies channel slice, releases lock before sending (avoids holding lock during channel writes). Unsubscribe acquires write lock before closing channel. No data race between Broadcast and Unsubscribe on the channel close: the channel is removed from the map under write lock before close(), so a concurrent Broadcast copying the map under RLock either includes the channel (safe: non-blocking send) or does not (already removed). Correct."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-009",
+          "file": "frontend/src/components/LecturerView.vue",
+          "todos": [
+            "TODO-015",
+            "TODO-016",
+            "TODO-019",
+            "TODO-020",
+            "TODO-024",
+            "TODO-026"
+          ],
+          "issue": "No duplicate refs or functions (verified via AST scan). All six TODOs touched LecturerView.vue and their edits are spatially separated: question dropdown (line 152-230), exam activation controls (line 409-510), roster table (line 530-600), import confirm guard (line 676-700), results max-scores (line 750-780). No overlapping script regions. Examination interface correctly extended with effective_state, scheduled_start_at, scheduled_end_at, activated_at, archived_at at lines 19-27."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-010",
+          "file": "frontend/src/components/StudentView.vue",
+          "todos": [
+            "TODO-014"
+          ],
+          "issue": "Imports useExamStream from ../composables/useExamStream at line 7. Uses effectiveState, connected, close from the composable at line 66. 3-state machine (select/waiting/active) implemented correctly. All imports resolve."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-011",
+          "file": "frontend/src/composables/useExamStream.ts",
+          "todos": [
+            "TODO-011",
+            "TODO-013"
+          ],
+          "issue": "Single file extended by both TODOs without duplication. EventSource setup and fallback setInterval both present, with correct interval cleanup on active/ended state change, close(), and unmount."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-012",
+          "file": "frontend build",
+          "todos": [
+            "ALL frontend TODOs"
+          ],
+          "issue": "bun run build (vue-tsc -b && vite build) succeeds with zero TypeScript errors and zero type errors. Frontend is clean."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-013",
+          "file": "frontend/nginx.conf",
+          "todos": [
+            "TODO-010"
+          ],
+          "issue": "SSE regex location block (line 34) appears before the generic /api/ block (line 49). Contains proxy_buffering off, proxy_read_timeout 3600s, chunked_transfer_encoding off, proxy_set_header Connection empty. Correct ordering."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-014",
+          "file": "frontend/src/constants/ui_copy.ts",
+          "todos": [
+            "TODO-020",
+            "TODO-016",
+            "TODO-021"
+          ],
+          "issue": "ASSIGN_STUDENTS retained (still used in __tests__/utils/ui_copy.test.ts:36). ENROLL_STUDENTS, EXAM_ROSTER, ACTIVATE_NOW, SCHEDULE_ACTIVATION, DEACTIVATE_NOW, SET_END_TIME, NEW_PRACTICE_QUESTION all added. No duplicates."
+        },
+        {
+          "severity": "OK",
+          "id": "MERGE-015",
+          "file": "backend/internal/controllers/lecturer_controller.go",
+          "todos": [
+            "TODO-005",
+            "TODO-009"
+          ],
+          "issue": "buildExamStatusEvent is defined in lecturer_controller.go (package controllers) and called at line 145 (ActivateExamination). quiz_controller.go (same package) does NOT call buildExamStatusEvent \u2014 it uses an inline fmt.Sprintf at line 125 with a different (broken) format string. There is no naming collision: one definition, used correctly in one place. The broken inline fmt.Sprintf at quiz_controller.go:125 is the separate MERGE-002 blocker."
+        }
+      ],
+      "summary": "Backend go build ./... fails with 3 syntax errors (2 unique causes) in the controllers package. Both are truncated fmt.Sprintf calls where the format string literal was accidentally deleted during the TODO-005/009 edits. All other checks pass: no duplicate type/function declarations anywhere, no stale call sites for the 3 widened signatures (NewQuizController 5-arg, NewLecturerController 2-arg, ExecuteSchemaScript 3-arg), route ordering correct (max-scores before :id, stream outside auth group), model columns consistent across DDL/SELECT/struct, frontend builds cleanly with zero TypeScript errors."
+    },
+    "merge_check_resolution": "CONFLICTS-FOUND -> 2 BLOCKERs resolved inline (Codex rate-limited until 05-29). WARNING MERGE-003 (ListExaminations inline struct vs examToResponse helper) left as-is, forwarded to validator. Backend now: go build OK, go vet OK. Frontend: bun run build OK (per merge-check).",
+    "validator": {
+      "round": "reqbatch-2026-05-25",
+      "verdict_summary": "26 PASS / 1 FAIL",
+      "failed_todo_ids": [
+        "TODO-007"
+      ],
+      "results": {
+        "TODO-001": {
+          "verdict": "PASS",
+          "verified": "Fresh-install CREATE TABLE app.examinations (postgres.go:554-564) includes scheduled_start_at/scheduled_end_at; extraMigrations (postgres.go:667-668) ADD COLUMN IF NOT EXISTS both. Idempotent."
+        },
+        "TODO-002": {
+          "verdict": "PASS",
+          "verified": "models.Examination has ScheduledStartAt/ScheduledEndAt *time.Time (examination.go:13-14). ExaminationEffectiveState (postgres.go:50-64) logic exact: inactive iff !IsActive; scheduled iff !windowOpen; active iff windowOpen&&windowAlive; ended otherwise. windowOpen uses !now.Before(start), windowAlive uses now.Before(end) \u2014 matches half-open [start,end) semantics."
+        },
+        "TODO-003": {
+          "verdict": "PASS",
+          "verified": "GetExamByID (1255), GetAllExaminations (1262), GetStudentExams (1283) all SELECT+Scan 9 columns incl scheduled_*/activated_at/archived_at. Build passes; SubmitAnswer/PreviewAnswer/GetExamQuestions still compile and read full exam."
+        },
+        "TODO-004": {
+          "verdict": "PASS",
+          "verified": "SetExaminationActive 5-arg (postgres.go:1112): pre-flight capture+count check runs BEFORE schedule write regardless of mode (1122-1138), so a scheduled future activation still cannot arm with uncaptured questions. Validates end>start (1118). nil start -> now() (1141). Lazy sandbox only when ActiveNow (1153). EnsureExamSandboxReady (1170) and SetScheduledEndAt (1192) correct."
+        },
+        "TODO-005": {
+          "verdict": "PASS",
+          "verified": "ActivateExamination parses {active,mode,scheduled_*} (lecturer_controller.go:108-148); scheduled requires start (129). DeactivateExamination: scheduled+endAt -> SetScheduledEndAt (keeps armed, no sandbox drop); else instant ArchiveExamination (drops sandbox) (160-178) \u2014 matches OQ1 stop-accepting-but-keep-armed. buildExamStatusEvent format string intact (45-48). NOTE (non-blocking): SetExaminationActive end<=start error is a bare fmt.Errorf so statusForRepoErr returns 500 not the spec'd 400 \u2014 minor."
+        },
+        "TODO-006": {
+          "verdict": "PASS",
+          "verified": "GetExamQuestions (114), SubmitAnswer (219), PreviewAnswer (298) all gate on !ExaminationEffectiveState(exam).ActiveNow. GetExamQuestions also EnsureExamSandboxReady + lazy broadcast. GetExams (66) and ListExaminations (54) both emit effective_state via ExaminationResponse. MERGE-003: ListExaminations builds the struct inline (lecturer_controller.go:62-73) but field-for-field identical to examToResponse incl effective_state/scheduled_* \u2014 frontend receives same shape, NOT a correctness risk; cleanliness nit only."
+        },
+        "TODO-007": {
+          "verdict": "FAIL",
+          "implementor": "codex-cli",
+          "issues": [
+            {
+              "file": "backend/internal/services/sse_hub.go:50-66 and 36-46",
+              "issue": "Broadcast copies the channel set under RLock then releases the lock before the non-blocking send. Unsubscribe removes ch from the map under write lock then close(ch) at line 45 AFTER releasing the lock. Race window: Broadcast snapshots ch -> Unsubscribe removes+closes ch -> Broadcast does `select { case ch <- payload }` on a CLOSED channel -> panic: send on closed channel. Confirmed with `go test -race`: data race + 'panic: send on closed channel' reproduced. This is live in production: a student disconnecting (StreamExamStatus defer Unsubscribe) concurrent with ActivateExamination/lazy-GetExamQuestions Broadcast for the same examID crashes the whole backend process.",
+              "fix": "Do not close the channel in Unsubscribe while a Broadcast may hold a reference. Options: (a) close(ch) INSIDE the write-locked critical section AND have Broadcast send under the read lock (accept holding RLock during non-blocking sends \u2014 sends are non-blocking so this is safe and cheap); or (b) never close subscriber channels \u2014 let Unsubscribe only delete from the map and rely on GC + the handler's ctx.Done() to stop the reader; or (c) guard each channel with a per-sub closed flag / recover() in Broadcast's send. Simplest correct fix: move the send loop in Broadcast under h.mu.RLock and close(ch) under h.mu.Lock in Unsubscribe (a writer cannot run while a reader holds RLock, so no send-on-closed)."
+            }
+          ],
+          "severity": "correctness",
+          "done_when_failed": "done_when: 'After Unsubscribe, Broadcast does not attempt to send to the closed channel' and 'Running with -race flag: no data races detected' \u2014 BOTH violated."
+        },
+        "TODO-008": {
+          "verdict": "PASS",
+          "verified": "StreamExamStatus (quiz_controller.go:362): ID parse, ?access_token= -> ValidateToken (401), exam exists (404), enrollment (403), SSE headers, immediate snapshot from ExaminationEffectiveState (no race), hub.Subscribe + defer Unsubscribe, 20s keepalive ticker, ctx.Done exit. NewQuizController 5-arg wired; route registered on v1 OUTSIDE quiz auth group (main.go:139). NOTE (non-blocking cleanliness): broadcast-event consumer at quiz_controller.go:424 prepends a second 'event: exam-status\\nid:' header onto a payload from buildExamStatusEvent that already contains one, producing a duplicate-header SSE frame. Per SSE spec last event/id wins so it dispatches correctly \u2014 functionally OK, redundant header. Note as follow-up. Depends on FAILED TODO-007 hub: handler code is correct but the hub it calls can panic."
+        },
+        "TODO-009": {
+          "verdict": "PASS",
+          "verified": "Lazy-trigger broadcast in GetExamQuestions (quiz_controller.go:125) reuses buildExamStatusEvent(examID,'active') \u2014 truncated Sprintf fixed. ActivateExamination broadcasts on instant activate (lecturer_controller.go:145). Fallback poll crossing scheduled_start_at fires GetExamQuestions/GetExams effective-state recompute -> broadcast, matching OQ2 no-background-timer."
+        },
+        "TODO-010": {
+          "verdict": "PASS",
+          "verified": "nginx.conf regex location ~ ^/api/v1/quiz/exams/[0-9]+/stream (line 34) precedes generic location /api/ (line 49). Has proxy_buffering off (41), proxy_read_timeout 3600s (43), chunked_transfer_encoding off (44), Connection '' (45)."
+        },
+        "TODO-011": {
+          "verdict": "PASS",
+          "verified": "useExamStream.ts: EventSource to /api/v1/quiz/exams/<id>/stream?access_token=<encoded token>; watch(examId, immediate) opens/closes; exam-status listener updates effectiveState; onUnmounted+close() close stream; connected reflects onopen/onerror."
+        },
+        "TODO-012": {
+          "verdict": "PASS",
+          "verified": "GetStudentEnrolledExams (postgres.go:1336) joins exam_students with NO is_active filter, 9-col scan. GetExams (quiz_controller.go:72) branches on include_inactive=true, builds ExaminationResponse with effective_state both branches. Default stays active-only."
+        },
+        "TODO-013": {
+          "verdict": "PASS",
+          "verified": "15s setInterval fallback poll of /quiz/exams?include_inactive=true while inactive/scheduled; clears on active/ended (poll guard line 43, SSE-driven line 98), close(), unmount. clearPoll before each startPoll prevents leaks."
+        },
+        "TODO-014": {
+          "verdict": "PASS",
+          "verified": "StudentView.vue phase ref select|waiting|active. selectedExamId computed feeds useExamStream (line 63-66). selectExam: active->ACTIVE+fetchQuestions else WAITING (165-173). startExam gated on effectiveState==='active' (188). Start button :disabled when !==active (template 352). goBackToSelect closes stream+resets. Questions only fetched after active (no immediate-questions path)."
+        },
+        "TODO-015": {
+          "verdict": "PASS",
+          "verified": "Question ID is a <select> (template 847); 'Create new question' option sets id=nextFreeId, isEditMode=false (188-189); existing option -> editQuestion+isEditMode=true. Override confirm in saveQuestion (618-626) fires ONLY when !isEditMode && examQuestions has matching id, BEFORE the POST; cancel returns. Editing existing saves without dialog."
+        },
+        "TODO-016": {
+          "verdict": "PASS",
+          "verified": "Examination interface gained effective_state/scheduled_* (LecturerView.vue:24-25). toISOString = new Date(localStr).toISOString() (415-417) used for both start and end. activateExam scheduled requires start (435). deactivateExamInstant guarded by useConfirm danger (465). deactivateExamScheduled sends {mode:scheduled,scheduled_end_at}. Badges via effectiveStateBadgeClass. fetchExams after each action. end>start validation enforced server-side (TODO-004) and surfaced via handleApiError \u2014 acceptance intent met."
+        },
+        "TODO-017": {
+          "verdict": "PASS",
+          "verified": "RosterStudent model (examination.go:22-30) with all fields incl AssignedAt time.Time. GetExamRoster (postgres.go:1363) COALESCE+join+ORDER BY student_number NULLS LAST. RemoveStudentFromExam (1399) returns wrapped ErrExamActive when ExaminationEffectiveState.ActiveNow else DELETEs."
+        },
+        "TODO-018": {
+          "verdict": "PASS",
+          "verified": "GetExamRoster handler returns {count,students} (lecturer_controller.go:184); RemoveStudentFromExam maps ErrExamActive->409 via statusForRepoErr (212-213). Routes registered GET+DELETE /lecturer/exams/:id/students[/:studentId] (main.go:169-170) under staff RoleMiddleware(Admin,Lecturer). AddStudentsToExam guards via ExaminationEffectiveState.ActiveNow (postgres.go:1230)."
+        },
+        "TODO-019": {
+          "verdict": "PASS",
+          "verified": "RosterStudent interface + rosterStudents ref + fetchRoster (watch selectedExamId) + removeStudentFromRoster (useConfirm). 'Enrolled: N students' header (1111) counts ACTUAL roster from GetExamRoster (not multiselect). Per-row Remove disabled when activeExam.effective_state==='active' (1132) \u2014 matches backend ActiveNow guard (scheduled allows remove, consistent). Refreshes after enroll."
+        },
+        "TODO-020": {
+          "verdict": "PASS",
+          "verified": "ui_copy.ts adds ENROLL_STUDENTS/EXAM_ROSTER, keeps ASSIGN_STUDENTS (still referenced in tests). Tab label -> Exam Roster, heading -> Enroll Students in Exam, button -> Enroll N Students. Internal activeTab key 'assignments' unchanged (no stale-localStorage regression)."
+        },
+        "TODO-021": {
+          "verdict": "PASS",
+          "verified": "PracticeAuthoring.vue: formRef (73), newPracticeQuestion()=resetForm+scrollIntoView (88-90), 'New Practice Question' button :disabled=!form.id (229), 'Editing #N' badge when form.id else New-question text (224). Reset Form retained."
+        },
+        "TODO-022": {
+          "verdict": "PASS",
+          "verified": "CREATE TABLE IF NOT EXISTS app.schema_import_audit (postgres.go:648-654) with id/imported_by FK/imported_at/byte_size/table_count. Idempotent, in queries slice."
+        },
+        "TODO-023": {
+          "verdict": "PASS",
+          "verified": "ExecuteSchemaScript 3-arg (postgres.go:311) keeps active-exam 409 gate, runs script, counts public pg_tables, INSERTs audit row with importedBy/len(sql)/tableCount (332-334, best-effort). ImportSchema controller reads JWT user, passes lecturer.ID (lecturer_controller.go:375-378)."
+        },
+        "TODO-024": {
+          "verdict": "PASS",
+          "verified": "import-schema route RoleMiddleware(RoleAdmin, RoleLecturer) (main.go:162). handleImportSchema confirm danger dialog before POST (LecturerView.vue:680). SECURITY TRADE-OFF user-approved per D3 \u2014 flagged, not failed."
+        },
+        "TODO-025": {
+          "verdict": "PASS",
+          "verified": "GetExamMaxScores (postgres.go:1308): title -> COALESCE(SUM(q.points),0.0), LEFT JOIN so no-question exams return 0. Handler returns {max_scores} (lecturer_controller.go:423). Route /lecturer/exams/max-scores (main.go:158) registered BEFORE /lecturer/exams/:id/questions (159) \u2014 static-before-param, no :id collision."
+        },
+        "TODO-026": {
+          "verdict": "PASS",
+          "verified": "Results tab: examMaxScores ref + fetchExamMaxScores called in fetchScores. Header shows '(max: N)' (1162). Cell shows earned/max (1175) and pct = Math.round((earned/max)*100) (1178) with '\u2014' when max 0/undefined. Denominator is exam total max points. Math correct."
+        },
+        "TODO-027": {
+          "verdict": "PASS",
+          "verified": "GetStudentResultsSummary already computes COALESCE(SUM(q.points),0) AS max_score (postgres.go:1817), scanned into ExamResultSummary.MaxScore (submission.go:77). StudentResults.vue shows total_score / max_score pts (206) with confirming comment (205)."
+        }
+      },
+      "merge_warning_disposition": {
+        "MERGE-003": "RESOLVED-NOT-A-RISK: ListExaminations inline ExaminationResponse build (lecturer_controller.go:62-73) is field-for-field identical to examToResponse (quiz_controller.go:50-64), including effective_state and all scheduled_*/activated_at/archived_at. Frontend receives the same shape from both /lecturer/exams and /quiz/exams. Recommend a follow-up refactor to call examToResponse for drift-safety, but it is a cleanliness item, not a correctness failure. PASS."
+      },
+      "additional_observations": [
+        "NON-BLOCKING (TODO-008/009): SSE broadcast frames carry a duplicated 'event: exam-status\\nid:' header (buildExamStatusEvent already emits the full frame, and StreamExamStatus:424 prepends another). Functionally correct per SSE last-field-wins, but emit the payload as-is (write `payload` directly, only prefix a fresh id if needed) to clean up the wire format.",
+        "NON-BLOCKING (TODO-005): SetExaminationActive returns end<=start validation as a bare fmt.Errorf, so statusForRepoErr maps it to HTTP 500 instead of the ARCH-001-specified 400. Consider a dedicated sentinel (e.g. ErrBadSchedule) mapped to 400 for API correctness.",
+        "INFO (TODO-025): GetExamMaxScores keys the result map by exam title; two exams sharing a title would collide. Matches the ARCH-011 spec (map[string]float64 by title) and is acceptable for current single-cohort usage, but titles are not unique in the schema."
+      ]
+    },
+    "validator_failed_list": {
+      "note": "Validator marks these FAILED. Completed entries left in place for the orchestrator to re-route via feedback-loop [8]. Only PASSes (all except TODO-007) should proceed to regression-tester [7].",
+      "failed": [
+        "TODO-007"
+      ]
+    },
+    "validator_resolution": "26 PASS / 1 FAIL. TODO-007 (sse_hub race) FIXED inline. Non-blocking validator follow-ups: (a) doubled SSE event/id header at quiz_controller StreamExamStatus consumer FIXED (now writes the complete frame from buildExamStatusEvent directly); (b) SetExaminationActive end<=start returns bare error -> HTTP 500 not 400 (sentinel) STILL OPEN, low priority; (c) GetExamMaxScores keys by exam title, non-unique titles collide (matches ARCH-011 spec, acceptable). MERGE-003 (inline ExaminationResponse vs examToResponse helper) = not a correctness risk, cleanliness follow-up only.",
+    "preexisting_finding": "PRE-EXISTING (not this round): go test -race flags a data race in submission_queue.go:97/113 via TestSubmissionQueue_ShutdownWaitsForInFlight. submission_queue.go is git-unmodified this round and not in any TODO file_scope. All services tests PASS without -race. Surfaced to user; NOT fixed (out of requirements-batch scope).",
+    "tester": {
+      "round": "reqbatch-2026-05-25",
+      "verdict_summary": "All 37 new tests pass. 0 TODOs moved to failed.",
+      "preexisting_race_note": "PRE-EXISTING (not this round): go test -race ./internal/services/... triggers a data race in submission_queue.go:97/113 (TestSubmissionQueue_ShutdownWaitsForInFlight). submission_queue.go is git-unmodified this round. Hub race test isolated via -run 'TestHub|TestSSE' and passes clean.",
+      "TODO-007": {
+        "tests_added": "backend/internal/services/sse_hub_test.go",
+        "cases": [
+          "(a) Subscribe then Broadcast delivers payload on channel",
+          "(b) Broadcast to exam with no subscribers is a no-op (no panic)",
+          "(c) Full-buffer channel skipped non-blocking; other subscribers still receive",
+          "(d) Unsubscribe removes channel and closes it",
+          "(d-extra) Unsubscribe is idempotent \u2014 second call does not double-close",
+          "Close() closes all channels; subsequent Unsubscribe is safe (no panic)",
+          "(e) CONCURRENCY: 50 goroutines Subscribe/Unsubscribe concurrent with Broadcaster \u2014 go test -race CLEAN, no send-on-closed-channel panic"
+        ],
+        "result": "7/7 tests passed",
+        "race_result": "go test -race -run 'TestHub|TestSSE' ./internal/services/... PASS (0 data races, 0 panics)"
+      },
+      "TODO-002": {
+        "tests_added": "backend/internal/repository/effective_state_test.go",
+        "cases": [
+          "is_active=false -> inactive regardless of schedule",
+          "is_active=true, no schedule -> active",
+          "is_active=true, start in future -> scheduled (not yet active)",
+          "is_active=true, now within [start, end) -> active (half-open semantics)",
+          "is_active=true, now >= end -> ended",
+          "end <= start degenerate case -> ended",
+          "end == start zero-length window (now after) -> ended",
+          "null end with past start -> active (open-ended window)"
+        ],
+        "result": "8/8 tests passed"
+      },
+      "TODO-011_TODO-013": {
+        "tests_added": "frontend/src/__tests__/composables/useExamStream.test.ts",
+        "cases": [
+          "parses exam-status SSE event and updates effectiveState to active",
+          "parses exam-status SSE event with scheduled state",
+          "ignores malformed SSE event data (no throw, state unchanged)",
+          "starts fallback poll after SSE opens; clears poll when SSE fires active",
+          "poll updates effectiveState when API returns active exam",
+          "close() closes the EventSource and stops the fallback poll",
+          "close() on unmount tears down EventSource",
+          "changing examId closes old EventSource and opens new one",
+          "setting examId to null closes stream and resets state to inactive",
+          "opens EventSource with access_token query param from localStorage",
+          "no interval leak on repeated examId changes \u2014 at most 1 poll fires"
+        ],
+        "result": "11/11 tests passed"
+      },
+      "full_frontend_suite": {
+        "result": "209/209 tests passed (23 test files) \u2014 no regressions from LecturerView.vue / StudentView.vue / PracticeAuthoring.vue / ui_copy.ts edits",
+        "command": "npm run test -- --reporter=verbose from frontend/"
+      }
+    }
+  }
+}

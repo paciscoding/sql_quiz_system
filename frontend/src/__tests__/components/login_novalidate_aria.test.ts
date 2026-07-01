@@ -101,6 +101,105 @@ describe('LoginView novalidate + ARIA (TODO-083)', () => {
     wrapper.unmount()
   })
 
+  it('labels are programmatically associated with inputs via for/id', async () => {
+    const router = makeRouter()
+    await router.push('/login')
+    const LoginView = (await import('../../components/LoginView.vue')).default
+    const wrapper = mount(LoginView, {
+      global: { plugins: [router] },
+    })
+    await flushPromises()
+
+    const labels = wrapper.findAll('label')
+    const withFor = labels.filter((l) => l.attributes('for'))
+    // Both the username and password labels must have a `for` attribute
+    expect(withFor.length).toBeGreaterThanOrEqual(2)
+
+    for (const label of withFor) {
+      const forId = label.attributes('for')!
+      const target = wrapper.find(`#${forId}`)
+      expect(target.exists()).toBe(true)
+      expect(target.element.tagName.toLowerCase()).toBe('input')
+    }
+
+    // Explicit assertions for the two specific inputs
+    const usernameInput = wrapper.find('input[autocomplete="username"]')
+    const passwordInput = wrapper.find('input[type="password"]')
+    const usernameId = usernameInput.attributes('id')
+    const passwordId = passwordInput.attributes('id')
+    expect(usernameId).toBeTruthy()
+    expect(passwordId).toBeTruthy()
+    const usernameLabel = wrapper.find(`label[for="${usernameId}"]`)
+    const passwordLabel = wrapper.find(`label[for="${passwordId}"]`)
+    expect(usernameLabel.exists()).toBe(true)
+    expect(passwordLabel.exists()).toBe(true)
+
+    wrapper.unmount()
+  })
+
+  it('login error is announced via role="alert"', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const router = makeRouter()
+    await router.push('/login')
+    const LoginView = (await import('../../components/LoginView.vue')).default
+    const wrapper = mount(LoginView, {
+      global: { plugins: [router] },
+    })
+    await flushPromises()
+
+    await wrapper.find('input[autocomplete="username"]').setValue('user')
+    await wrapper.find('input[type="password"]').setValue('pass')
+    await wrapper.find('form').trigger('submit.prevent')
+    await flushPromises()
+
+    const alert = wrapper.find('[role="alert"]')
+    expect(alert.exists()).toBe(true)
+    expect(alert.text()).toContain('Invalid')
+
+    vi.unstubAllGlobals()
+    wrapper.unmount()
+  })
+
+  it('password show/hide toggle switches input type', async () => {
+    const router = makeRouter()
+    await router.push('/login')
+    const LoginView = (await import('../../components/LoginView.vue')).default
+    const wrapper = mount(LoginView, {
+      global: { plugins: [router] },
+    })
+    await flushPromises()
+
+    const pw = () => wrapper.find('#login-password')
+    expect(pw().attributes('type')).toBe('password')
+
+    await wrapper.find('.pw-toggle').trigger('click')
+    await flushPromises()
+    expect(pw().attributes('type')).toBe('text')
+
+    await wrapper.find('.pw-toggle').trigger('click')
+    await flushPromises()
+    expect(pw().attributes('type')).toBe('password')
+
+    wrapper.unmount()
+  })
+
+  it('both field labels show a visible required marker', async () => {
+    const router = makeRouter()
+    await router.push('/login')
+    const LoginView = (await import('../../components/LoginView.vue')).default
+    const wrapper = mount(LoginView, {
+      global: { plugins: [router] },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('label[for="login-username"]').text()).toContain('*')
+    expect(wrapper.find('label[for="login-password"]').text()).toContain('*')
+
+    wrapper.unmount()
+  })
+
   it('renders without errors', async () => {
     const router = makeRouter()
     await router.push('/login')

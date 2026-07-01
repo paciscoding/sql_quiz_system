@@ -1,0 +1,382 @@
+<script setup lang="ts">
+import { ref, computed, onMounted, watch } from 'vue'
+import type { Examination, RosterStudent } from './types'
+import { handleApiError, toApiError } from '../../services/error_handler'
+import Skeleton from '../Skeleton.vue'
+import EmptyState from '../EmptyState.vue'
+import Spinner from '../Spinner.vue'
+
+interface ConsolidatedScore {
+  student_id: number
+  username: string
+  student_number: string
+  first_name: string
+  last_name: string
+  sec_lec: string
+  sec_lab: string
+  exam_scores: Record<string, number>
+  practice_total: number
+  grand_total: number
+}
+
+interface DrillSubmission {
+  student_id: number
+  question_id: number
+  is_correct: boolean
+  score: number
+}
+
+// Independent exams list for the drill-down <select>
+const exams = ref<Examination[]>([])
+
+const fetchExams = async () => {
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const response = await fetch('/api/v1/lecturer/exams', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (response.ok) {
+      exams.value = (await response.json()) || []
+    } else {
+      throw await toApiError(response, 'Failed to fetch exams')
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to fetch exams' })
+  }
+}
+
+const consolidatedScores = ref<ConsolidatedScore[]>([])
+const loadingScores = ref(false)
+
+const fetchScores = async () => {
+  loadingScores.value = true
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const response = await fetch('/api/v1/lecturer/scores', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (response.ok) {
+      consolidatedScores.value = await response.json()
+    } else {
+      handleApiError(new Error('Failed to fetch scores'), { fallback: 'Failed to fetch scores' })
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to fetch scores' })
+  } finally {
+    loadingScores.value = false
+  }
+  // Also fetch per-exam max scores for the denominators
+  fetchExamMaxScores()
+}
+
+const examMaxScores = ref<Record<string, number>>({})
+
+const fetchExamMaxScores = async () => {
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const resp = await fetch('/api/v1/lecturer/exams/max-scores', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (resp.ok) {
+      const data = await resp.json()
+      examMaxScores.value = data.max_scores || {}
+    }
+  } catch (err) {
+    // Non-fatal: just display '?' for max
+  }
+}
+
+const exportCSV = () => {
+  const token = localStorage.getItem('sql_quiz_token')
+  window.open(`/api/v1/lecturer/export-scores?token=${token}`, '_blank')
+}
+
+const allExamTitles = computed(() => {
+  const titles = new Set<string>()
+  consolidatedScores.value.forEach(s => {
+    Object.keys(s.exam_scores).forEach(t => titles.add(t))
+  })
+  return Array.from(titles).sort()
+})
+
+// --- Results drill-down ---
+const resultsExamId = ref<number | null>(null)
+const drillLoading = ref(false)
+const drillQuestions = ref<any[]>([])
+const drillSubmissions = ref<DrillSubmission[]>([])
+const drillRoster = ref<RosterStudent[]>([])
+
+const drillQuestionStats = computed(() => {
+  return drillQuestions.value.map(q => {
+    const subs = drillSubmissions.value.filter(s => s.question_id === q.id)
+    const attempts = subs.length
+    const correctStudents = new Set(subs.filter(s => s.is_correct).map(s => s.student_id)).size
+    // Average of each distinct student's BEST score (not all attempts)
+    const bestByStudent = new Map<number, number>()
+    subs.forEach(s => {
+      const prev = bestByStudent.get(s.student_id) ?? 0
+      bestByStudent.set(s.student_id, Math.max(prev, s.score || 0))
+    })
+    const distinctStudents = bestByStudent.size
+    const avgScore = distinctStudents > 0
+      ? Array.from(bestByStudent.values()).reduce((acc, v) => acc + v, 0) / distinctStudents
+      : 0
+    return { id: q.id, requirement: q.requirement, attempts, correctStudents, avgScore }
+  })
+})
+
+const drillNotSubmitted = computed(() => {
+  const submittedIds = new Set(drillSubmissions.value.map(s => s.student_id))
+  return drillRoster.value.filter(s => !submittedIds.has(s.student_id))
+})
+
+async function fetchDrillData(examId: number) {
+  drillLoading.value = true
+  drillQuestions.value = []
+  drillSubmissions.value = []
+  drillRoster.value = []
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const [qResp, sResp, rResp] = await Promise.all([
+      fetch(`/api/v1/lecturer/exams/${examId}/questions`, { headers: { 'Authorization': `Bearer ${token}` } }),
+      fetch(`/api/v1/lecturer/exams/${examId}/submissions`, { headers: { 'Authorization': `Bearer ${token}` } }),
+      fetch(`/api/v1/lecturer/exams/${examId}/students`, { headers: { 'Authorization': `Bearer ${token}` } })
+    ])
+    if (qResp.ok) {
+      drillQuestions.value = await qResp.json()
+    }
+    if (sResp.ok) {
+      drillSubmissions.value = await sResp.json()
+    }
+    if (rResp.ok) {
+      const rData = await rResp.json()
+      drillRoster.value = rData.students || []
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load drill-down data' })
+  } finally {
+    drillLoading.value = false
+  }
+}
+
+watch(resultsExamId, (id) => {
+  if (id !== null) {
+    fetchDrillData(id)
+  } else {
+    drillQuestions.value = []
+    drillSubmissions.value = []
+    drillRoster.value = []
+  }
+})
+
+onMounted(() => {
+  fetchExams()
+  fetchScores()
+})
+</script>
+
+<template>
+  <div class="lecturer-form card">
+    <div class="results-header">
+      <h2>Consolidated Student Performance</h2>
+      <button @click="exportCSV" class="secondary-btn" style="margin: 0;">Export Scores (CSV)</button>
+    </div>
+
+    <!-- Exam filter for drill-down -->
+    <div class="input-group" style="max-width: 400px;">
+      <label>View:</label>
+      <select v-model.number="resultsExamId">
+        <option :value="null">All exams (consolidated)</option>
+        <option v-for="e in exams" :key="e.id" :value="e.id">{{ e.title }} (ID: {{ e.id }})</option>
+      </select>
+    </div>
+
+    <!-- Consolidated view (when no specific exam selected) -->
+    <template v-if="resultsExamId === null">
+      <Skeleton v-if="loadingScores" variant="table-row" :rows="5" :cols="6" />
+      <EmptyState v-else-if="!loadingScores && consolidatedScores.length === 0" title="No scores yet" body="Once students submit answers, their scores appear here." />
+      <div v-else class="preview-table-wrap sticky-table-head">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              <th>Std #</th>
+              <th>Username</th>
+              <th>Name</th>
+              <th>Sec (Lec/Lab)</th>
+              <th v-for="title in allExamTitles" :key="title">
+                {{ title }}<br /><span class="muted" style="font-size: 0.75rem; font-weight: 400;">(max: {{ examMaxScores[title] !== undefined ? examMaxScores[title].toFixed(0) : '?' }})</span>
+              </th>
+              <th>Practice</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in consolidatedScores" :key="s.student_id">
+              <td>{{ s.student_number || '—' }}</td>
+              <td>{{ s.username }}</td>
+              <td>{{ s.first_name }} {{ s.last_name }}</td>
+              <td>{{ s.sec_lec }} / {{ s.sec_lab }}</td>
+              <td v-for="title in allExamTitles" :key="title">
+                <span>{{ (s.exam_scores[title] ?? 0).toFixed(2) }} / {{ examMaxScores[title] !== undefined ? examMaxScores[title].toFixed(0) : '?' }}</span>
+                <br />
+                <span class="muted" style="font-size: 0.8rem;">
+                  {{ examMaxScores[title] && examMaxScores[title] > 0 ? Math.round(((s.exam_scores[title] ?? 0) / examMaxScores[title]) * 100) + '%' : '—' }}
+                </span>
+              </td>
+              <td style="font-weight: 800;">{{ s.practice_total.toFixed(2) }}</td>
+              <td style="font-weight: 900; color: var(--color-primary);">{{ s.grand_total.toFixed(2) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
+    <!-- Per-exam drill-down view -->
+    <template v-else>
+      <Spinner v-if="drillLoading" inline />
+      <template v-else>
+        <!-- Per-question difficulty table -->
+        <div style="margin-top: var(--space-4);">
+          <h3 style="margin-bottom: var(--space-2);">Question Difficulty</h3>
+          <EmptyState v-if="drillQuestions.length === 0" :compact="true" title="No questions" body="This exam has no questions yet." />
+          <div v-else class="preview-table-wrap sticky-table-head">
+            <table class="preview-table">
+              <thead>
+                <tr>
+                  <th>Q#</th>
+                  <th>Requirement</th>
+                  <th>Attempts</th>
+                  <th>Students Correct</th>
+                  <th>Avg Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="qs in drillQuestionStats" :key="qs.id">
+                  <td>{{ qs.id }}</td>
+                  <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ qs.requirement }}</td>
+                  <td>{{ qs.attempts }}</td>
+                  <td>{{ qs.correctStudents }}</td>
+                  <td>{{ qs.avgScore.toFixed(2) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Not-yet-submitted students -->
+        <div style="margin-top: var(--space-4);">
+          <h3 style="margin-bottom: var(--space-2);">Not Yet Submitted</h3>
+          <EmptyState v-if="drillNotSubmitted.length === 0 && drillRoster.length > 0" :compact="true" title="All students have submitted" body="Every enrolled student has at least one submission." />
+          <EmptyState v-else-if="drillRoster.length === 0" :compact="true" title="No enrolled students" body="Enroll students from the Exam Roster tab." />
+          <div v-else-if="drillNotSubmitted.length > 0" class="preview-table-wrap sticky-table-head">
+            <table class="preview-table">
+              <thead>
+                <tr>
+                  <th>Student #</th>
+                  <th>Name</th>
+                  <th>Sec (Lec/Lab)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="s in drillNotSubmitted" :key="s.student_id">
+                  <td>{{ s.student_number || s.username }}</td>
+                  <td>{{ s.first_name }} {{ s.last_name }}</td>
+                  <td>{{ s.sec_lec }} / {{ s.sec_lab }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
+    </template>
+  </div>
+</template>
+
+<style scoped>
+.card {
+  background: var(--color-surface);
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+  margin-bottom: var(--space-4);
+}
+
+.lecturer-form {
+  background: var(--color-surface);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.results-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-4);
+}
+
+.secondary-btn {
+  padding: var(--space-2) var(--space-4);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  border: 2px solid var(--color-border);
+  font-weight: 700;
+  cursor: pointer;
+  margin-bottom: var(--space-4);
+  transition: none;
+}
+
+.secondary-btn:hover {
+  background-color: var(--color-surface-muted);
+}
+
+.secondary-btn:active {
+  transform: translateY(1px);
+}
+
+.input-group {
+  display: flex;
+  flex-direction: column;
+}
+
+label {
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+  font-size: 0.95rem;
+  color: var(--color-text);
+}
+
+select {
+  padding: 0.6rem;
+  border: 2px solid var(--color-border);
+  border-radius: 0;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+h2 {
+  color: var(--color-text);
+  font-weight: 700;
+  margin: 0 0 var(--space-3) 0;
+  font-size: 1.1rem;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+.preview-table-wrap { margin-top: 10px; overflow-x: auto; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-surface); }
+.preview-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; background: var(--color-surface); color: var(--color-text); }
+.preview-table th, .preview-table td { border-bottom: 1px solid var(--color-border-soft); padding: 6px 10px; text-align: left; }
+.preview-table th { background: var(--color-surface-sunk); color: var(--color-text); font-weight: 700; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.preview-table tr:nth-child(even) td { background: var(--color-surface-muted); }
+
+@media (max-width: 767.98px) {
+  .results-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+</style>

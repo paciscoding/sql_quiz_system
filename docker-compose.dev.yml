@@ -1,0 +1,20 @@
+# OPT-IN dev overlay — NOT auto-merged (named *.dev.yml, not *.override.yml), so it
+# never touches the production / Cloudflare-tunnel deployment.
+#
+# Use it only when you want the backend and/or Postgres reachable from the host
+# (e.g. to point Vite straight at the backend, or to run the backend via `go run`):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db backend
+#
+# Ports are bound to 127.0.0.1 only, so nothing is exposed beyond this machine.
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  backend:
+    ports:
+      - "127.0.0.1:8080:8080"
+    # Allow the Vite dev origin (harmless even though the proxy makes it same-origin).
+    environment:
+      ALLOWED_ORIGINS: "http://localhost,http://localhost:80,http://localhost:5173"

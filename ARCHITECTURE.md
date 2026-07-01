@@ -21,6 +21,7 @@ The database is split across several logical schemas, each with a distinct role 
 | `app`                                 | System tables (see below). Always present.                                                       |
 | `public`                              | Curriculum tables imported by the lecturer. Treated as a clean template; **frozen** for the duration of any active examination. SELECT (Query) submissions read directly from here under the `exam_student_readonly` role. |
 | `sandbox_exam_{examID}`               | Shared per-exam sandbox cloned from `public.*` once at activation. Used by **DML** submissions only; pure-SELECT exams skip cloning entirely. All students of the same exam read and write the same physical tables here, serialised by the global in-process FIFO submission queue (single worker, capacity 256, 30 s per-job timeout); each submission's writes are reverted by `ROLLBACK TO SAVEPOINT`. Dropped on deactivation. |
+| `curriculum_exam_{examID}`            | Per-exam curriculum schema (optional). A lecturer imports a database into it via `POST /api/v1/lecturer/exams/:id/curriculum/import`; the exam's Phase-0 Correct Result capture, Phase-2 SELECT read-path, and Phase-1 sandbox clone all source from here. Falls back to the shared `public` schema when `app.examinations.curriculum_schema = 'public'` (the default), preserving the original single-template behaviour. Dropped when the examination is hard-deleted. See `practice_cat_{categoryID}` for the precedent pattern. |
 | `practice_cat_{categoryID}`           | Per-practice-category database. Each `app.practice_categories` row owns one schema into which a lecturer imports a `.sql` (POST `/api/v1/lecturer/practice/categories/:id/import`). Practice questions belong to a category (FK `practice_questions.category_id`) and both their SELECT and DML submissions run against the category's own schema, isolated from `public`. DML uses savepoint-rollback; SELECT reads the category schema under `exam_student_readonly`. This is what keeps practice databases separate from the exam curriculum. |
 | `sandbox_practice`                    | **Deprecated** (retained one release for rollback; scheduled for removal). Former persistent shared practice sandbox cloned from `public.*`. Superseded by per-category `practice_cat_{id}` schemas; no longer used by the submission path. |
 
@@ -58,7 +59,8 @@ Examination evaluation is split into four phases, gated on `app.examinations.is_
 2. **Sandbox preparation** — If the exam contains at least one DML question, `InitializeExamSandbox(examID)` runs once: `CREATE SCHEMA IF NOT EXISTS sandbox_exam_{examID}`, grant `exam_student` CRUD on it, then for each `public.*` table `CREATE TABLE sandbox_exam_{examID}.x (LIKE public.x INCLUDING ALL); INSERT INTO … SELECT * FROM public.x`. The clone happens at activation, not lazily on first submission. A row is upserted into `app.exam_sandboxes`. Pure-SELECT exams skip this step entirely.
 3. **Freeze** — On success, `is_active = true`, `activated_at = now()`. While active:
    - `UpsertQuestion` for any question of this exam → 409.
-   - `ImportSchema` → 409 (would invalidate every active exam's cache and any active sandbox clone).
+   - `ImportSchema` (global, targeting `public.*`) → 409 (would invalidate every active exam's cache and any active sandbox clone).
+   - `ImportExamCurriculum` (`POST /lecturer/exams/:id/curriculum/import`) → 409 **for this exam only** — the per-exam curriculum import is gated per-exam (blocked only while that specific exam is active, not globally). A lecturer may import curriculum for a different inactive exam while this one runs.
    - `AssignStudents` for this exam → 409.
    - Only `DeactivateExamination` is permitted on the exam itself.
 
@@ -102,9 +104,14 @@ The savepoint+rollback pattern guarantees the shared sandbox returns to its acti
 Phase 2 compares the student's result-set against `app.questions.expected_result` (captured in Phase 0). Layered checks:
 1. **Result Set Match** — full-score path. Comparison is over canonical JSON (sorted keys; row order honored only if `strict_ordering = true`).
 2. **Attribute Strictness** (lecturer-toggleable, `strict_attributes`) — column names compared against `expected_columns`.
-3. **Syntax Errors** — captured from PG, returned to the student verbatim, score = 0.
+3. **Column Order** (lecturer-toggleable, `strict_column_order`) — when on, the student's output columns must appear in the same left-to-right order as `expected_columns`, compared index-by-index. This is an **independent** pass/fail gate: it is evaluated separately from `strict_ordering` and `strict_attributes`, and does not imply either. Default `false`; existing questions are unaffected.
+4. **Syntax Errors** — captured from PG, returned to the student verbatim, score = 0.
 
 *Row-order strictness is controlled by the `strict_ordering` flag — when off, comparison is set-equality (multiset of rows); when on, the student's rows must appear in the same order as the teacher's.*
+
+**`expected_columns` capture order.** To make the Column Order check meaningful, `expected_columns` is populated from the PostgreSQL field-descriptor array returned by the driver (true SQL left-to-right column order), not from Go map iteration. The student's output column order is captured the same way in the evaluation path and compared index-by-index against `expected_columns`.
+
+**DB columns.** Both `app.questions` and `app.practice_questions` carry `strict_column_order BOOLEAN NOT NULL DEFAULT FALSE`. For exam questions the flag is nested in the `strict_mode` JSON object on the wire (`"column_order": bool`); for practice questions it is a top-level field (`"strict_column_order": bool`).
 
 ### 2. DML Validation (Insert / Update / Delete)
 Phase 2 evaluates DML inside the shared per-exam sandbox, serialised by the global in-process FIFO submission queue:
@@ -159,7 +166,7 @@ The legacy "Backup → Teacher → Diff → Restore" loop and the `ResetTable(sc
     *   **A:** Bounded by the curriculum's largest table or a configured row cap. Stored as `jsonb`. Phase 0 capture refuses to commit if the row count exceeds a configurable limit (default: 10,000) and writes `capture_error = "result-set too large"` so the issue surfaces at Phase 0 rather than Phase 2.
 
 ### 5. Implementation Details
-*   **Database Structure:** Lecturers import any custom SQL schema (e.g., Elmasri Company) via the dashboard. The import populates `public.*`; system tables in `app.*` are never touched. `ImportSchema` is gated on no examination being active.
+*   **Database Structure:** Lecturers import a custom SQL schema (e.g., Elmasri Company) per exam from the exam's authoring workspace, which populates that exam's own `curriculum_exam_{id}` (API 9.5) and is gated only on *that* exam being active. The legacy global import that populates the shared `public.*` (`ImportSchema`, gated on *no* examination being active) is retained for scripting / backward-compatibility but is no longer surfaced in the dashboard. Either way, system tables in `app.*` are never touched.
 *   **Lecturer Answer Submission:** `UpsertQuestion` triggers Correct Result capture inline. The response body returns `expected_result_status` and `capture_error`. Capture failures **do not** roll back the upsert — the row is saved with `expected_result_status = 'failed'` so the lecturer can fix and retry. Activation will refuse to start as long as any question is in `failed` or `pending` state.
 *   **Roster Import Pipeline:** The lecturer-facing bulk import endpoint (`POST /api/v1/lecturer/students/import`) accepts a multipart file upload (`.csv` via `encoding/csv`; `.xlsx` via `github.com/xuri/excelize/v2`; format detected by filename extension). `ParseRoster` reads the file with a case-insensitive header alias map and returns a slice of `ParsedStudentRow`. `StudentImportService.Import` opens a single database transaction and iterates the slice: for each row it establishes a `SAVEPOINT`, calls `UpsertStudentByNumber` (SQL `INSERT … ON CONFLICT (student_number) … DO UPDATE` — `password_hash` is intentionally excluded from the `UPDATE` clause so re-importing the roster does not reset a student's changed password), then releases the savepoint on success or rolls it back on failure and appends to the per-row `errors[]` array. The outer transaction commits once all rows are processed; the response always includes `{total, created, updated, skipped, errors}`.
 *   **Schema Migrations:** New columns and tables are added via idempotent `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE … ADD COLUMN IF NOT EXISTS` from `InitializeSystemTables` at backend startup. No external migration tool is required, but every DDL statement in `InitializeSystemTables` must be idempotent.
@@ -229,7 +236,20 @@ The SPA is organised around small, single-responsibility primitives. Three round
 - **`services/`** — module-singleton state: `auth`, `confirm_service`, `error_handler`, `notification_service`, plus API clients (`practice.ts`, etc.).
 - **`utils/`** — pure helpers: `format_date` (Intl.DateTimeFormat + relative time), `format_sql` (sql-formatter wrapper).
 - **`constants/`** — `ui_copy.ts` (`UI_COPY`) governs button labels.
-- **`__tests__/`** — Vitest + happy-dom test files mirroring the directories above (22 files, 198 cases).
+- **`components/lecturer/`** — the lecturer examination authoring UI, decomposed into single-responsibility panels (see *Lecturer examination workspace* below).
+- **`__tests__/`** — Vitest + happy-dom test files mirroring the directories above (29 files, 299 cases).
+
+### Lecturer examination workspace (master → detail)
+The lecturer authoring UI (`/lecturer`) is a master/detail flow under `components/lecturer/`, split out of a former 1894-line monolith into focused files:
+- **`LecturerView.vue`** — slim shell; sole owner of the exam list (`exams` + `fetchExams()`) and `selectedExamId`. Renders `ExamListPanel` when nothing is selected, else `ExamWorkspace`. Children emit `changed`; the shell re-runs `fetchExams()` so list-visible readiness counts stay fresh.
+- **`ExamListPanel.vue` / `ExamCard.vue`** — the list: a create-exam form plus one self-contained card per exam carrying inline rename, the readiness summary, and **activation / scheduling / deactivation** (exam-"event" creation lives at the list level, not inside the detail). Cards emit `open` / `changed` / `deleted`.
+- **`ExamWorkspace.vue`** — the detail view, mounted with `:key="exam.id"` so panels fully remount per exam; a "← Back" control plus a **Schema / Questions / Roster** sub-tab bar (tab state is in-memory, not persisted).
+- **`ExamSchemaPanel.vue`** — imports into the exam's **own** `curriculum_exam_{id}` via `importExamCurriculum()` (API 9.5) with a 409 → confirm-replace retry. The legacy shared-`public` import (API 9) is no longer surfaced in the UI.
+- **`ExamQuestionsPanel.vue`** — question CRUD, preview (sends `exam_id` so it resolves the exam's curriculum), Phase-0 capture status, strict-mode flags, the description + intro-image editor, and requirement autosave (localStorage key scoped per exam).
+- **`ExamRosterPanel.vue`** — enrollment (bulk import + multi-select) and the roster table. Destructive actions (delete exam, remove student) are gated on `effective_state === 'active'`, protecting a scheduled-active exam.
+- **`types.ts`** — shared interfaces (`Examination`, `Student`, `RosterStudent`, `CaptureStatus`, `PreviewResult`) imported by every panel to avoid drift.
+
+Results are **not** a tab here — they live on a dedicated, role-gated page (see *Auth + routing*).
 
 ### Auth + routing
 - Auth state lives in `services/auth.ts > useAuth()` (`user`, `isLoggedIn`, `login`, `logout`, `hydrateFromStorage`). Components never read `localStorage` directly.
@@ -239,6 +259,7 @@ The SPA is organised around small, single-responsibility primitives. Three round
   3. Role check (`meta.allowedRoles`) with an **ADMIN wildcard short-circuit** — ADMIN passes any route whose `meta.adminBlocked !== true`. `/practice` opts out because student submissions there are recorded under the submitting user_id and would pollute analytics.
   4. Fall-through.
 - A 404 catch-all (`path: '/:pathMatch(.*)*'`) and `/403` page exist and are kept reachable for logged-in users.
+- The lecturer **Results** page (`/lecturer/results` → lazy `components/lecturer/LecturerResults.vue`) is gated `meta.allowedRoles: ['ADMIN', 'LECTURER']` (ADMIN via the wildcard; no `adminBlocked`). It owns its own data lifecycle — consolidated scores, per-exam drill-down, and CSV export — independent of the `/lecturer` authoring shell. A STUDENT hitting this path is redirected to `/403`.
 
 ### Forms and errors
 - Validated forms carry `novalidate`; `useFormValidation` owns error display via `<FieldError>` (`role="alert"`) with `aria-invalid`/`aria-describedby` bound on each input.

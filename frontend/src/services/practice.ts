@@ -66,6 +66,7 @@ export interface PracticeQuestion {
   points: number
   strict_ordering: boolean
   strict_attrs: boolean
+  strict_column_order: boolean
   expected_result?: any
   expected_columns?: any
   expected_result_status: string

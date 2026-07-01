@@ -1,0 +1,52 @@
+{
+  "project": "exam-feedback-batch-2026-06-29",
+  "arch_decisions": [
+    {
+      "id": "ARCH-001",
+      "title": "Student exam layout: stack by default, two-column only for narrow result tables",
+      "detail": "StudentView.vue .pane-grid is hard-coded grid-template-columns: 1fr 1fr, forcing brief+answer side-by-side and overflowing the answer form. Change default to single-column (answer panel below brief). Add a computed that switches to two-column ONLY when the brief's expected-result table has <= 4 columns (narrow, >0). DML questions (no expected table) stay stacked. Use scoped styles in StudentView.vue; do NOT touch global style.css."
+    },
+    {
+      "id": "ARCH-002",
+      "title": "Lecturer inline preview of exam description + images",
+      "detail": "ExamQuestionsPanel.vue only has a plain textarea for the introduction and a separate IntroImagesEditor (props: scope:'exam', ownerId:number). Add an inline 'Preview' toggle button revealing a panel that renders the current introduction text (white-space: pre-wrap, plain text, NEVER v-html) plus the uploaded intro images the way the student sees them. Read images via listExamIntroImages(props.exam.id) from services/schemaImages.ts."
+    },
+    {
+      "id": "ARCH-003",
+      "title": "Specific, truthful image-upload error messages",
+      "detail": "Backend UploadExamIntroImage (lecturer_controller.go ~709) returns 413 for BOTH per-file (>5MB) and aggregate (>25MB), and a generic 415 for bad magic bytes. Frontend schemaImages.ts hardcodes status 413 -> Error('too large') and 415 -> Error('unsupported format'); IntroImagesEditor.mapUploadError turns 'too large' into 'Aggregate intro-image size exceeds 25 MB' which is WRONG for a single oversized file. Backend: emit distinct, specific messages (per-file too large with the 5MB limit; aggregate too large with 25MB; unsupported/corrupted naming what was detected; empty/truncated). Frontend: stop overriding 413/415 with hardcoded strings; surface the backend body.error verbatim (keep 401->forceLogout). Keep magic-byte validation (PNG 0x89504E47, JPEG 0xFFD8FF)."
+    },
+    {
+      "id": "ARCH-004",
+      "title": "Exam Test Run shows row preview only; SQL errors only, no correctness",
+      "detail": "PreviewAnswer (quiz_controller.go ~277) returns status correct/incorrect + feedback via ValidatePreview->decideStatus. ValidatePreview is SHARED with practice mode (practice_controller.go:150) so do NOT change it globally. In PreviewAnswer ONLY: if status is 'correct' or 'incorrect', replace status with neutral 'preview' and blank the feedback, and do not send score, so correctness can't be read in devtools. Keep status 'syntax_error' + its feedback. Frontend StudentView.vue test-run panel: render the ResultTable + truncation note always; show the SQL error text ONLY when status==='syntax_error'; never show a pass/fail badge or correctness feedback for the test run."
+    },
+    {
+      "id": "ARCH-005",
+      "title": "Lecturer per-question Avg Score = best-per-student",
+      "detail": "LecturerResults.vue drillQuestionStats computes avgScore = sum(all attempts)/attempt_count over ALL submissions (skews toward students with many attempts). Recompute: best (max) score per distinct student_id, then average those per-student bests. Reads raw submissions from ListSubmissions, so it is independent of ARCH-006."
+    },
+    {
+      "id": "ARCH-006",
+      "title": "Exam question score = best attempt (not latest) across the backend",
+      "detail": "When a student submits wrong then correct, the scored value must be the BEST attempt, not the latest (which can be lower/zero). postgres_results.go uses latest-per-question in three places; change each to best-by-score (ORDER BY ... score DESC, submitted_at DESC tie-break): GetStudentExamResults (DISTINCT ON (s.question_id), pick max-score row's sql_text/validation_details), GetStudentResultsSummary (latest_submissions CTE), GetConsolidatedScores (LatestSubmissions CTE; may rename to BestSubmissions). Makes student detail, student summary, and lecturer gradebook all show best score."
+    }
+  ],
+  "todos": [
+    {"id": "TODO-1", "title": "Student exam UX: stacked/2-col layout + test-run table-only", "arch_ref": "ARCH-001,ARCH-004", "assigned_to": "claude-implementor", "parallel_group": "G-student-ux", "complexity": "medium", "file_scope": ["frontend/src/components/StudentView.vue"], "depends_on": [], "done_when": ".pane-grid is single-column by default with the answer panel below the brief; a computed switches to two-column only when expected_columns.length>0 && <=4; the test-run/preview panel shows only the ResultTable (+ truncation note), shows error text only when status==='syntax_error', and never shows a correctness badge or correctness feedback; vue-tsc passes."},
+    {"id": "TODO-2", "title": "Lecturer description+image preview toggle + real upload errors (frontend)", "arch_ref": "ARCH-002,ARCH-003", "assigned_to": "claude-implementor", "parallel_group": "G-lecturer-authoring", "complexity": "medium", "file_scope": ["frontend/src/components/lecturer/ExamQuestionsPanel.vue", "frontend/src/components/IntroImagesEditor.vue", "frontend/src/services/schemaImages.ts"], "depends_on": [], "done_when": "ExamQuestionsPanel has a Preview toggle showing intro text (pre-wrap, not v-html) + intro images as the student sees them; schemaImages.ts no longer overrides 413/415 with hardcoded strings and surfaces backend body.error verbatim (401 still forceLogout); IntroImagesEditor.mapUploadError passes the server message through; vue-tsc passes."},
+    {"id": "TODO-3", "title": "Lecturer per-question Avg Score = best-per-student", "arch_ref": "ARCH-005", "assigned_to": "claude-implementor", "parallel_group": "G-lecturer-results", "complexity": "low", "file_scope": ["frontend/src/components/lecturer/LecturerResults.vue"], "depends_on": [], "done_when": "drillQuestionStats avgScore = average over distinct students of each student's MAX score; attempts count unchanged; vue-tsc passes."},
+    {"id": "TODO-4", "title": "Backend: neutralize test-run correctness, precise upload errors, best-by-score scoring", "arch_ref": "ARCH-003,ARCH-004,ARCH-006", "assigned_to": "claude-implementor", "parallel_group": "G-backend", "complexity": "high", "file_scope": ["backend/internal/controllers/quiz_controller.go", "backend/internal/controllers/lecturer_controller.go", "backend/internal/repository/postgres_results.go"], "depends_on": [], "done_when": "PreviewAnswer maps correct/incorrect -> status 'preview' with blank feedback and no score, keeps syntax_error+feedback; UploadExamIntroImage returns distinct specific messages for per-file too large vs aggregate vs unsupported/corrupted vs empty; postgres_results.go GetStudentExamResults, GetStudentResultsSummary, GetConsolidatedScores all order best-by-score (score DESC, submitted_at DESC); go build ./... and existing go tests pass."}
+  ],
+  "in_progress": [],
+  "completed": ["TODO-1", "TODO-2", "TODO-3", "TODO-4"],
+  "failed": [],
+  "agent_notes": {
+    "claude": {
+      "TODO-1": "StudentView.vue: added briefTwoCol computed (1..4 expected_columns -> .pane-grid--cols2 = 1fr 1fr; base now 1fr; media query forces 1fr). Test-run panel: added 'preview' to PreviewResult.status union; removed correctness badge + unconditional feedback; error <p> only when status==='syntax_error'; kept ResultTable + truncation note. badgeClassFor/statusLabel retained (still used by final-submission panel). vue-tsc clean.",
+      "TODO-2": "ExamQuestionsPanel.vue: Preview toggle (showIntroPreview) renders intro text pre-wrap (no v-html) + image stack via examImageBlobUrl(exam.id,img.id) (same mechanism as IntroImagesEditor.loadThumbs); onUnmounted revokes blob URLs. schemaImages.ts: removed hardcoded 413/415 branches in BOTH uploadExamIntroImage and uploadCategoryIntroImage; non-2xx (except 401) now surfaces body.error. IntroImagesEditor.mapUploadError simplified to return raw || 'Upload failed.'. vue-tsc clean.",
+      "TODO-3": "LecturerResults.vue: drillQuestionStats avgScore now = avg over distinct students of each student's MAX score (Map<student_id,max>); attempts and return shape unchanged. vue-tsc clean.",
+      "TODO-4": "quiz_controller.go PreviewAnswer: correct/incorrect -> status 'preview' + blank feedback (syntax_error untouched, no score field). lecturer_controller.go UploadExamIntroImage: read-fail -> 'the image file is empty or truncated'; bad magic -> diagnostic 415 message; per-file/aggregate messages already distinct. postgres_results.go: GetStudentExamResults / GetStudentResultsSummary / GetConsolidatedScores (CTE renamed BestSubmissions) all ORDER BY score DESC, submitted_at DESC. go build + go test ./... pass."
+    }
+  }
+}

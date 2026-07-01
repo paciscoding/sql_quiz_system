@@ -51,7 +51,7 @@ func (s *ValidationService) Validate(ctx context.Context, studentID int, questio
 		return models.ValidationResult{}, fmt.Errorf("failed to parse captured student data: %w", err)
 	}
 
-	return s.decideStatus(result, studentData, question), nil
+	return s.decideStatus(result, studentData, result.Columns, question), nil
 }
 
 // ValidatePreview runs the student SQL in a read-only sandbox and returns the
@@ -77,11 +77,11 @@ func (s *ValidationService) ValidatePreview(ctx context.Context, studentID int, 
 		}, pr.Rows, pr.Columns, pr.RowCount, pr.Truncated, nil
 	}
 
-	finalResult := s.decideStatus(pr.Result, pr.Rows, q)
+	finalResult := s.decideStatus(pr.Result, pr.Rows, pr.Columns, q)
 	return finalResult, pr.Rows, pr.Columns, pr.RowCount, pr.Truncated, nil
 }
 
-func (s *ValidationService) decideStatus(execResult models.ValidationResult, studentData []map[string]interface{}, q models.Question) models.ValidationResult {
+func (s *ValidationService) decideStatus(execResult models.ValidationResult, studentData []map[string]interface{}, studentColumns []string, q models.Question) models.ValidationResult {
 	var teacherData []map[string]interface{}
 	if err := json.Unmarshal(q.ExpectedResult, &teacherData); err != nil {
 		// Should not happen for well-formed questions; return incorrect
@@ -90,6 +90,22 @@ func (s *ValidationService) decideStatus(execResult models.ValidationResult, stu
 		execResult.Score = 0
 		execResult.Feedback = "The result is wrong."
 		return execResult
+	}
+
+	if q.StrictMode.ColumnOrder {
+		var teacherCols []string
+		// q.ExpectedColumns is a JSONB array of column-name strings. If it is empty
+		// or fails to parse (e.g. legacy rows captured before ordered-capture existed),
+		// skip the gate rather than hard-failing.
+		if len(q.ExpectedColumns) > 0 && json.Unmarshal(q.ExpectedColumns, &teacherCols) == nil && len(teacherCols) > 0 {
+			if !equalStringSlices(teacherCols, studentColumns) {
+				execResult.Status = "incorrect"
+				execResult.IsCorrect = false
+				execResult.Score = 0
+				execResult.Feedback = "The column order does not match the expected output."
+				return execResult
+			}
+		}
 	}
 
 	if s.compareResults(teacherData, studentData, q.StrictMode) {
@@ -137,6 +153,18 @@ func (s *ValidationService) compareResults(teacher, student []map[string]interfa
 			}
 		}
 		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}

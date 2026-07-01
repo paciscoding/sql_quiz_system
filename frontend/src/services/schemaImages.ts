@@ -1,3 +1,5 @@
+import { forceLogout } from './session'
+
 export interface IntroImageMetadata {
   id: number
   owner_id: number
@@ -73,16 +75,15 @@ export function uploadCategoryIntroImage(
     }
 
     xhr.addEventListener('load', () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
+      if (xhr.status === 401) {
+        forceLogout()
+        reject(new Error('Session expired'))
+      } else if (xhr.status >= 200 && xhr.status < 300) {
         try {
           resolve(JSON.parse(xhr.responseText) as IntroImageMetadata)
         } catch {
           reject(new Error('Invalid response from server'))
         }
-      } else if (xhr.status === 413) {
-        reject(new Error('too large'))
-      } else if (xhr.status === 415) {
-        reject(new Error('unsupported format'))
       } else {
         let msg = 'Upload failed'
         try {
@@ -143,16 +144,15 @@ export function uploadExamIntroImage(
     }
 
     xhr.addEventListener('load', () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
+      if (xhr.status === 401) {
+        forceLogout()
+        reject(new Error('Session expired'))
+      } else if (xhr.status >= 200 && xhr.status < 300) {
         try {
           resolve(JSON.parse(xhr.responseText) as IntroImageMetadata)
         } catch {
           reject(new Error('Invalid response from server'))
         }
-      } else if (xhr.status === 413) {
-        reject(new Error('too large'))
-      } else if (xhr.status === 415) {
-        reject(new Error('unsupported format'))
       } else {
         let msg = 'Upload failed'
         try {

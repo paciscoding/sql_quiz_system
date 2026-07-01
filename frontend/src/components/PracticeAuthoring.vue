@@ -38,7 +38,8 @@ const form = ref<Partial<PracticeQuestion>>({
   question_type: 'QUERY',
   points: 1.0,
   strict_ordering: false,
-  strict_attrs: false
+  strict_attrs: false,
+  strict_column_order: false
 })
 const previewRows = ref<any[]>([])
 const previewCols = ref<string[]>([])
@@ -147,7 +148,8 @@ const resetForm = () => {
     question_type: 'QUERY',
     points: 1.0,
     strict_ordering: false,
-    strict_attrs: false
+    strict_attrs: false,
+    strict_column_order: false
   }
   previewRows.value = []
   previewCols.value = []
@@ -389,68 +391,68 @@ onMounted(() => {
         </button>
       </div>
 
-      <table v-if="categories.length > 0" class="data-table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Schema</th>
-            <th>Questions</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          <template v-for="c in categories" :key="c.id">
-            <tr>
-              <td style="font-weight: 700;">{{ c.name }}</td>
-              <td><code>{{ c.schema_name }}</code></td>
-              <td>{{ c.question_count }}</td>
-              <td>
-                <div style="display: flex; gap: var(--space-1); flex-wrap: wrap;">
-                  <button class="btn btn-secondary btn-sm" @click="doRenameCategory(c)">{{ UI_COPY.RENAME_CATEGORY }}</button>
-                  <button class="btn btn-secondary btn-sm" @click="openImport(c)">{{ UI_COPY.IMPORT_CATEGORY_DB }}</button>
-                  <button class="btn btn-secondary btn-sm" @click="doDeleteCategory(c)" style="border-color: var(--color-danger); color: var(--color-danger);">{{ UI_COPY.DELETE_CATEGORY }}</button>
-                </div>
-              </td>
-            </tr>
-            <!-- Per-category description editor row -->
-            <tr>
-              <td colspan="4" style="padding: var(--space-3); background: var(--color-surface-muted);">
-                <label style="display: block; font-size: 0.8rem; font-weight: 700; margin-bottom: var(--space-1); color: var(--color-text-muted);">Description (shown to students on the intro page)</label>
-                <div style="display: flex; gap: var(--space-2); align-items: flex-end;">
-                  <textarea
-                    v-model="categoryIntroEdits[c.id]"
-                    class="input"
-                    rows="3"
-                    style="flex: 1; resize: vertical; min-height: 60px;"
-                    :placeholder="'Write a description for the ' + c.name + ' category...'"
-                  ></textarea>
-                  <button
-                    class="btn btn-primary btn-sm"
-                    :disabled="categoryIntroSaving[c.id]"
-                    @click="saveCategoryIntro(c)"
-                    style="white-space: nowrap;"
-                  >{{ categoryIntroSaving[c.id] ? 'Saving...' : 'Save Description' }}</button>
-                </div>
-                <IntroImagesEditor scope="category" :owner-id="c.id" />
-              </td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
-      <p v-else class="muted">No categories yet. Create one above.</p>
+      <!-- Per-category card stack -->
+      <div v-if="categories.length > 0">
+        <div v-for="c in categories" :key="c.id" class="category-card">
+          <!-- Card header -->
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap;">
+              <h3 style="margin: 0;">{{ c.name }}</h3>
+              <code>{{ c.schema_name }}</code>
+              <span class="muted" style="font-size: 0.8rem;">{{ c.question_count }} questions</span>
+            </div>
+            <div style="display: flex; gap: var(--space-1); flex-wrap: wrap;">
+              <button class="btn btn-secondary btn-sm" @click="doRenameCategory(c)">{{ UI_COPY.RENAME_CATEGORY }}</button>
+              <button class="btn btn-secondary btn-sm" @click="openImport(c)">{{ UI_COPY.IMPORT_CATEGORY_DB }}</button>
+              <button class="btn btn-secondary btn-sm" @click="doDeleteCategory(c)" style="border-color: var(--color-danger); color: var(--color-danger);">{{ UI_COPY.DELETE_CATEGORY }}</button>
+            </div>
+          </div>
 
-      <!-- Inline import editor -->
-      <div v-if="importCategoryId !== null" style="margin-top: var(--space-4);">
-        <h3>Import database into "{{ categoryNameById[importCategoryId ?? 0] }}"</h3>
-        <p class="muted">Paste a SQL script using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
-        <SqlEditor v-model="importSql" height="200px" />
-        <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
-          <button class="btn btn-primary" :disabled="importLoading || !importSql.trim()" @click="doImport">
-            <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : UI_COPY.IMPORT_CATEGORY_DB }}
-          </button>
-          <button class="btn btn-secondary" @click="cancelImport">Cancel</button>
+          <!-- Database schema sub-panel -->
+          <div class="cat-subpanel">
+            <span class="cat-subpanel-label">Database schema</span>
+            <div v-if="importCategoryId === c.id">
+              <h3>Import database into "{{ c.name }}"</h3>
+              <p class="muted">Paste a SQL script using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
+              <SqlEditor v-model="importSql" height="200px" />
+              <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+                <button class="btn btn-primary" :disabled="importLoading || !importSql.trim()" @click="doImport">
+                  <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : UI_COPY.IMPORT_CATEGORY_DB }}
+                </button>
+                <button class="btn btn-secondary" @click="cancelImport">Cancel</button>
+              </div>
+            </div>
+            <p v-else class="muted" style="margin: 0;">Import a .sql to (re)load this category's database.</p>
+          </div>
+
+          <!-- Description sub-panel -->
+          <div class="cat-subpanel">
+            <span class="cat-subpanel-label">Description (shown to students on the intro page)</span>
+            <div style="display: flex; gap: var(--space-2); align-items: flex-end;">
+              <textarea
+                v-model="categoryIntroEdits[c.id]"
+                class="input"
+                rows="3"
+                style="flex: 1; resize: vertical; min-height: 60px;"
+                :placeholder="'Write a description for the ' + c.name + ' category...'"
+              ></textarea>
+              <button
+                class="btn btn-primary btn-sm"
+                :disabled="categoryIntroSaving[c.id]"
+                @click="saveCategoryIntro(c)"
+                style="white-space: nowrap;"
+              >{{ categoryIntroSaving[c.id] ? 'Saving...' : 'Save Description' }}</button>
+            </div>
+          </div>
+
+          <!-- Introduction images sub-panel -->
+          <div class="cat-subpanel">
+            <span class="cat-subpanel-label">Introduction images</span>
+            <IntroImagesEditor scope="category" :owner-id="c.id" />
+          </div>
         </div>
       </div>
+      <p v-else class="muted">No categories yet. Create one above.</p>
     </div>
     
     <!-- Section C: Create/Edit Form -->
@@ -518,6 +520,9 @@ onMounted(() => {
           </label>
           <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
             <input type="checkbox" v-model="form.strict_attrs" /> Strict Attrs
+          </label>
+          <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
+            <input type="checkbox" v-model="form.strict_column_order" /> Strict Column Order
           </label>
         </div>
       </div>
@@ -636,5 +641,28 @@ h3 {
   margin-bottom: var(--space-2);
   font-size: 0.85rem;
   grid-column: span 2;
+}
+
+.category-card {
+  border: 2px solid var(--color-border);
+  border-left: 4px solid var(--color-primary);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--color-surface);
+}
+.category-card:nth-of-type(even) {
+  background: var(--color-surface-muted);
+}
+.cat-subpanel {
+  border: 1px solid var(--color-border-soft);
+  padding: var(--space-3);
+  margin-top: var(--space-3);
+}
+.cat-subpanel > .cat-subpanel-label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+  display: block;
 }
 </style>

@@ -125,10 +125,14 @@ Triggers **Phase 0 Correct Result Capture** *(redesign)*.
   "points": 10,
   "strict_mode": {
     "ordering": true,
-    "attributes": true
+    "attributes": true,
+    "column_order": false
   }
 }
 ```
+  - `strict_mode.ordering` — when `true`, the student's rows must appear in the same left-to-right order as the teacher's result; when `false`, comparison is set-equality (multiset of rows).
+  - `strict_mode.attributes` — when `true`, the student's output column names must exactly match `expected_columns`.
+  - `strict_mode.column_order` — when `true`, the student's output columns must appear in the same left-to-right order as `expected_columns` (index-by-index comparison). This is an independent pass/fail gate evaluated separately from `ordering` and `attributes`. Defaults to `false`; existing questions are unaffected.
 - **Phase gate:** 409 if `app.examinations.is_active = true` for the question's exam.
 - **Behavior:** Save the question row, then synchronously run the teacher SQL on a `public` clone inside a transaction, capture the result, roll back, write the cache fields. Capture failures **do not roll back the upsert**.
 - **Response 200 (captured):**
@@ -163,7 +167,7 @@ Triggers **Phase 0 Correct Result Capture** *(redesign)*.
 - **Response 200:** `{"message": "Question deleted successfully"}`
 
 ### 9. Import Schema (Admin / Lecturer)
-Populates `public.*` from a SQL script.
+Populates `public.*` from a SQL script. This endpoint targets the **shared `public` schema** (the original single-template curriculum). For isolated, per-exam curriculum imports use the per-exam endpoint (9.5) instead. **The lecturer dashboard now imports per-exam (9.5) exclusively;** this global endpoint is retained for scripting / backward-compatibility but is no longer exposed in the UI.
 
 - **URL:** `/lecturer/import-schema`
 - **Method:** `POST`
@@ -171,11 +175,29 @@ Populates `public.*` from a SQL script.
 - **Phase gate** *(redesign)*: 409 if **any** examination has `is_active = true`. The error body lists the offending exam IDs.
 - **Behavior:** Wipe and recreate `public.*` per the script. Does not touch `app.*` or any `student_*` schemas.
 
+### 9.5. Import Per-Exam Curriculum (Admin / Lecturer)
+Imports a SQL script into the exam's own `curriculum_exam_{id}` schema, isolating the curriculum from other exams and from the shared `public` template.
+
+- **URL:** `/lecturer/exams/:id/curriculum/import`
+- **Method:** `POST`
+- **Auth:** ADMIN | LECTURER
+- **Query param:** `confirm_replace=true` — required to overwrite a non-empty curriculum schema (same UX as the practice category import).
+- **Payload:** `{"sql": "<unqualified SQL script>"}` — schema-qualified names (`public.x`, `app.x`, `curriculum_exam_*.x`, etc.) are rejected with 400.
+- **Behavior:** Drops and recreates `curriculum_exam_{id}` from the supplied script, then sets `app.examinations.curriculum_schema = 'curriculum_exam_{id}'`. Phase-0 Correct Result capture, Phase-2 SELECT read-path, and Phase-1 sandbox clone all source from the exam's `curriculum_schema` going forward.
+- **Response 200:** `{"message": "Curriculum imported into exam"}`
+- **Response 400:** `{"error": "..."}` — schema-qualified identifier detected in the SQL.
+- **Response 404:** `{"error": "exam not found"}` — when no examination with the given `id` exists.
+- **Response 409 (exam active):** `{"error": "examination is currently active"}` — curriculum import is gated per-exam: blocked only while that specific exam is active (not globally).
+- **Response 409 (non-empty, no confirm):** `{"error": "..."}` — curriculum schema already has tables and `confirm_replace` was not `true`.
+
 ### 10. List / Create Examinations
 - **URL:** `/lecturer/exams`
 - **Methods:** `GET`, `POST`
 - **POST Payload:** `{"name": "Midterm Exam", "description": "...", "is_active": false}`
-- **GET Response 200:** Array of `{"id", "title", "is_active", "activated_at", "archived_at", ...}`.
+- **GET Response 200:** Array of examination objects. Each object includes `{"id", "title", "is_active", "activated_at", "archived_at", "curriculum_schema", ...}`. The `curriculum_schema` field is `"public"` by default (backward-compatible); it changes to `"curriculum_exam_{id}"` after a successful call to endpoint 9.5. Plus three pre-computed readiness fields used by the lecturer UI's readiness summary:
+  - `question_count` (int) — number of questions defined for the exam.
+  - `total_points` (number) — sum of `points` across all questions in the exam.
+  - `uncaptured_count` (int) — number of questions whose `expected_result_status` is not `'captured'` (i.e., `'pending'` or `'failed'`). A non-zero value means the exam cannot yet be activated.
 
 ### 11. Activate Examination
 Phase 1 transition.
@@ -202,6 +224,32 @@ Phase 3 transition. Drops the per-exam DML sandbox (if any).
 - **Method:** `PUT`
 - **Behavior:** Set `is_active = false`, `archived_at = now()`. Look up `app.exam_sandboxes WHERE exam_id = :id AND dropped_at IS NULL`; if a row exists, `DROP SCHEMA sandbox_exam_{examID} CASCADE` and set `dropped_at = now()`. Pure-SELECT exams have no row and no schema to drop.
 - **Response 200:** `{"message": "Examination deactivated and sandboxes cleaned up"}`
+
+### 12.5. Rename Examination
+- **URL:** `/lecturer/exams/:id`
+- **Method:** `PUT`
+- **Auth:** ADMIN | LECTURER
+- **Payload:** `{"title": "New Exam Title"}`
+- **Behavior:** Updates `app.examinations.title` for the given exam. The exam may be active or inactive; renaming does not affect the phase lifecycle.
+- **Response 200:** `{"message": "Exam renamed"}`
+- **Response 400:** `{"error": "title is required"}` — when the request body is missing or `title` is blank.
+- **Response 404:** `{"error": "exam not found"}` — when no examination with the given `id` exists.
+
+### 12.6. Delete Examination (cascade)
+- **URL:** `/lecturer/exams/:id`
+- **Method:** `DELETE`
+- **Auth:** ADMIN | LECTURER
+- **Behavior:** Hard-deletes the examination and all its dependent data in the following order, inside a single database transaction:
+  1. `app.submissions` rows for the exam.
+  2. `app.exam_students` roster rows for the exam.
+  3. Exam-scoped intro image records (`app.examination_intro_images WHERE examination_id = :id`).
+  4. `app.questions` rows for the exam (including cached Correct Results).
+  5. `DROP SCHEMA sandbox_exam_{id} CASCADE` if a sandbox exists, then delete the `app.exam_sandboxes` row.
+  6. `DELETE FROM app.examinations WHERE id = :id`.
+- **Phase gate:** 409 if the exam is currently active — the sandbox must be dropped cleanly via deactivate first.
+- **Response 200:** `{"message": "Exam deleted"}`
+- **Response 404:** `{"error": "exam not found"}` — when no examination with the given `id` exists.
+- **Response 409:** `{"error": "deactivate the exam before deleting"}` — when `app.examinations.is_active = true` for the target exam.
 
 ### 13. Assign Students to Exam
 - **URL:** `/lecturer/exams/:id/students`
@@ -263,7 +311,10 @@ All student practice endpoints return **423 Locked** if any examination is curre
 ### 20. Upsert Practice Question (Admin / Lecturer)
 - **URL:** `/lecturer/practice/question`
 - **Method:** `POST`
-- **Payload:** Same shape as endpoint 8 (Upsert Question).
+- **Payload:** Same shape as endpoint 8 (Upsert Question) except strict-mode fields are **top-level booleans** instead of a nested object:
+  - `strict_ordering` (bool, default `false`) — same semantics as `strict_mode.ordering`.
+  - `strict_attrs` (bool, default `false`) — same semantics as `strict_mode.attributes`.
+  - `strict_column_order` (bool, default `false`) — same semantics as `strict_mode.column_order`: when `true`, the student's output columns must appear index-by-index in the same left-to-right order as `expected_columns`. Independent of `strict_ordering` and `strict_attrs`. Backed by `app.practice_questions.strict_column_order BOOLEAN NOT NULL DEFAULT FALSE`.
 - **Behavior:** Triggers Correct Result Capture synchronously against `sandbox_practice`.
 - **Response 200:** Same shape as endpoint 8.
 

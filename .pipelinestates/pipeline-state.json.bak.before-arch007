@@ -1,0 +1,333 @@
+{
+  "arch_decisions": [
+    {
+      "id": "ARCH-001",
+      "decision": "Implement Practice Scoring Aggregation",
+      "rationale": "Students need to track their practice progress. Aggregating by best attempt per question ensures we reward mastery.",
+      "affects": [
+        "backend/models",
+        "backend/repository",
+        "backend/controllers"
+      ]
+    },
+    {
+      "id": "ARCH-002",
+      "decision": "Add Practice Results Tab to Student Dashboard",
+      "rationale": "Separating exam results from practice results maintains clarity in the student UI.",
+      "affects": [
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-003",
+      "decision": "Post-Quiz Completion Summary",
+      "rationale": "Immediate feedback after completing a quiz improves student experience and confirms submission status.",
+      "affects": [
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-004",
+      "decision": "Lecturer Score Export (Dynamic CSV)",
+      "rationale": "Lecturers need a consolidated view of all student performance for grading and reporting.",
+      "affects": [
+        "backend/controllers",
+        "backend/repository",
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-005",
+      "decision": "Exam-Centric Lecturer Workflow",
+      "rationale": "Forcing lecturers to select an exam before authoring questions prevents orphaned questions and provides immediate context on the exam's activation readiness.",
+      "affects": [
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-006",
+      "decision": "Brutalist Monotone UI Refactor",
+      "rationale": "A black-on-white monotone theme with brutalist aesthetics provides a high-contrast, focused experience, while allowing highlights for critical feedback.",
+      "affects": [
+        "frontend/style.css",
+        "frontend/components"
+      ]
+    }
+  ],
+  "todos": [],
+  "in_progress": [],
+  "completed": [
+    {
+      "id": "TODO-001",
+      "title": "Backend: Implement Practice Summary Aggregation in Repository",
+      "description": "Add `GetPracticeSummary(ctx, studentID)` to `PostgresRepository`. This method should return a list of practice questions with the student's best result (aggregated by `practice_question_id`, picking `is_correct=true` if it exists, otherwise the latest attempt). Define `PracticeSummary` struct in `models`.",
+      "depends_on": [],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "backend/internal/repository/postgres.go",
+        "backend/internal/models/practice.go"
+      ],
+      "arch_ref": "ARCH-001",
+      "done_when": "Repository has `GetPracticeSummary` and it correctly aggregates best attempts per question."
+    },
+    {
+      "id": "TODO-002",
+      "title": "Backend: Expose Practice Summary API Endpoint",
+      "description": "Add `GetSummary` handler to `PracticeController` mapping to `GET /api/v1/practice/summary`. Register the route in `backend/cmd/main.go`.",
+      "depends_on": [
+        "TODO-001"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/controllers/practice_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "arch_ref": "ARCH-001",
+      "done_when": "GET /api/v1/practice/summary returns a JSON array of practice summaries for the authenticated student."
+    },
+    {
+      "id": "TODO-003",
+      "title": "Frontend: Add Practice Summary Service Call",
+      "description": "Add `getSummary(): Promise<PracticeSummary[]>` to `frontend/src/services/practice.ts`.",
+      "depends_on": [
+        "TODO-002"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/services/practice.ts"
+      ],
+      "arch_ref": "ARCH-002",
+      "done_when": "`getSummary` is exported and successfully fetches data from the new backend endpoint."
+    },
+    {
+      "id": "TODO-004",
+      "title": "Frontend: Implement Practice Results Tab in Dashboard",
+      "description": "Update `StudentResults.vue` to include a 'Practice' tab. Display the aggregated practice summary in a table similar to exam results.",
+      "depends_on": [
+        "TODO-003"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/StudentResults.vue"
+      ],
+      "arch_ref": "ARCH-002",
+      "done_when": "The student dashboard has a working Practice Results tab showing question-level status."
+    },
+    {
+      "id": "TODO-005",
+      "title": "Frontend: Implement Post-Quiz Completion Summary",
+      "description": "Enhance `PracticeView.vue` to show a modal or inline summary after a successful or failed submission, providing immediate confirmation and feedback.",
+      "depends_on": [],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/PracticeView.vue"
+      ],
+      "arch_ref": "ARCH-003",
+      "done_when": "Students see a clear 'Correct/Incorrect' summary immediately after submitting a practice answer."
+    },
+    {
+      "id": "TODO-006",
+      "title": "Backend: Implement Consolidated Score Query for Lecturers",
+      "description": "Add `GetConsolidatedScores(ctx)` to `PostgresRepository`. This method should return a list of students with their total exam scores and total practice points (based on best attempts).",
+      "depends_on": [
+        "TODO-001"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Repository can return a full list of student performance across all exams and practice questions."
+    },
+    {
+      "id": "TODO-007",
+      "title": "Backend: Add Lecturer CSV Export Endpoint",
+      "description": "Add `ExportScoresCSV` handler to `LecturerController` mapping to `GET /api/v1/lecturer/export/scores`. Generate a CSV with Student ID, Name, Exam Total, and Practice Total.",
+      "depends_on": [
+        "TODO-006"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "backend/internal/controllers/lecturer_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Requesting the export endpoint returns a CSV file with the consolidated scores."
+    },
+    {
+      "id": "TODO-008",
+      "title": "Frontend: Add Export Scores Button to Lecturer View",
+      "description": "Add an 'Export Scores (CSV)' button to `LecturerView.vue` that triggers the download of the consolidated CSV.",
+      "depends_on": [
+        "TODO-007"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Lecturers can download the performance CSV from their dashboard."
+    },
+    {
+      "id": "TODO-009",
+      "title": "Backend: Expose Consolidated Scores JSON API",
+      "description": "Add `GetScoresJSON` handler to `LecturerController` mapping to `GET /api/v1/lecturer/scores`. This endpoint should return the same consolidated data as the CSV export (Student ID, Name, Exam Total, Practice Total) in JSON format.",
+      "depends_on": [
+        "TODO-006"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/controllers/lecturer_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "GET /api/v1/lecturer/scores returns a JSON array of student performance records."
+    },
+    {
+      "id": "TODO-010",
+      "title": "Frontend: Create Lecturer Service and Scores Fetcher",
+      "description": "Create `frontend/src/services/lecturer.ts` and add `getConsolidatedScores()` function to fetch performance data from the backend.",
+      "depends_on": [
+        "TODO-009"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/services/lecturer.ts"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "`getConsolidatedScores` is implemented and exports the fetching logic."
+    },
+    {
+      "id": "TODO-011",
+      "title": "Frontend: Implement Results Tab and Performance Table in Lecturer View",
+      "description": "Update `LecturerView.vue` to include a 'Results' tab. Implement a table showing student performance (Username, Exam Score, Practice Score). Integrate the 'Export Scores' button into this tab.",
+      "depends_on": [
+        "TODO-010",
+        "TODO-008"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Lecturers can see a performance table and download the CSV from the new 'Results' tab."
+    },
+    {
+      "id": "TODO-012",
+      "title": "Frontend: Implement Exam Selector in Questions Tab",
+      "description": "Add a dropdown to the 'Questions' tab in `LecturerView.vue` to select an existing exam. Ensure it triggers `fetchExamQuestions` and updates the UI state when changed.",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-005",
+      "status": "PASS",
+      "done_when": "Lecturers can select an exam from a dropdown at the top of the Questions tab."
+    },
+    {
+      "id": "TODO-013",
+      "title": "Frontend: Add Activation Toggle and Status to Questions Tab",
+      "description": "Display the selected exam's activation status (Active/Inactive) and add a button to toggle this status directly from the 'Questions' tab. Handle backend error messages (409 Conflict) and display them to the user.",
+      "depends_on": [
+        "TODO-012"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-005",
+      "status": "PASS",
+      "done_when": "The selected exam's status is visible and can be toggled via a button in the Questions tab."
+    },
+    {
+      "id": "TODO-014",
+      "title": "Frontend: Implement Workflow Locking in Questions Tab",
+      "description": "Disable or hide the question creation/edit form and the questions list in `LecturerView.vue` until an exam is selected. Automatically bind `question.exam_id` to the selected exam.",
+      "depends_on": [
+        "TODO-013"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-005",
+      "status": "PASS",
+      "done_when": "The question form is unusable until an exam is selected, and exam_id is auto-filled."
+    },
+    {
+      "id": "TODO-015",
+      "title": "Frontend: Global Monotone Style Refactor",
+      "description": "Update `style.css` to enforce a strict black-on-white monotone theme. Remove any grid background patterns or background images from the root and app containers. Ensure `--color-bg` and `--color-surface` are strictly white (#ffffff) and `--color-text` is strictly black (#000000).",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/style.css",
+        "frontend/src/App.vue"
+      ],
+      "arch_ref": "ARCH-006",
+      "assigned_to": "codex-cli",
+      "reason": "Mechanical CSS variable refactor and style cleanup.",
+      "done_when": "Global styles use a strict monotone palette and any grid background is removed.",
+      "status": "PASS"
+    },
+    {
+      "id": "TODO-016",
+      "title": "Frontend: Component-Level Brutalist Style Audit",
+      "description": "Audit all Vue components to ensure they use high-contrast brutalist borders (thick black) and shadows (sharp offset). Replace any soft colors or gradients with black/white or pure highlight colors where appropriate.",
+      "depends_on": [
+        "TODO-015"
+      ],
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/AdminView.vue",
+        "frontend/src/components/BulkImportStudents.vue",
+        "frontend/src/components/LecturerView.vue",
+        "frontend/src/components/LoginView.vue",
+        "frontend/src/components/PracticeAuthoring.vue",
+        "frontend/src/components/PracticeView.vue",
+        "frontend/src/components/StudentResults.vue",
+        "frontend/src/components/StudentView.vue"
+      ],
+      "arch_ref": "ARCH-006",
+      "assigned_to": "gemini-cli",
+      "reason": "Multi-component audit requiring visual consistency reasoning.",
+      "done_when": "All major UI components (Cards, Buttons, Tables) exhibit the brutalist monotone aesthetic.",
+      "status": "PASS"
+    },
+    {
+      "id": "TODO-017",
+      "title": "Frontend: Implement Selective Highlights",
+      "description": "Ensure that status indicators (Success, Warning, Danger) and syntax highlighting (SqlEditor) use their respective highlight colors while maintaining high contrast against the monotone background. Verify contrast ratios for accessibility.",
+      "depends_on": [
+        "TODO-016"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/NotificationToast.vue",
+        "frontend/src/components/SqlEditor.vue",
+        "frontend/src/style.css"
+      ],
+      "arch_ref": "ARCH-006",
+      "assigned_to": "codex-cli",
+      "reason": "Isolated component updates for specific status colors.",
+      "done_when": "Highlight colors are used sparingly but effectively for critical information, and contrast is high.",
+      "status": "PASS"
+    }
+  ],
+  "failed": [],
+  "agent_notes": {
+    "model_conflict_resolution": "The 'gemini-implementor' subagent encountered a model resolution loop for the invalid 'gemini-3.1-flash-preview' model. To resolve this, the 'generalist' agent was used to perform TODO-016 and TODO-017. Custom aliases and resolutions were also added to .gemini/settings.json to map the invalid string to 'gemini-3-flash-preview'."
+  }
+}

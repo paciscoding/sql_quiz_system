@@ -70,12 +70,20 @@ const locales = [
 
 <template>
   <div class="cms-shell">
+    <a href="#content" class="skip-link">Skip to main content</a>
     <NotificationToast />
     <ConfirmDialogHost />
 
     <!-- Persistent top header -->
     <header class="cms-header">
-      <div class="cms-brand" @click="router.push('/')" role="link" tabindex="0">
+      <div
+        class="cms-brand"
+        @click="router.push('/')"
+        @keydown.enter="router.push('/')"
+        @keydown.space.prevent="router.push('/')"
+        role="link"
+        tabindex="0"
+      >
         <span class="brand-mark">SQ</span>
         <span>SQL Quiz</span>
         <span class="brand-sub">Grader Portal</span>
@@ -93,7 +101,7 @@ const locales = [
       </button>
 
       <div v-if="isLoggedIn" class="cms-header-right">
-        <select v-model="locale" class="locale-select" aria-label="Language">
+        <select v-model="locale" class="locale-select" aria-label="Language" disabled title="Additional languages coming soon">
           <option v-for="l in locales" :key="l.code" :value="l.code">{{ l.label }}</option>
         </select>
         <span class="header-greeting">
@@ -145,6 +153,11 @@ const locales = [
                 <span>Practice Authoring</span>
               </button>
             </router-link>
+            <router-link to="/lecturer/results" custom v-slot="{ navigate, isActive }">
+              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+                <span>Results</span>
+              </button>
+            </router-link>
           </template>
 
           <template v-if="user.role === 'ADMIN'">
@@ -166,6 +179,20 @@ const locales = [
 </template>
 
 <style scoped>
+/* Keyboard skip-link: hidden until focused */
+.skip-link {
+  position: absolute;
+  left: 8px;
+  top: -48px;
+  z-index: 100;
+  padding: 8px 14px;
+  background: var(--color-primary);
+  color: #fff;
+  border-radius: var(--radius);
+  transition: top .15s ease;
+}
+.skip-link:focus { top: 8px; }
+
 /* Mobile drawer behavior for the sidebar */
 @media (max-width: 1023.98px) {
   .cms-sidebar {

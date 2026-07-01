@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue'
+import Icon from './Icon.vue'
 
 defineProps<{
   rows: Record<string, any>[]
@@ -49,7 +50,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="wrapperRef" class="responsive-table-wrap sticky-table-head" :style="{ '--sticky-max-h': maxHeight ?? '300px' }">
-    <span v-if="hasOverflow && !scrolled" class="scroll-hint">Scroll →</span>
+    <span v-if="hasOverflow && !scrolled" class="scroll-hint">Scroll <Icon name="arrow-right" /></span>
     <table v-if="rows.length > 0" class="data-table">
       <thead>
         <tr><th v-for="c in columns" :key="c">{{ c }}</th></tr>

@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import SqlEditor from './SqlEditor.vue'
 import EmptyState from './EmptyState.vue'
+import Icon from './Icon.vue'
 import ResultTable from './ResultTable.vue'
 import SchemaIntroduction from './SchemaIntroduction.vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
@@ -34,7 +35,7 @@ interface ValidationResult {
 }
 
 interface PreviewResult {
-  status: 'correct' | 'incorrect' | 'syntax_error'
+  status: 'correct' | 'incorrect' | 'syntax_error' | 'preview'
   feedback: string
   rows: Record<string, any>[]
   columns: string[]
@@ -115,6 +116,11 @@ const selectedQuestion = computed<Question | null>(
   () => questions.value.find(q => q.id === selectedQuestionId.value) || null
 )
 const currentQuestion = computed(() => selectedQuestion.value)
+
+const briefTwoCol = computed(() => {
+  const n = currentQuestion.value?.expected_columns?.length ?? 0
+  return n > 0 && n <= 4
+})
 
 const currentIndex = computed(() =>
   questions.value.findIndex(q => q.id === selectedQuestionId.value))
@@ -380,14 +386,14 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
     <template v-else-if="phase === 'waiting'">
       <div class="card waiting-panel">
         <button class="btn btn-secondary" style="margin-bottom: var(--space-4);" @click="goBackToSelect">
-          ← Back
+          <Icon name="arrow-left" /> Back
         </button>
         <h3 style="margin-top: 0;">{{ selectedExam?.title }}</h3>
         <div style="display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-4);">
           <span class="muted">Status:</span>
           <span class="badge" :class="effectiveBadgeClass(effectiveState)">{{ effectiveState }}</span>
-          <span class="muted" style="font-size: 0.8rem;" v-if="connected">● Connected</span>
-          <span class="muted" style="font-size: 0.8rem;" v-else>○ Reconnecting…</span>
+          <span class="muted" style="font-size: 0.8rem;" v-if="connected"><Icon name="circle-dot" /> Connected</span>
+          <span class="muted" style="font-size: 0.8rem;" v-else><Icon name="circle" /> Reconnecting…</span>
         </div>
         <p class="muted" v-if="effectiveState !== 'active'">
           Waiting for the exam to start. The Start Exam button will become available when the exam is active.
@@ -409,7 +415,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
     <!-- ── ACTIVE phase ─────────────────────────────────────────────────── -->
     <template v-else>
       <div class="header-bar">
-        <button class="btn btn-secondary" @click="goBackToSelect">← Back</button>
+        <button class="btn btn-secondary" @click="goBackToSelect"><Icon name="arrow-left" /> Back</button>
         <!-- Persistent intro / questions toggle — always visible in active phase -->
         <button
           class="btn"
@@ -427,8 +433,8 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           <label>Question</label>
           <select class="input" v-model="selectedQuestionId">
             <option :value="null">-- Select question --</option>
-            <option v-for="q in questions" :key="q.id" :value="q.id">
-              Q{{ q.id }} ({{ q.type }} - {{ q.points }} pts)
+            <option v-for="(q, i) in questions" :key="q.id" :value="q.id">
+              Q{{ i + 1 }} ({{ q.type }} - {{ q.points }} pts)
             </option>
           </select>
         </div>
@@ -455,7 +461,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           </template>
           <div style="margin-top: var(--space-5);">
             <button class="btn btn-primary" @click="activeView = 'questions'">
-              Proceed to Questions →
+              Proceed to Questions <Icon name="arrow-right" />
             </button>
           </div>
         </div>
@@ -468,10 +474,10 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           <span>Question <strong>{{ currentIndex >= 0 ? currentIndex + 1 : 1 }}</strong> of <strong>{{ questions.length }}</strong></span>
           <span class="muted">{{ answeredCount }} answered · {{ correctCount }} correct</span>
         </div>
-        <div class="qp-bar"><div class="qp-fill" :style="{ width: progressPct + '%' }" /></div>
+        <div class="qp-bar"><div class="qp-fill" :style="{ transform: 'scaleX(' + (progressPct / 100) + ')' }" /></div>
       </div>
 
-      <div class="pane-grid">
+      <div class="pane-grid" :class="{ 'pane-grid--cols2': briefTwoCol }">
         <div class="card">
           <h3 style="margin-top: 0;">Question Brief</h3>
           <div v-if="currentQuestion">
@@ -511,11 +517,10 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
 
       <div v-if="previewResult" class="card result-panel" :class="previewResult.status" :style="{ opacity: previewStale ? 0.55 : 1 }">
         <div style="display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2);">
-          <span class="badge" :class="badgeClassFor(previewResult.status)">{{ statusLabel(previewResult.status) }}</span>
           <span class="muted" style="font-size: 0.8rem;">Test Run</span>
           <span v-if="previewStale" class="muted" style="font-size: 0.75rem; margin-left: auto;">Stale - run again to refresh</span>
         </div>
-        <p style="margin: 0 0 var(--space-3) 0;">{{ previewResult.feedback }}</p>
+        <p v-if="previewResult.status === 'syntax_error'" style="margin: 0 0 var(--space-3) 0; font-weight: 600; color: var(--color-danger);">{{ previewResult.feedback }}</p>
         <ResultTable :rows="previewResult.rows" :columns="previewResult.columns" max-height="320px" />
         <p v-if="previewResult.truncated" class="muted" style="font-size: 0.8rem; margin-top: var(--space-2);">
           Showing 200 of {{ previewResult.row_count }} rows.
@@ -556,8 +561,11 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
 }
 .pane-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: var(--space-5);
+}
+.pane-grid--cols2 {
+  grid-template-columns: 1fr 1fr;
 }
 
 .card {
@@ -625,7 +633,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
 .result-panel p { font-weight: 600; margin: 0; }
 
 @media (max-width: 768px) {
-  .pane-grid   { grid-template-columns: 1fr; }
+  .pane-grid, .pane-grid--cols2 { grid-template-columns: 1fr; }
   .header-bar  { flex-direction: column; align-items: stretch; }
 }
 
@@ -651,7 +659,12 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
 }
 .qp-fill {
   height: 100%;
+  width: 100%;
+  transform-origin: left center;
   background: #3a87ad;
-  transition: width .25s ease;
+  transition: transform .25s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .qp-fill { transition: none; }
 }
 </style>

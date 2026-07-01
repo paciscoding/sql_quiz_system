@@ -1,0 +1,777 @@
+{
+  "arch_decisions": [
+    {
+      "id": "ARCH-001",
+      "decision": "Implement Practice Scoring Aggregation",
+      "rationale": "Students need to track their practice progress. Aggregating by best attempt per question ensures we reward mastery.",
+      "affects": [
+        "backend/models",
+        "backend/repository",
+        "backend/controllers"
+      ]
+    },
+    {
+      "id": "ARCH-002",
+      "decision": "Add Practice Results Tab to Student Dashboard",
+      "rationale": "Separating exam results from practice results maintains clarity in the student UI.",
+      "affects": [
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-003",
+      "decision": "Post-Quiz Completion Summary",
+      "rationale": "Immediate feedback after completing a quiz improves student experience and confirms submission status.",
+      "affects": [
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-004",
+      "decision": "Lecturer Score Export (Dynamic CSV)",
+      "rationale": "Lecturers need a consolidated view of all student performance for grading and reporting.",
+      "affects": [
+        "backend/controllers",
+        "backend/repository",
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-005",
+      "decision": "Exam-Centric Lecturer Workflow",
+      "rationale": "Forcing lecturers to select an exam before authoring questions prevents orphaned questions and provides immediate context on the exam's activation readiness.",
+      "affects": [
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-006",
+      "decision": "Brutalist Monotone UI Refactor",
+      "rationale": "A black-on-white monotone theme with brutalist aesthetics provides a high-contrast, focused experience, while allowing highlights for critical feedback.",
+      "affects": [
+        "frontend/style.css",
+        "frontend/components"
+      ]
+    },
+    {
+      "id": "ARCH-007",
+      "decision": "Router-driven auth with a single reactive auth store; App.vue stops branching on localStorage.",
+      "rationale": "Today App.vue reads localStorage in parallel to vue-router and re-syncs via watch(route.path). This breaks deep links (refresh on /student lands on the right component but the nav re-flickers and any consumer of isLoggedIn/user that mounts before the watch fires sees stale data), and a stale user object can persist after token expiry because nothing invalidates it. A single source of truth \u2014 vue-router for *where* the user is, and a reactive auth store for *who* they are \u2014 eliminates the dual state machine, makes 401 handling possible in one place, and lets meta-driven guards do the role checking instead of v-if soup in App.vue.",
+      "affects": [
+        "frontend/src/router.ts",
+        "frontend/src/App.vue",
+        "frontend/src/main.ts",
+        "frontend/src/services/auth.ts",
+        "frontend/src/components/LoginView.vue"
+      ],
+      "design_notes": "CREATE `frontend/src/services/auth.ts` exporting a module-level reactive store and a `useAuth()` composable. Public API:\n  - `interface AuthUser { id?: number; username: string; role: 'ADMIN'|'LECTURER'|'STUDENT' }`\n  - `const authState = reactive({ token: string|null, user: AuthUser|null })`  // module singleton\n  - `function useAuth()` returns `{ token, user, isLoggedIn (computed), login(token, user), logout(), hydrateFromStorage() }`\n  - `login(token, user)` writes both to localStorage (keys MUST remain `sql_quiz_token` and `sql_quiz_user` to avoid breaking existing storage) AND sets reactive state.\n  - `logout()` clears both storage keys and reactive state, then the caller (or a one-shot effect) navigates to `/login`.\n  - `hydrateFromStorage()` is called once from `main.ts` BEFORE `app.mount(...)` to seed state from localStorage. This guarantees no flicker on refresh.\n\nROUTER CHANGES (`frontend/src/router.ts`):\n  - Replace `meta.public` and `meta.role` (singular) with `meta.requiresAuth: boolean` (default true) and `meta.allowedRoles?: Role[]` (omit = any authenticated role).\n  - Per-route meta:\n    * `/login`           \u2192 `{ requiresAuth: false }`\n    * `/student`         \u2192 `{ requiresAuth: true, allowedRoles: ['STUDENT'] }`\n    * `/lecturer`        \u2192 `{ requiresAuth: true, allowedRoles: ['ADMIN','LECTURER'] }`\n    * `/admin`           \u2192 `{ requiresAuth: true, allowedRoles: ['ADMIN'] }`  (note: today's router lets ADMIN reach any meta.role, preserve this by listing ADMIN explicitly on lecturer-shared routes)\n    * `/practice`        \u2192 `{ requiresAuth: true, allowedRoles: ['STUDENT'] }`\n    * `/student/results` \u2192 `{ requiresAuth: true, allowedRoles: ['STUDENT'] }`\n    * `/lecturer/practice` \u2192 `{ requiresAuth: true, allowedRoles: ['ADMIN','LECTURER'] }`\n  - The existing `/dashboard` route currently uses `component: () => import('./App.vue')` which is wrong (it would mount App inside itself). Keep ONLY the `beforeEnter` redirect logic but switch the component to a tiny `RoleRedirect.vue` (or a `redirect: (to) => ...` function form) that reads `useAuth().user.value` instead of localStorage. Preferred: change `/dashboard` to `{ path: '/dashboard', redirect: () => { const u = useAuth().user.value; return u?.role === 'ADMIN' ? '/admin' : u?.role === 'LECTURER' ? '/lecturer' : u?.role === 'STUDENT' ? '/student' : '/login' } }`. Drop the `component` line.\n  - Single `router.beforeEach((to)) => { ... }` guard:\n    1. If `!to.meta.requiresAuth` (i.e. login) AND `useAuth().isLoggedIn.value` \u2192 redirect to `/dashboard` (so a logged-in user typing /login bounces to their home). EXCEPTION: if `to.query.force === '1'` allow through (for token expiry redirects).\n    2. If `to.meta.requiresAuth` AND `!isLoggedIn.value` \u2192 `next({ path: '/login', query: { redirect: to.fullPath } })`.\n    3. If `to.meta.allowedRoles` AND user.role NOT IN that list \u2192 `next({ name: 'forbidden' })` (see route below) OR fall back to `/dashboard` if `forbidden` isn't desired; choose `forbidden` so the user gets a clear message rather than a silent bounce.\n    4. Else `next()`.\n  - Add a `/403` route `{ path: '/403', name: 'forbidden', component: ForbiddenView, meta: { requiresAuth: false } }`. Keep ForbiddenView minimal (brutalist card, 'Forbidden', 'Return to your home' link that uses `useAuth().user.value?.role` to compute the target).\n\nAPP.VUE CHANGES:\n  - Delete `isLoggedIn`, `user`, `checkAuth`, the `onMounted`, and the `watch(route.path)`.\n  - Replace with `const { user, isLoggedIn, logout: doLogout } = useAuth()`.\n  - Template `v-if=\"isLoggedIn && user\"` becomes `v-if=\"isLoggedIn\"` (user is non-null whenever logged in).\n  - `logout` button handler: `await doLogout(); router.push('/login')`.\n  - `<main class=\"content\"><router-view /></main>` stays; no branching beyond that.\n\nLOGIN VIEW CHANGES (`LoginView.vue`):\n  - After successful POST, call `useAuth().login(data.token, data.user)` INSTEAD of writing localStorage directly. (login() owns the write.)\n  - Then `router.push((route.query.redirect as string) || '/dashboard')` so deep-link round-tripping works.\n\nMAIN.TS CHANGES:\n  - `import { useAuth } from './services/auth'; useAuth().hydrateFromStorage();` BEFORE `app.use(router); app.mount('#app')`.\n\nEDGE CASES (must be handled, tests will check these):\n  - Already-logged-in user hits `/login` directly \u2192 bounced to `/dashboard` (which redirects to their role home). Exception: if `?force=1` they reach login (used by expired-token redirect path).\n  - Deep link without auth: `/student/results` typed cold \u2192 guard sends to `/login?redirect=/student/results`; after login, LoginView pushes back to redirect target.\n  - Role mismatch: STUDENT typing `/admin` \u2192 redirected to `/403`, which offers a link to their role home.\n  - Token expiry: out of scope for this round (P1 \u2014 note in backlog); however, the auth store SHOULD be the only writer of localStorage so a future interceptor can call `useAuth().logout()` from one place.\n  - Hard refresh on a protected route while logged in: `hydrateFromStorage()` runs before mount, so `isLoggedIn` is true synchronously when the guard first runs \u2014 no flash of /login.\n\nDO NOT introduce Pinia for this round. A module-scoped `reactive()` is sufficient; revisit if state grows.\n\nCLARIFICATION (feedback-loop 2026-05-22): Error routes (not-found, forbidden) are exempt from Rule 1's auto-redirect so that logged-in users still see error pages. Rule 1's exception list must include the route names 'not-found' and 'forbidden' alongside the existing ?force=1 escape hatch; otherwise role-mismatched users redirected to /403 by Rule 3 are immediately bounced to /dashboard, and any logged-in user hitting an unknown URL is bounced away from the 404 page."
+    },
+    {
+      "id": "ARCH-008",
+      "decision": "Extract a reusable StudentMultiSelect.vue component (searchable, keyboard-navigable, with Select All / Select None), in-repo, replacing the inline checkbox list in LecturerView.vue.",
+      "rationale": "Correction to the brief: LecturerView.vue does NOT use a comma-separated text input \u2014 it already has an inline checkbox list bound to `selectedStudentIds` (lines 675\u2013682) backed by `GET /api/v1/users/students`. The real gap is that the inline list has no search, no keyboard navigation, no select-all/none, no result count summary, and isn't reusable for future use cases (e.g. assigning students to practice sets, group emails). Building a small in-repo component preserves the brutalist monotone aesthetic exactly (a library would drag in styles that fight var(--color-border) and the sharp 2px borders) and avoids adding a runtime dependency for a contained UI concern. Backend endpoint is verified: `GET /api/v1/users/students` (NOT `/users?role=STUDENT` \u2014 the brief had that wrong; do not change the backend).",
+      "affects": [
+        "frontend/src/components/StudentMultiSelect.vue",
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "design_notes": "CREATE `frontend/src/components/StudentMultiSelect.vue` as a controlled component.\n\nPROPS (TypeScript):\n  - `modelValue: number[]`                    // selected student IDs (v-model)\n  - `students: Array<{ id: number; username: string }>`  // caller passes the list; this component does NOT fetch (keeps it pure, lets parent control loading state)\n  - `loading?: boolean`                       // optional, shows a 'Loading students...' state\n  - `placeholder?: string`                    // search input placeholder, default 'Search students...'\n  - `maxHeight?: string`                      // CSS, default '250px' to match current multi-select-box\n\nEMITS:\n  - `update:modelValue` (number[])\n\nBEHAVIOR:\n  - Internal `searchQuery` ref; filtered list is `students.filter(s => s.username.toLowerCase().includes(searchQuery.toLowerCase()))`. Case-insensitive substring match; do not implement fuzzy matching in this round.\n  - Header row inside the box: search input on the left; `[Select All]` and `[Select None]` text-buttons on the right. 'Select All' operates on the CURRENTLY FILTERED set (intuitive: if a user searches 'sec01', clicking Select All selects only the visible matches and merges with existing selection \u2014 do a union, not a replace). 'Select None' clears the FILTERED subset from the selection only (so unrelated selections elsewhere are preserved).\n  - Counter line below header: `'{n} of {total} selected'` where total = `students.length`.\n  - Each row: checkbox + label. The label is clickable (existing pattern).\n  - Keyboard navigation: arrow Up/Down moves a visual focus across rendered (filtered) rows; Space toggles the focused row; Enter does the same as Space; the search input has tabindex 0 and is the natural first focus stop; rows have tabindex -1 and use `@keydown` handlers on a wrapping div with `role=\"listbox\"`. Roving tabindex pattern: a single `focusedIndex` ref drives `:tabindex` per row.\n  - When the filtered list changes, clamp `focusedIndex` to a valid index (or -1 if empty).\n  - Empty state: 'No students match.' when filtered list is empty but `students.length > 0`; 'No students found.' when `students.length === 0` (preserves current wording).\n  - Styling: reuse `.multi-select-box`, `.student-item` look (2px black border, monospace font, sharp corners). Add a `.msel-toolbar` flex row at the top. No new colors.\n\nINTEGRATION IN LecturerView.vue (Assignments tab):\n  - Replace the inline `<div class=\"multi-select-box\">...</div>` block (lines ~674\u2013682) with `<StudentMultiSelect v-model=\"selectedStudentIds\" :students=\"studentsList\" />`.\n  - Keep `fetchStudents()` and the `studentsList` ref on LecturerView \u2014 the component remains presentation-only.\n  - The existing label `'Select Students ({{ selectedStudentIds.length }} selected):'` can be simplified or removed since the component shows its own counter; keep the outer `<label>` for the section heading but drop the count (avoid double-counting).\n  - Import path: `import StudentMultiSelect from './StudentMultiSelect.vue'`.\n\nACCESSIBILITY:\n  - Root `<div role=\"group\" aria-label=\"Student selector\">`.\n  - Search input has visible label OR `aria-label=\"Search students\"`.\n  - List uses `role=\"listbox\"` with `aria-multiselectable=\"true\"`; each row `role=\"option\"` with `aria-selected` reflecting checkbox state.\n\nOUT OF SCOPE FOR THIS ROUND:\n  - Virtual scrolling. Current rosters are small (<500). Note in backlog if it becomes an issue.\n  - Server-side search.\n  - Async chunked load."
+    },
+    {
+      "id": "ARCH-009",
+      "decision": "Add a catch-all 404 route and NotFoundView.vue with a role-aware 'Back to home' link.",
+      "rationale": "Today the router has no catch-all; an unknown path lands on a blank `<router-view />` inside App.vue with the nav still rendered \u2014 confusing because nothing tells the user the path is bad. A typed 404 route lets the brutalist UI explicitly tell users where they are, and the role-aware home link plays well with ARCH-007's auth store. Keeping it as a separate view (not an inline template in App.vue) keeps App.vue dumb and aligns with the 'App renders router-view, nothing else' rule from ARCH-007.",
+      "affects": [
+        "frontend/src/components/NotFoundView.vue",
+        "frontend/src/router.ts"
+      ],
+      "design_notes": "CREATE `frontend/src/components/NotFoundView.vue`:\n  - Brutalist card: thick 2px black border, white background, monospace mark `404` styled like the `.logo-mark` (border + mono).\n  - Heading: 'Page not found'.\n  - Body: 'The path \"{{ route.fullPath }}\" does not exist.' (use `useRoute()` to show the attempted path verbatim \u2014 helps debugging).\n  - Primary link: text 'Back to home' that resolves the target via `useAuth()`:\n    * if not logged in \u2192 `/login`\n    * STUDENT \u2192 `/student`\n    * LECTURER or ADMIN \u2192 `/lecturer`\n    Use `<router-link>` not raw `<a>`.\n  - Optional secondary action: 'Go back' that calls `router.back()` (only if `window.history.length > 1`).\n  - Reuse the `.card`, `.btn-primary` styles already established; do not invent new classes beyond a small `.notfound-shell` wrapper centering the card vertically/horizontally similar to `.login-shell`.\n\nROUTE REGISTRATION (`router.ts`):\n  - Append AT THE END of the routes array:\n    `{ path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('./components/NotFoundView.vue'), meta: { requiresAuth: false } }`\n  - `meta.requiresAuth: false` is important: an unauthenticated user typing a junk URL should see 404, not be punted to /login (otherwise the user can't tell whether the URL was bad or auth was bad).\n  - Order matters in vue-router 4 only for ambiguous matches; since `/:pathMatch(.*)*` is the most permissive, it must be LAST.\n\nEDGE CASES:\n  - Typing `/admin` while logged in as STUDENT routes through the guard's role check \u2192 `/403`, NOT 404. Confirm by ordering: guard checks `requiresAuth` and `allowedRoles` first for matched routes; only truly unmatched paths fall to the catch-all.\n  - Logout while on `/not-found` (e.g. a stale tab): user stays on the page since `meta.requiresAuth: false`. The 'Back to home' link will resolve to `/login` because `isLoggedIn` is now false."
+    },
+    {
+      "id": "ARCH-010",
+      "decision": "Mobile responsiveness pass for <768px: stacked nav, fluid content, horizontal-scroll tables (one consistent strategy), media queries on App.vue and the four heavy views.",
+      "rationale": "Viewport meta is already present (verified in index.html). Layouts break below 768px primarily because (a) `.nav-links` is a single flex row with 5\u20137 buttons that overflows, (b) `.content` has a fixed `max-width: 1200px` but no horizontal padding adjustment, (c) LecturerView's `form-grid` is `1fr 1fr` and squashes inputs, (d) `ResultTable` and `.preview-table` overflow without affordance on some viewports. We pick ONE table strategy \u2014 horizontal scroll with a subtle scroll affordance \u2014 because it preserves all columns (important for the consolidated scores table which has dynamic exam columns) and a card layout would require duplicating semantic content per row. The brutalist aesthetic favors a stacked nav (no hamburger / no JS toggle) which collapses into a vertical column under the logo at the breakpoint.",
+      "affects": [
+        "frontend/src/App.vue",
+        "frontend/src/components/LecturerView.vue",
+        "frontend/src/components/StudentView.vue",
+        "frontend/src/components/ResultTable.vue",
+        "frontend/src/style.css"
+      ],
+      "design_notes": "BREAKPOINT: single breakpoint `@media (max-width: 767.98px)`. Use 767.98 (not 768) to avoid double-matching at exactly 768.\n\nAPP.VUE (top nav):\n  - Below breakpoint: `.top-nav` becomes `flex-direction: column; align-items: stretch; padding: 0.6rem 1rem; gap: 0.6rem;`.\n  - `.nav-links` becomes `flex-direction: column; align-items: stretch; gap: 0.3rem;` and each button becomes full-width with `text-align: left`.\n  - `.user-info` becomes its own line `margin-right: 0; padding-bottom: 0.4rem; border-bottom: 1px solid var(--color-border);`.\n  - `.logo` stays at the top.\n  - `.content` becomes `margin: 1.5rem auto; padding: 0 0.75rem; max-width: 100%;`. (Keep the 1200px cap above the breakpoint.)\n  - DO NOT introduce a hamburger or any JS-driven menu. Stacked is the spec.\n\nSTYLE.CSS (global utilities):\n  - Add a single `.responsive-table-wrap` class (matching `.preview-table-wrap`) with `overflow-x: auto; -webkit-overflow-scrolling: touch; border: 2px solid var(--color-border);` and a `::after` pseudo or right-side gradient hint to indicate scrollability when content overflows. Keep the affordance subtle (brutalist): a 12px wide right-edge linear-gradient from transparent to `rgba(0,0,0,0.08)` only when scrollable. If implementing the gradient is non-trivial without JS, fall back to a visible `\u2192` chevron hint inside the wrapper for mobile (CSS-only via `@media`).\n  - `.preview-table` (and any other table): below breakpoint, reduce `padding: 0.4rem 0.6rem` and `font-size: 0.8rem` to fit more on small screens before scroll kicks in.\n  - Add a utility `@media (max-width: 767.98px) { .form-grid { grid-template-columns: 1fr !important; } }` so any caller using `.form-grid` becomes single-column. (LecturerView's `.full-width` already spans, which becomes a no-op when there is only 1 column \u2014 fine.)\n\nLECTURERVIEW.VUE:\n  - `.tab-bar` below breakpoint: change `flex: 1` to allow horizontal scroll. Set `.tab-bar { overflow-x: auto; flex-wrap: nowrap; }` and `.tab-bar button { flex: 0 0 auto; min-width: 110px; }`. Avoid stacking tabs vertically \u2014 keeps the brutalist horizontal rhythm.\n  - `.context-selector` becomes `flex-direction: column; align-items: stretch;` below breakpoint.\n  - `.exam-context-status` becomes `flex-direction: column; align-items: flex-start; gap: 0.5rem;` below breakpoint.\n  - The consolidated scores table is already wrapped in `.preview-table-wrap` (horizontal scroll). Verify and keep.\n  - The Results tab's header `<div style=\"display: flex; justify-content: space-between;\">` with the Export button must stack on mobile: extract that inline style into a scoped class `.results-header` and add a media-query rule to switch to `flex-direction: column; align-items: stretch;`.\n\nSTUDENTVIEW.VUE:\n  - Implementor should AUDIT for: fixed widths, inline styles enforcing horizontal layout, table without `.preview-table-wrap`. Apply `.responsive-table-wrap` (or existing `.preview-table-wrap`) to any bare table. Reduce `padding` and stack any `.form-grid` (already handled globally if class is used).\n\nRESULTTABLE.VUE:\n  - Ensure the outer container uses `.preview-table-wrap` (or new `.responsive-table-wrap`) so horizontal scroll kicks in. Do NOT convert rows to cards on mobile \u2014 column dimensionality matters here.\n  - If headers wrap awkwardly on mobile, set `white-space: nowrap` on `th` so a column either fits or contributes to overflow (the scroll affordance covers the rest).\n\nNOT IN SCOPE THIS ROUND (P1/P2 \u2014 document in `docs/ui_ux_backlog.md` per agent_notes):\n  - Card-per-row table layouts for any view.\n  - Hamburger / slide-in nav.\n  - Tablet breakpoint (768\u20131023). Acceptable for now to use desktop layout from 768 upward.\n  - Touch-target audit (44px minimum) beyond what naturally falls out of padding bumps.\n\nACCEPTANCE / SPOT-CHECK CRITERIA (validator):\n  - At 360px wide (iPhone SE), `.top-nav` does not horizontally scroll; all buttons are stacked and reachable.\n  - At 360px wide, the consolidated scores table scrolls horizontally without clipping content under the nav.\n  - At 768px exactly, desktop layout applies (single-line nav, two-column form-grid).\n  - No use of `position: fixed` for the nav (keeps brutalist + avoids viewport edge cases on iOS Safari)."
+    }
+  ],
+  "todos": [],
+  "in_progress": [],
+  "completed": [
+    {
+      "id": "TODO-001",
+      "title": "Backend: Implement Practice Summary Aggregation in Repository",
+      "description": "Add `GetPracticeSummary(ctx, studentID)` to `PostgresRepository`. This method should return a list of practice questions with the student's best result (aggregated by `practice_question_id`, picking `is_correct=true` if it exists, otherwise the latest attempt). Define `PracticeSummary` struct in `models`.",
+      "depends_on": [],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "backend/internal/repository/postgres.go",
+        "backend/internal/models/practice.go"
+      ],
+      "arch_ref": "ARCH-001",
+      "done_when": "Repository has `GetPracticeSummary` and it correctly aggregates best attempts per question."
+    },
+    {
+      "id": "TODO-002",
+      "title": "Backend: Expose Practice Summary API Endpoint",
+      "description": "Add `GetSummary` handler to `PracticeController` mapping to `GET /api/v1/practice/summary`. Register the route in `backend/cmd/main.go`.",
+      "depends_on": [
+        "TODO-001"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/controllers/practice_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "arch_ref": "ARCH-001",
+      "done_when": "GET /api/v1/practice/summary returns a JSON array of practice summaries for the authenticated student."
+    },
+    {
+      "id": "TODO-003",
+      "title": "Frontend: Add Practice Summary Service Call",
+      "description": "Add `getSummary(): Promise<PracticeSummary[]>` to `frontend/src/services/practice.ts`.",
+      "depends_on": [
+        "TODO-002"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/services/practice.ts"
+      ],
+      "arch_ref": "ARCH-002",
+      "done_when": "`getSummary` is exported and successfully fetches data from the new backend endpoint."
+    },
+    {
+      "id": "TODO-004",
+      "title": "Frontend: Implement Practice Results Tab in Dashboard",
+      "description": "Update `StudentResults.vue` to include a 'Practice' tab. Display the aggregated practice summary in a table similar to exam results.",
+      "depends_on": [
+        "TODO-003"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/StudentResults.vue"
+      ],
+      "arch_ref": "ARCH-002",
+      "done_when": "The student dashboard has a working Practice Results tab showing question-level status."
+    },
+    {
+      "id": "TODO-005",
+      "title": "Frontend: Implement Post-Quiz Completion Summary",
+      "description": "Enhance `PracticeView.vue` to show a modal or inline summary after a successful or failed submission, providing immediate confirmation and feedback.",
+      "depends_on": [],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/PracticeView.vue"
+      ],
+      "arch_ref": "ARCH-003",
+      "done_when": "Students see a clear 'Correct/Incorrect' summary immediately after submitting a practice answer."
+    },
+    {
+      "id": "TODO-006",
+      "title": "Backend: Implement Consolidated Score Query for Lecturers",
+      "description": "Add `GetConsolidatedScores(ctx)` to `PostgresRepository`. This method should return a list of students with their total exam scores and total practice points (based on best attempts).",
+      "depends_on": [
+        "TODO-001"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "backend/internal/repository/postgres.go"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Repository can return a full list of student performance across all exams and practice questions."
+    },
+    {
+      "id": "TODO-007",
+      "title": "Backend: Add Lecturer CSV Export Endpoint",
+      "description": "Add `ExportScoresCSV` handler to `LecturerController` mapping to `GET /api/v1/lecturer/export/scores`. Generate a CSV with Student ID, Name, Exam Total, and Practice Total.",
+      "depends_on": [
+        "TODO-006"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "backend/internal/controllers/lecturer_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Requesting the export endpoint returns a CSV file with the consolidated scores."
+    },
+    {
+      "id": "TODO-008",
+      "title": "Frontend: Add Export Scores Button to Lecturer View",
+      "description": "Add an 'Export Scores (CSV)' button to `LecturerView.vue` that triggers the download of the consolidated CSV.",
+      "depends_on": [
+        "TODO-007"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Lecturers can download the performance CSV from their dashboard."
+    },
+    {
+      "id": "TODO-009",
+      "title": "Backend: Expose Consolidated Scores JSON API",
+      "description": "Add `GetScoresJSON` handler to `LecturerController` mapping to `GET /api/v1/lecturer/scores`. This endpoint should return the same consolidated data as the CSV export (Student ID, Name, Exam Total, Practice Total) in JSON format.",
+      "depends_on": [
+        "TODO-006"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/controllers/lecturer_controller.go",
+        "backend/cmd/main.go"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "GET /api/v1/lecturer/scores returns a JSON array of student performance records."
+    },
+    {
+      "id": "TODO-010",
+      "title": "Frontend: Create Lecturer Service and Scores Fetcher",
+      "description": "Create `frontend/src/services/lecturer.ts` and add `getConsolidatedScores()` function to fetch performance data from the backend.",
+      "depends_on": [
+        "TODO-009"
+      ],
+      "status": "PASS",
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/services/lecturer.ts"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "`getConsolidatedScores` is implemented and exports the fetching logic."
+    },
+    {
+      "id": "TODO-011",
+      "title": "Frontend: Implement Results Tab and Performance Table in Lecturer View",
+      "description": "Update `LecturerView.vue` to include a 'Results' tab. Implement a table showing student performance (Username, Exam Score, Practice Score). Integrate the 'Export Scores' button into this tab.",
+      "depends_on": [
+        "TODO-010",
+        "TODO-008"
+      ],
+      "status": "PASS",
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-004",
+      "done_when": "Lecturers can see a performance table and download the CSV from the new 'Results' tab."
+    },
+    {
+      "id": "TODO-012",
+      "title": "Frontend: Implement Exam Selector in Questions Tab",
+      "description": "Add a dropdown to the 'Questions' tab in `LecturerView.vue` to select an existing exam. Ensure it triggers `fetchExamQuestions` and updates the UI state when changed.",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-005",
+      "status": "PASS",
+      "done_when": "Lecturers can select an exam from a dropdown at the top of the Questions tab."
+    },
+    {
+      "id": "TODO-013",
+      "title": "Frontend: Add Activation Toggle and Status to Questions Tab",
+      "description": "Display the selected exam's activation status (Active/Inactive) and add a button to toggle this status directly from the 'Questions' tab. Handle backend error messages (409 Conflict) and display them to the user.",
+      "depends_on": [
+        "TODO-012"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-005",
+      "status": "PASS",
+      "done_when": "The selected exam's status is visible and can be toggled via a button in the Questions tab."
+    },
+    {
+      "id": "TODO-014",
+      "title": "Frontend: Implement Workflow Locking in Questions Tab",
+      "description": "Disable or hide the question creation/edit form and the questions list in `LecturerView.vue` until an exam is selected. Automatically bind `question.exam_id` to the selected exam.",
+      "depends_on": [
+        "TODO-013"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-005",
+      "status": "PASS",
+      "done_when": "The question form is unusable until an exam is selected, and exam_id is auto-filled."
+    },
+    {
+      "id": "TODO-015",
+      "title": "Frontend: Global Monotone Style Refactor",
+      "description": "Update `style.css` to enforce a strict black-on-white monotone theme. Remove any grid background patterns or background images from the root and app containers. Ensure `--color-bg` and `--color-surface` are strictly white (#ffffff) and `--color-text` is strictly black (#000000).",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/style.css",
+        "frontend/src/App.vue"
+      ],
+      "arch_ref": "ARCH-006",
+      "assigned_to": "codex-cli",
+      "reason": "Mechanical CSS variable refactor and style cleanup.",
+      "done_when": "Global styles use a strict monotone palette and any grid background is removed.",
+      "status": "PASS"
+    },
+    {
+      "id": "TODO-016",
+      "title": "Frontend: Component-Level Brutalist Style Audit",
+      "description": "Audit all Vue components to ensure they use high-contrast brutalist borders (thick black) and shadows (sharp offset). Replace any soft colors or gradients with black/white or pure highlight colors where appropriate.",
+      "depends_on": [
+        "TODO-015"
+      ],
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/AdminView.vue",
+        "frontend/src/components/BulkImportStudents.vue",
+        "frontend/src/components/LecturerView.vue",
+        "frontend/src/components/LoginView.vue",
+        "frontend/src/components/PracticeAuthoring.vue",
+        "frontend/src/components/PracticeView.vue",
+        "frontend/src/components/StudentResults.vue",
+        "frontend/src/components/StudentView.vue"
+      ],
+      "arch_ref": "ARCH-006",
+      "assigned_to": "gemini-cli",
+      "reason": "Multi-component audit requiring visual consistency reasoning.",
+      "done_when": "All major UI components (Cards, Buttons, Tables) exhibit the brutalist monotone aesthetic.",
+      "status": "PASS"
+    },
+    {
+      "id": "TODO-017",
+      "title": "Frontend: Implement Selective Highlights",
+      "description": "Ensure that status indicators (Success, Warning, Danger) and syntax highlighting (SqlEditor) use their respective highlight colors while maintaining high contrast against the monotone background. Verify contrast ratios for accessibility.",
+      "depends_on": [
+        "TODO-016"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/NotificationToast.vue",
+        "frontend/src/components/SqlEditor.vue",
+        "frontend/src/style.css"
+      ],
+      "arch_ref": "ARCH-006",
+      "assigned_to": "codex-cli",
+      "reason": "Isolated component updates for specific status colors.",
+      "done_when": "Highlight colors are used sparingly but effectively for critical information, and contrast is high.",
+      "status": "PASS"
+    },
+    {
+      "id": "TODO-018",
+      "title": "Create frontend/src/services/auth.ts with reactive useAuth() store",
+      "description": "Create a new file exporting a module-singleton reactive auth store and a useAuth() composable. Define AuthUser interface with fields id?, username, role ('ADMIN'|'LECTURER'|'STUDENT'). Define module-level authState = reactive({ token: string|null, user: AuthUser|null }). useAuth() must return: token, user, isLoggedIn (computed(() => !!authState.token && !!authState.user)), login(token, user) which writes to both localStorage keys 'sql_quiz_token'/'sql_quiz_user' AND sets reactive state, logout() which clears both storage keys and reactive state (navigation is left to the caller), and hydrateFromStorage() which reads from localStorage and sets reactive state. Must NOT import from router (avoids circular dependency).",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/services/auth.ts"
+      ],
+      "arch_ref": "ARCH-007",
+      "done_when": "frontend/src/services/auth.ts exists and exports useAuth(). Calling hydrateFromStorage() when localStorage has valid keys makes isLoggedIn.value true. Calling login() writes to localStorage and sets isLoggedIn.value true. Calling logout() clears localStorage and sets isLoggedIn.value false.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; new single-file TypeScript service \u2014 Codex is the natural fit.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-019",
+      "title": "Update frontend/src/main.ts to hydrate auth store before app.mount()",
+      "description": "Import useAuth from './services/auth' and call useAuth().hydrateFromStorage() BEFORE app.use(router) and app.mount('#app'). This guarantees the reactive auth state is seeded from localStorage synchronously, so router guards and App.vue see isLoggedIn as true on hard refresh of a protected route without any flicker.",
+      "depends_on": [
+        "TODO-018"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/main.ts"
+      ],
+      "arch_ref": "ARCH-007",
+      "done_when": "main.ts calls hydrateFromStorage() before app.use(router) and app.mount(). The import resolves without TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file main.ts tweak force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-020",
+      "title": "Rework frontend/src/router.ts: replace meta.role/public with meta.requiresAuth/allowedRoles, fix /dashboard redirect, add /403 route, single beforeEach guard",
+      "description": "Replace all meta.public and meta.role usages with meta.requiresAuth (boolean) and meta.allowedRoles (Role[] | undefined). Route-level meta per design_notes: /login -> requiresAuth:false; /student -> requiresAuth:true, allowedRoles:['STUDENT']; /lecturer -> requiresAuth:true, allowedRoles:['ADMIN','LECTURER']; /admin -> requiresAuth:true, allowedRoles:['ADMIN']; /practice -> requiresAuth:true, allowedRoles:['STUDENT']; /student/results -> requiresAuth:true, allowedRoles:['STUDENT']; /lecturer/practice -> requiresAuth:true, allowedRoles:['ADMIN','LECTURER']. Change /dashboard from a broken component: App.vue import to a pure redirect function: redirect: () => { const u = useAuth().user.value; return u?.role === 'ADMIN' ? '/admin' : u?.role === 'LECTURER' ? '/lecturer' : u?.role === 'STUDENT' ? '/student' : '/login' }. Add /403 route: { path: '/403', name: 'forbidden', component: () => import('./components/ForbiddenView.vue'), meta: { requiresAuth: false } }. Replace the existing beforeEach with a single guard implementing four rules: (1) !requiresAuth AND isLoggedIn AND no ?force=1 -> redirect /dashboard; (2) requiresAuth AND !isLoggedIn -> redirect /login?redirect=to.fullPath; (3) allowedRoles defined AND user.role not in list -> redirect to name:'forbidden'; (4) else next(). Import useAuth from './services/auth'. Add TypeScript module augmentation for RouteMeta to include requiresAuth and allowedRoles fields.",
+      "depends_on": [
+        "TODO-018"
+      ],
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/router.ts"
+      ],
+      "arch_ref": "ARCH-007",
+      "done_when": "router.ts compiles without TypeScript errors. All routes have meta.requiresAuth declared. The /dashboard route no longer imports App.vue as its component. The single beforeEach guard replaces the old one. The /403 named route 'forbidden' is registered as the second-to-last route (before the catch-all added in TODO-025).",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; medium-complexity single-file router rework force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-024",
+      "title": "Create frontend/src/components/StudentMultiSelect.vue controlled component",
+      "description": "Create a new fully controlled Vue 3 component. Props (TypeScript): modelValue: number[], students: Array<{id: number; username: string}>, loading?: boolean, placeholder?: string (default 'Search students...'), maxHeight?: string (default '250px'). Emits: 'update:modelValue' with number[]. Internal state: searchQuery ref. Filtered list = students filtered by case-insensitive substring match on username against searchQuery. Layout: root div with role='group' aria-label='Student selector'; inside: a .msel-toolbar flex row containing a search input (aria-label='Search students') and two text-buttons '[Select All]' / '[Select None]'; a counter line '{n} of {total} selected'; the list div with role='listbox' aria-multiselectable='true', maxHeight CSS, overflow-y auto; each row div with role='option', :aria-selected, tabindex driven by roving focusedIndex ref; checkbox + label per row. Select All: union of currently-filtered IDs into existing selection (not a replace). Select None: remove currently-filtered IDs from existing selection. Keyboard: ArrowDown/ArrowUp moves focusedIndex, Space/Enter toggles focused item; search input is first focus stop (tabindex=0), rows use tabindex=-1 except focused one which gets tabindex=0 (roving pattern). When filteredList changes, clamp focusedIndex to valid range. Empty state: 'No students match.' when filtered is empty but students.length > 0; 'No students found.' when students.length === 0. Styling: reuse .multi-select-box and .student-item classes (2px black border, monospace, sharp corners); add .msel-toolbar flex row styling in scoped style. No new color variables.",
+      "depends_on": [],
+      "complexity": "high",
+      "file_scope": [
+        "frontend/src/components/StudentMultiSelect.vue"
+      ],
+      "arch_ref": "ARCH-008",
+      "done_when": "StudentMultiSelect.vue exists and compiles. It renders the search input, Select All/None buttons, the counter, and the filtered student list. Clicking a row emits update:modelValue with the toggled selection. Select All on a filtered subset unions into existing selection. Select None on a filtered subset removes only those IDs. Arrow key navigation moves focus through rendered rows. Empty states display correctly.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; high-complexity single-file Vue component force-routed to Codex per parked-lane policy (flag: high complexity).",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-028",
+      "title": "Add mobile responsive utilities to frontend/src/style.css",
+      "description": "Add to style.css: (1) A .responsive-table-wrap utility class with overflow-x: auto; -webkit-overflow-scrolling: touch; border: 2px solid var(--color-border);. Include a CSS-only right-edge scroll affordance via @media (max-width: 767.98px): a position: relative wrapper with an ::after pseudo-element creating a 12px right-side linear-gradient from transparent to rgba(0,0,0,0.08); if the gradient approach is complex, fall back to a visible right-border/chevron hint. (2) A single @media (max-width: 767.98px) block with: .form-grid { grid-template-columns: 1fr !important; } and .preview-table th, .preview-table td, .data-table th, .data-table td { padding: 0.4rem 0.6rem; font-size: 0.8rem; }. Do not alter any existing rules above the breakpoint.",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/style.css"
+      ],
+      "arch_ref": "ARCH-010",
+      "done_when": "style.css has a .responsive-table-wrap class. At viewport width <=767.98px, .form-grid collapses to a single column and table cells reduce padding/font-size. The existing desktop styles above 768px are unaffected.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file CSS additions force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-021",
+      "title": "Create frontend/src/components/ForbiddenView.vue (403 page)",
+      "description": "Create a brutalist 403 view component. Must display a '403' mark styled like .logo-mark (border + mono font), heading 'Forbidden', and a paragraph 'You do not have permission to access this page.' Include a 'Return to home' router-link that computes its target using useAuth(): not logged in -> /login; STUDENT -> /student; LECTURER or ADMIN -> /lecturer. Reuse .card, .btn-primary styles. Wrap in a .notfound-shell (or .forbidden-shell) centering the card vertically and horizontally (same pattern as .login-shell). Must import useAuth from '../services/auth' and useRoute from 'vue-router'.",
+      "depends_on": [
+        "TODO-018"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/ForbiddenView.vue"
+      ],
+      "arch_ref": "ARCH-007",
+      "done_when": "ForbiddenView.vue renders a centered brutalist card with '403', a heading, a description, and a router-link whose :to prop is computed from useAuth().user.value?.role. No TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity new single-file Vue component force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-022",
+      "title": "Refactor frontend/src/App.vue to consume useAuth() and drop localStorage reads",
+      "description": "Delete: isLoggedIn ref, user ref, checkAuth function, onMounted, and the watch(route.path, checkAuth) block. Replace with: const { user, isLoggedIn, logout: doLogout } = useAuth(). Change the nav v-if from 'isLoggedIn && user' to 'isLoggedIn'. Update the logout button handler to: doLogout(); router.push('/login'). Remove unused imports (ref, onMounted, watch). Keep useRouter and useRoute imports if still used; keep NotificationToast. Template and styles are otherwise unchanged.",
+      "depends_on": [
+        "TODO-018",
+        "TODO-019"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/App.vue"
+      ],
+      "arch_ref": "ARCH-007",
+      "done_when": "App.vue has no direct localStorage reads. isLoggedIn and user are derived from useAuth(). The nav renders correctly for each role. No TypeScript errors. The watch(route.path) hack is gone.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file App.vue refactor force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-023",
+      "title": "Update frontend/src/components/LoginView.vue to call useAuth().login() and honor ?redirect=",
+      "description": "After a successful POST /api/v1/login response, replace the two direct localStorage.setItem calls with a single call to useAuth().login(data.token, data.user). Then replace router.push('/dashboard') with router.push((route.query.redirect as string) || '/dashboard') to support the deep-link round-trip defined in the ARCH-007 guard. Add imports: useAuth from '../services/auth', useRoute from 'vue-router'. The rest of LoginView (form, error display, loading state) remains unchanged.",
+      "depends_on": [
+        "TODO-018",
+        "TODO-020"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LoginView.vue"
+      ],
+      "arch_ref": "ARCH-007",
+      "done_when": "LoginView.vue no longer calls localStorage.setItem directly. After login it calls useAuth().login(). router.push uses route.query.redirect when present. No TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file LoginView tweak force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-025",
+      "title": "Integrate StudentMultiSelect into LecturerView.vue Assignments tab",
+      "description": "In the Assignments tab of LecturerView.vue (around lines 673-682), replace the inline <div class='multi-select-box'>...</div> block with <StudentMultiSelect v-model='selectedStudentIds' :students='studentsList' />. Import StudentMultiSelect from './StudentMultiSelect.vue' and register it. Simplify the outer label from 'Select Students ({{ selectedStudentIds.length }} selected):' to 'Select Students:' since the component now shows its own counter. Keep fetchStudents() and the studentsList ref on LecturerView unchanged. Do not modify any other part of LecturerView.",
+      "depends_on": [
+        "TODO-024"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-008",
+      "done_when": "LecturerView.vue Assignments tab renders StudentMultiSelect in place of the inline checkbox list. The selectedStudentIds ref is still updated when selections change. studentsList is still fetched from GET /api/v1/users/students. No TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file LecturerView integration force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-026",
+      "title": "Create frontend/src/components/NotFoundView.vue (404 page)",
+      "description": "Create a brutalist 404 view. Render a .notfound-shell centering a .card vertically and horizontally (matching .login-shell layout). Inside the card: a '404' monospace mark styled like .logo-mark (2px border + mono font); heading 'Page not found'; body paragraph showing the attempted path verbatim using useRoute().fullPath (e.g. 'The path \"/foo/bar\" does not exist.'); a 'Back to home' router-link whose :to is computed from useAuth(): not logged in -> '/login', STUDENT -> '/student', LECTURER or ADMIN -> '/lecturer'; an optional 'Go back' button that calls router.back() shown only when window.history.length > 1. Reuse .card, .btn-primary classes; add only a small .notfound-shell scoped style. Import useAuth from '../services/auth', useRoute and useRouter from 'vue-router'.",
+      "depends_on": [
+        "TODO-018"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/NotFoundView.vue"
+      ],
+      "arch_ref": "ARCH-009",
+      "done_when": "NotFoundView.vue renders a centered brutalist card with '404', the attempted path verbatim, a role-aware 'Back to home' router-link, and a conditional 'Go back' button. No TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity new single-file NotFoundView component force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-027",
+      "title": "Append catch-all 404 route to frontend/src/router.ts",
+      "description": "Append as the absolute last entry in the routes array: { path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('./components/NotFoundView.vue'), meta: { requiresAuth: false } }. The route must be last so it only matches truly unmatched paths. meta.requiresAuth: false is required so unauthenticated users see 404 instead of being redirected to /login. The /403 route added in TODO-020 must appear before this catch-all.",
+      "depends_on": [
+        "TODO-020",
+        "TODO-026"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/router.ts"
+      ],
+      "arch_ref": "ARCH-009",
+      "done_when": "router.ts ends with the /:pathMatch(.*)*  catch-all route with name 'not-found' and meta.requiresAuth: false. Navigating to /this-does-not-exist renders NotFoundView. Navigating to /admin as a STUDENT still hits the guard role check and goes to /403 (not 404). No TypeScript errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file router append force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-029",
+      "title": "Add mobile responsive styles to frontend/src/App.vue (stacked nav at <768px)",
+      "description": "Add a @media (max-width: 767.98px) block inside the App.vue <style> section (non-scoped, since the classes are non-scoped). Rules: .top-nav { flex-direction: column; align-items: stretch; padding: 0.6rem 1rem; gap: 0.6rem; }; .nav-links { flex-direction: column; align-items: stretch; gap: 0.3rem; }; .nav-links button { text-align: left; width: 100%; }; .user-info { margin-right: 0; padding-bottom: 0.4rem; border-bottom: 1px solid var(--color-border); }; .content { margin: 1.5rem auto; padding: 0 0.75rem; max-width: 100%; }. Do NOT add a hamburger menu or any JavaScript-driven nav toggle. The nav stacks visually only via CSS.",
+      "depends_on": [
+        "TODO-022"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/App.vue"
+      ],
+      "arch_ref": "ARCH-010",
+      "done_when": "At viewport width <=767.98px, the top nav stacks vertically (logo, then nav buttons each full-width), and .content has no horizontal overflow. At 768px exactly the desktop single-line nav is used. No JS nav toggle exists.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file App.vue media-query additions force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-030",
+      "title": "Add mobile responsive styles to frontend/src/components/LecturerView.vue",
+      "description": "Add a @media (max-width: 767.98px) block in LecturerView.vue's scoped styles. Rules: .tab-bar { overflow-x: auto; flex-wrap: nowrap; }; .tab-bar button { flex: 0 0 auto; min-width: 110px; } (horizontal scroll, no vertical stacking); .context-selector { flex-direction: column; align-items: stretch; }; .exam-context-status { flex-direction: column; align-items: flex-start; gap: 0.5rem; }. Additionally, extract the inline style='display: flex; justify-content: space-between;' on the Results tab header div into a scoped class .results-header and add: @media (max-width: 767.98px) { .results-header { flex-direction: column; align-items: stretch; } }. Verify the consolidated scores table is wrapped in .preview-table-wrap (already present per code review); if not, add the wrapper.",
+      "depends_on": [
+        "TODO-028"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/LecturerView.vue"
+      ],
+      "arch_ref": "ARCH-010",
+      "done_when": "At <=767.98px: the tab bar scrolls horizontally (buttons do not wrap/stack vertically); .context-selector and .exam-context-status stack vertically; the Results header (title + Export button) stacks vertically. The consolidated scores table scrolls horizontally. No desktop layout is broken.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file LecturerView scoped-style additions force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-031",
+      "title": "Add mobile responsive styles to frontend/src/components/StudentView.vue",
+      "description": "Audit StudentView.vue for: (1) any bare <table> not wrapped in .preview-table-wrap or .responsive-table-wrap \u2014 add the wrapper; (2) any inline styles enforcing horizontal two-column layout \u2014 extract to scoped classes and add @media (max-width: 767.98px) rules to stack them; (3) any fixed widths that would cause overflow at 360px. Add a @media (max-width: 767.98px) block addressing the above findings. If StudentView uses .form-grid, that is already handled globally by TODO-028 and needs no per-component override.",
+      "depends_on": [
+        "TODO-028"
+      ],
+      "complexity": "medium",
+      "file_scope": [
+        "frontend/src/components/StudentView.vue"
+      ],
+      "arch_ref": "ARCH-010",
+      "done_when": "At viewport width <=767.98px, StudentView.vue renders without horizontal overflow on the page. All tables are wrapped in a scroll-capable container. No fixed widths clip content at 360px.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; medium-complexity single-file StudentView audit/responsive pass force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-032",
+      "title": "Add mobile responsive styles to frontend/src/components/ResultTable.vue",
+      "description": "Wrap the existing table element in ResultTable.vue inside a .responsive-table-wrap (or .preview-table-wrap) div to enable horizontal scroll on mobile. The current template uses an inline style with overflow-x: auto on a wrapping div \u2014 replace the inline overflow-x: auto div with the class-based .responsive-table-wrap from style.css (added in TODO-028) for consistency. Add white-space: nowrap to th elements via a scoped style rule so headers contribute to horizontal scroll width rather than wrapping. Do NOT convert rows to cards.",
+      "depends_on": [
+        "TODO-028"
+      ],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/components/ResultTable.vue"
+      ],
+      "arch_ref": "ARCH-010",
+      "done_when": "ResultTable.vue uses .responsive-table-wrap (class-based) for its outer container. th elements have white-space: nowrap. At <=767.98px, the table scrolls horizontally rather than clipping or wrapping columns. No TypeScript or template errors.",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file ResultTable.vue wrapper swap force-routed to Codex per parked-lane policy.",
+      "status": "DONE"
+    },
+    {
+      "id": "TODO-033",
+      "title": "Exempt error routes from router beforeEach Rule 1's auto-redirect",
+      "description": "In frontend/src/router.ts, modify the beforeEach guard's Rule 1 so that logged-in users navigating to the named error routes ('not-found' and 'forbidden') are NOT redirected to /dashboard. Currently Rule 1 reads: `if (!to.meta.requiresAuth && isLoggedIn.value) { if (to.query.force === '1') { next(); return } next({ path: '/dashboard' }); return }`. Change it to additionally allow through when `to.name === 'forbidden' || to.name === 'not-found'`. Recommended implementation: extend the existing escape-hatch condition so the early `next()` fires for any of (a) `to.query.force === '1'`, (b) `to.name === 'forbidden'`, (c) `to.name === 'not-found'`. Example: `if (!to.meta.requiresAuth && isLoggedIn.value) { if (to.query.force === '1' || to.name === 'forbidden' || to.name === 'not-found') { next(); return } next({ path: '/dashboard' }); return }`. Do NOT change meta.requiresAuth on /403 or the catch-all (both must stay false so unauthenticated users can still see error pages directly). Do NOT alter Rule 2, Rule 3, or any other route definitions. After the change, verify by reading: (1) logged-in STUDENT typing /admin -> Rule 3 redirects to name:'forbidden' -> Rule 1 allows it through -> ForbiddenView renders. (2) logged-in user typing /this-does-not-exist -> matches catch-all (name:'not-found') -> Rule 1 allows it through -> NotFoundView renders. (3) unauthenticated user typing /403 or /bogus-path -> still sees the error page (Rule 1 short-circuits because isLoggedIn is false). (4) logged-in user typing /login -> still bounces to /dashboard (the named-route exception does not apply). (5) ?force=1 escape hatch still works.",
+      "depends_on": [],
+      "complexity": "low",
+      "file_scope": [
+        "frontend/src/router.ts"
+      ],
+      "arch_ref": "ARCH-007",
+      "assigned_to": "codex-cli",
+      "reason": "Antigravity lane parked; low-complexity single-file router guard tweak force-routed to Codex per parked-lane policy. Originates from feedback-loop round 2026-05-22 resolving the merge-check FAIL on TODO-020/TODO-021/TODO-027 (Rule 1 swallowed /403 and /404 for logged-in users).",
+      "done_when": "router.ts beforeEach Rule 1 lets named routes 'forbidden' and 'not-found' through for logged-in users. Manual smoke: STUDENT navigating to /admin renders ForbiddenView (not the student dashboard); any logged-in user navigating to a bogus URL renders NotFoundView (not the dashboard). /login still redirects logged-in users to /dashboard. ?force=1 escape hatch still works. vue-tsc --noEmit exits 0.",
+      "status": "DONE"
+    }
+  ],
+  "failed": [],
+  "agent_notes": {
+    "model_conflict_resolution": "The 'gemini-implementor' subagent encountered a model resolution loop for the invalid 'gemini-3.1-flash-preview' model. To resolve this, the 'generalist' agent was used to perform TODO-016 and TODO-017. Custom aliases and resolutions were also added to .gemini/settings.json to map the invalid string to 'gemini-3-flash-preview'.",
+    "ui_ux_p0_round_2026_05_22": "Round scope: four P0 UI/UX fixes designed in ARCH-007 (router-driven auth + useAuth store), ARCH-008 (extract StudentMultiSelect.vue with search/keyboard/select-all-none; corrects the brief's claim of a comma-separated input \u2014 LecturerView already had an inline checkbox list, the real gap is reusability and ergonomics), ARCH-009 (404 catch-all + role-aware NotFoundView), and ARCH-010 (mobile <768px: stacked nav, fluid content, horizontal-scroll tables as the single consistent table strategy, no hamburger). Backend verification: GET /api/v1/users/students exists (not /users?role=STUDENT as the brief stated); no backend changes required for this round. Viewport meta tag is already present in index.html. P1/P2 items deferred to docs/ui_ux_backlog.md include: token-expiry interceptor, tablet breakpoint, touch-target audit, virtual scrolling on StudentMultiSelect, card-per-row table mode, and a global Pinia migration if state outgrows the module-singleton reactive() pattern.",
+    "codex": {
+      "TODO-018": "Created frontend/src/services/auth.ts with module-singleton reactive authState, useAuth() composable returning token/user/isLoggedIn/login/logout/hydrateFromStorage. No circular router dependency.",
+      "TODO-019": "Updated main.ts: added useAuth import and hydrateFromStorage() call before app.use(router)/app.mount(). vue-tsc passed.",
+      "TODO-020": "Rewrote router.ts: meta.public/role -> meta.requiresAuth/allowedRoles; /dashboard is pure redirect using useAuth().user.value; /403 forbidden route added; single beforeEach guard with 3 rules. RouteMeta augmented. 11 requiresAuth occurrences confirmed.",
+      "TODO-021": "Created ForbiddenView.vue: brutalist 403 card with useAuth()-derived homeTarget computed to /login, /student, or /lecturer based on role.",
+      "TODO-024": "Created StudentMultiSelect.vue: full controlled component with search filter, Select All/None (union/diff on filtered set), roving tabindex keyboard nav, empty states, brutalist scoped styles. Uses nextTick for focus.",
+      "TODO-028": "Appended .responsive-table-wrap class + @media(max-width:767.98px) block to style.css with .form-grid single-column and table cell size reduction.",
+      "TODO-022": "Refactored App.vue: removed isLoggedIn/user refs, checkAuth, onMounted, watch(route.path); now uses useAuth(). nav v-if changed to v-if=isLoggedIn. vue-tsc passed.",
+      "TODO-023": "Updated LoginView.vue: replaced localStorage.setItem calls with login(data.token, data.user); router.push now uses route.query.redirect fallback.",
+      "TODO-025": "Replaced inline checkbox list in LecturerView.vue Assignments tab with StudentMultiSelect v-model component. Added import. Label simplified.",
+      "TODO-026": "Created NotFoundView.vue: brutalist 404 card with useRoute().fullPath display, useAuth()-derived homeTarget, conditional Go back button.",
+      "TODO-027": "Appended catch-all /:pathMatch(.*)*  route as last entry in router.ts routes array with name=not-found and meta.requiresAuth=false. /403 is second-to-last.",
+      "TODO-029": "Added @media(max-width:767.98px) block to App.vue style section: .top-nav stacks, .nav-links columns, buttons full-width, .user-info border-bottom, .content fluid.",
+      "TODO-030": "Added .results-header scoped class replacing inline flex style on Results tab header. Added @media(max-width:767.98px) block for tab-bar horizontal scroll, context-selector/exam-context-status stacking.",
+      "TODO-031": "Added @media(max-width:767.98px) .student-shell{padding:0 0.5rem} to StudentView.vue. Pre-existing 768px breakpoint for pane-grid/header-bar kept intact.",
+      "TODO-032": "Updated ResultTable.vue: outer div now uses class=responsive-table-wrap (drops inline overflowX), added scoped th{white-space:nowrap}.",
+      "TODO-033": "Extended Rule 1 escape-hatch condition in router.ts line 97 to include || to.name === \"forbidden\" || to.name === \"not-found\"; single-line change, vue-tsc exits 0, no other lines touched."
+    },
+    "merge": {
+      "verdict": "FAIL",
+      "files_reviewed": 12,
+      "conflicts": [
+        {
+          "file": "frontend/src/router.ts",
+          "issue": "/403 route has meta.requiresAuth:false, so Rule 1 of beforeEach (public route + isLoggedIn -> redirect /dashboard) fires whenever a logged-in user is sent to name:forbidden by Rule 3. The result is: role-mismatch navigation goes /admin -> Rule3 -> /403 -> Rule1 -> /dashboard, bypassing ForbiddenView entirely. ForbiddenView.vue is unreachable for any authenticated user.",
+          "todos": [
+            "TODO-020",
+            "TODO-021",
+            "TODO-027"
+          ],
+          "root_cause": "ARCH-007 design_notes specify requiresAuth:false for /403 so unauthenticated users can see it, but the same guard rule that protects public pages from logged-in users (Rule 1) unconditionally catches /403 \u2014 the design did not include a named-route exception alongside the force=1 exception."
+        }
+      ],
+      "notes": [
+        "catch-all /:pathMatch(.*)*  is correctly last in routes array (line 80), after /403 (line 74).",
+        "Auth contract is fully consistent: all five consumers (App.vue, LoginView.vue, router.ts, ForbiddenView.vue, NotFoundView.vue) use useAuth() with isLoggedIn.value and user.value.role. No renamed exports detected.",
+        "No old meta.role or meta.public references found anywhere in the frontend source tree.",
+        "App.vue, LoginView.vue: zero direct localStorage reads remaining. LecturerView.vue still reads localStorage for the auth token in its fetch calls (pre-existing pattern, not in the scope of this round).",
+        "vue-tsc --noEmit exits 0. The AuthNavState cast in App.vue (line 14) changes user from ComputedRef<AuthUser|null> to ComputedRef<AuthUser>; all template accesses on user are inside v-if=\"isLoggedIn\" which is a runtime guard. The cast hides a theoretical null (if isLoggedIn is true but user is somehow null), but in practice the auth store guarantees isLoggedIn = !!token && !!user. No type error at compile time and tsc passed.",
+        "No provide/inject usage found in App.vue or any child component; backward-compatibility item 8 is clean.",
+        "StudentMultiSelect integration: inline checkbox block replaced cleanly (line 676); import present (line 4). The orphaned .multi-select-box and .student-item scoped CSS rules remain in LecturerView.vue (lines 788-810) \u2014 dead CSS, not a conflict, but a cleanup item for the feedback loop.",
+        "Mobile breakpoints: App.vue has @media(max-width:767.98px); LecturerView.vue has @media(max-width:767.98px); style.css has @media(max-width:767.98px). These rules do not contradict each other. StudentView.vue has a pre-existing @media(max-width:768px) block (pane-grid, header-bar) alongside the new @media(max-width:767.98px) block from TODO-031 \u2014 the 768px block is pre-existing and was intentionally kept; the 0.02px overlap is cosmetic only, not a merge conflict."
+      ]
+    },
+    "feedback_loop_round_2026_05_22": {
+      "verdict": "RE-ROUTE to codex-cli (Option 1 from merge-check)",
+      "failure_source": "merge-check (step [5]) FAIL on frontend/src/router.ts",
+      "failure_summary": "beforeEach Rule 1 (`!requiresAuth && isLoggedIn -> /dashboard`) unconditionally swallows /403 and the /:pathMatch(.*)* catch-all, because both routes carry meta.requiresAuth:false per ARCH-007 / ARCH-009. Consequence: ForbiddenView is unreachable for any logged-in user (role-mismatch flow /admin -> Rule3 name:forbidden -> Rule1 -> /dashboard -> role-home), and NotFoundView is unreachable for logged-in users hitting bad URLs. Affected TODOs: TODO-020 (router rework), TODO-021 (ForbiddenView), TODO-027 (catch-all).",
+      "decision_rationale": "Option 1 (named-route exception in Rule 1) chosen. Option 2 (flip meta.requiresAuth to true on /403 and /404) regresses UX for unauthenticated users hitting bookmarked broken links by bouncing them to /login instead of showing the error page. Option 3 (different redirect target) is more invasive and not clearly better. Option 1 preserves the original ARCH-007 intent ('unauthenticated users can see error pages') with the smallest code change, keeps meta semantics intact, and parallels the existing ?force=1 escape hatch idiom.",
+      "original_implementors": {
+        "TODO-020": "codex-cli",
+        "TODO-021": "codex-cli",
+        "TODO-027": "codex-cli"
+      },
+      "re_routed_to": "codex-cli",
+      "new_todo": "TODO-033",
+      "additional_context": "Single-line behavior change in frontend/src/router.ts beforeEach Rule 1: extend the early-allow branch from `to.query.force === '1'` to `to.query.force === '1' || to.name === 'forbidden' || to.name === 'not-found'`. No other routes or rules change. ARCH-007 design_notes updated with a clarifying sentence so future readers understand the exception list.",
+      "escalate_to_architect": false,
+      "loop_guard": "First feedback-loop cycle for these TODO IDs. If TODO-033 itself fails merge-check or validator, escalate to architect (ARCH-007 would need redesign of the public-route auto-redirect rule).",
+      "orchestrator_instructions": "Dispatch step [4b] codex-implementor for TODO-033, then re-run [5] merge-check on the touched file (frontend/src/router.ts), then [6] validator, then [7] regression-tester. TODO-020/021/027 stay in 'completed'/'DONE' state (their original deliverables are intact); the fix is layered on top via TODO-033 rather than reopening them."
+    },
+    "tester": {
+      "TODO-018": {
+        "tests_added": "frontend/src/__tests__/auth.test.ts",
+        "result": "7/7 tests passed",
+        "cases_covered": [
+          "login() writes to localStorage AND reactive state; isLoggedIn becomes true",
+          "logout() clears both storage AND state; isLoggedIn becomes false",
+          "hydrateFromStorage() restores token and user from pre-populated localStorage",
+          "hydrateFromStorage() is a no-op when localStorage is empty",
+          "hydrateFromStorage() gracefully handles corrupted user JSON (no throw; stays logged out)",
+          "isLoggedIn is false when only token is present (no user)",
+          "isLoggedIn is false when only user is present (no token)"
+        ]
+      },
+      "TODO-020": {
+        "tests_added": "frontend/src/__tests__/router.test.ts",
+        "result": "10/10 tests passed (shared file with TODO-027 and TODO-033)",
+        "cases_covered": [
+          "Unauthenticated user -> /student -> redirected to /login?redirect=/student (Rule 2)",
+          "Unauthenticated user -> /login -> allowed (Rule 1 short-circuits at !isLoggedIn)",
+          "Unauthenticated user -> /403 -> allowed (forbidden route reached)",
+          "Unauthenticated user -> /nonexistent-bogus-url -> not-found",
+          "Logged-in STUDENT -> /student -> allowed",
+          "Logged-in STUDENT -> /admin -> /403 (Rule 3 + Rule 1 named-route exception)",
+          "Logged-in user -> /login (no force=1) -> bounced to /student via /dashboard",
+          "Logged-in user -> /login?force=1 -> allowed",
+          "Logged-in LECTURER -> /dashboard -> /lecturer"
+        ]
+      },
+      "TODO-027": {
+        "tests_added": "frontend/src/__tests__/router.test.ts",
+        "result": "covered in shared router test file",
+        "cases_covered": [
+          "Unauthenticated user -> /nonexistent-bogus-url -> name=not-found",
+          "Logged-in STUDENT -> /nonexistent-bogus-url -> name=not-found (TODO-033 fix verified)"
+        ]
+      },
+      "TODO-033": {
+        "tests_added": "frontend/src/__tests__/router.test.ts",
+        "result": "covered in shared router test file",
+        "cases_covered": [
+          "Logged-in STUDENT -> /admin -> Rule 3 sends to forbidden -> Rule 1 exception allows it -> /403 renders",
+          "Logged-in STUDENT -> /nonexistent-bogus-url -> Rule 1 exception allows not-found -> NotFoundView renders"
+        ]
+      },
+      "TODO-024": {
+        "tests_added": "frontend/src/__tests__/StudentMultiSelect.test.ts",
+        "result": "15/15 tests passed",
+        "cases_covered": [
+          "renders one row per students prop",
+          "renders No students found. when students is empty",
+          "shows Loading students... when loading=true",
+          "checking a row emits update:modelValue with ID added",
+          "unchecking a row emits update:modelValue with ID removed",
+          "Select All unions all filtered IDs into existing selection",
+          "Select None removes only filtered IDs from selection",
+          "search input filters visible rows (case-insensitive)",
+          "search shows No students match. when filter finds nothing",
+          "Select All with active filter adds only filtered IDs (union)",
+          "Select None with active filter removes only filtered IDs (preserves others)",
+          "container has role=group",
+          "listbox has role=listbox",
+          "rows have role=option and aria-selected reflecting modelValue",
+          "arrow key navigation moves focus through rendered rows"
+        ]
+      },
+      "framework": "vitest@4.1.7 + @vue/test-utils@2.4.10 + happy-dom@20.9.0 \u2014 newly added (project had no prior test infra)",
+      "total_result": "3 test files, 32 tests total, 32 passed, 0 failed, exit code 0"
+    }
+  }
+}

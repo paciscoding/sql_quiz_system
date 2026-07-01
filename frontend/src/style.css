@@ -20,7 +20,7 @@
   /* --- Text -------------------------------------------------------------- */
   --color-text:          #1e1c17;   /* near-black, warm */
   --color-text-muted:    #6b6558;
-  --color-text-subtle:   #948c7c;
+  --color-text-subtle:   #7c7466;   /* AA 4.6:1 on white (was #948c7c ≈ 3.3:1, failed) */
   --color-link:          #285c8a;
   --color-link-hover:    #1c4366;
 
@@ -523,6 +523,7 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
 /* ---------- Layout shell ------------------------------------------------- */
 .cms-shell {
   min-height: 100vh;
+  min-height: 100dvh;   /* avoid mobile browser-chrome over/undershoot */
   display: grid;
   grid-template-rows: var(--layout-header-h) 1fr;
   background: var(--color-bg);
@@ -617,8 +618,12 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   box-shadow: var(--shadow-1);
 }
 
-/* When a view wants to render full-bleed (e.g. login), opt out of .cms-main. */
+/* When a view wants to render full-bleed (e.g. login), opt out of .cms-main.
+   The sidebar <aside> is absent on these routes, so the single grid child would
+   otherwise land in the fixed sidebar column (--layout-sidebar-w). Span the full
+   grid width so the content can use the whole viewport. */
 .cms-main.is-bare {
+  grid-column: 1 / -1;
   background: transparent;
   border: none;
   box-shadow: none;
@@ -808,9 +813,21 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
 .input-group.full-width { grid-column: 1 / -1; }
 
 /* ---------- Misc legacy compatibility ----------------------------------- */
-.app-container { min-height: 100vh; background: var(--color-bg); }
+.app-container { min-height: 100vh; min-height: 100dvh; background: var(--color-bg); }
 .top-nav, .nav-links { /* legacy classnames retained on old views — neutralised */ }
 .nav-links button { background: transparent; }
+
+/* Coarse-pointer (touch) devices: enforce a 44px minimum tap target on
+   interactive controls, without bloating dense desktop (mouse) layouts. */
+@media (pointer: coarse) {
+  .btn,
+  .primary-btn, .secondary-btn, .success-btn, .fail-btn, .toggle-btn,
+  .sidebar-nav a, .sidebar-nav button.nav-item,
+  .cms-header-right .locale-select,
+  input:not([type='checkbox']):not([type='radio']), select, textarea {
+    min-height: 44px;
+  }
+}
 
 /* Make focus rings consistent across all interactive elements */
 button:focus-visible, a:focus-visible, [tabindex]:focus-visible {

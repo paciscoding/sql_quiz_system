@@ -134,8 +134,6 @@ async function onFileChange(event: Event) {
 }
 
 function mapUploadError(raw: string): string {
-  if (raw === 'too large') return 'Aggregate intro-image size exceeds 25 MB.'
-  if (raw === 'unsupported format') return 'Only PNG and JPEG are accepted.'
   return raw || 'Upload failed.'
 }
 
