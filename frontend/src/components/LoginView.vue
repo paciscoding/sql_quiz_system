@@ -110,6 +110,14 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
         <p v-if="error" role="alert" style="margin-top: var(--space-3); text-align: center;">
           <span class="badge badge-danger">{{ error }}</span>
         </p>
+
+        <p style="margin-top: var(--space-4); text-align: center;">
+          <RouterLink
+            to="/forgot-password"
+            class="forgot-link"
+            data-testid="forgot-password-link"
+          >Forgot password?</RouterLink>
+        </p>
       </form>
     </div>
   </div>
@@ -125,6 +133,12 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
   padding: var(--space-7) var(--space-4);
 }
 .req { color: var(--color-danger); }
+.forgot-link {
+  font-size: 0.88rem;
+  color: var(--color-primary-strong, var(--color-primary));
+  text-decoration: underline;
+}
+.forgot-link:hover { text-decoration: none; }
 .pw-wrap { display: flex; gap: var(--space-2); }
 .pw-wrap .input { flex: 1; }
 .login-card {

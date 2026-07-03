@@ -42,6 +42,65 @@ func NewStudentImportService(repo ImportRepo) *StudentImportService {
 	return &StudentImportService{repo: repo}
 }
 
+// StudentUpsertInput is the canonical set of roster fields for creating or
+// updating a single student. It is the shared input for BOTH the CSV importer
+// and the single POST /students endpoint.
+type StudentUpsertInput struct {
+	StudentNumber string
+	StudentIDExt  string
+	SecLec        string
+	SecLab        string
+	FirstName     string
+	LastName      string
+	Email         string
+}
+
+// UpsertOne is the SINGLE source of truth for turning roster fields into a
+// system_users row. It hashes the default password (= student_number) and calls
+// the repository upsert on the supplied transaction. Both the bulk importer and
+// the single-student endpoint funnel through here, so a one-row import and a
+// manual add produce an identical row by construction.
+func (s *StudentImportService) UpsertOne(ctx context.Context, tx pgx.Tx, in StudentUpsertInput, creatorID int) (outcome string, userID int, err error) {
+	// Both identifiers are mandatory: student_number is the upsert key + default
+	// password, student_id_ext is the login username (UNIQUE NOT NULL).
+	if in.StudentNumber == "" {
+		return "", 0, fmt.Errorf("student number is required")
+	}
+	if in.StudentIDExt == "" {
+		return "", 0, fmt.Errorf("student ID is required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.StudentNumber), bcrypt.DefaultCost)
+	if err != nil {
+		return "", 0, err
+	}
+	row := models.StudentImportRow{
+		StudentNumber: in.StudentNumber,
+		StudentIDExt:  in.StudentIDExt,
+		SecLec:        in.SecLec,
+		SecLab:        in.SecLab,
+		FirstName:     in.FirstName,
+		LastName:      in.LastName,
+		Email:         in.Email,
+		PasswordHash:  string(hash),
+	}
+	return s.repo.UpsertStudentByNumber(ctx, tx, row, creatorID)
+}
+
+// CreateSingle upserts one student in its own transaction. It shares UpsertOne
+// with the bulk path, guaranteeing manual==bulk parity. The default password is
+// the student_number.
+func (s *StudentImportService) CreateSingle(ctx context.Context, creatorID int, in StudentUpsertInput) (outcome string, userID int, err error) {
+	txErr := s.repo.WithTransaction(ctx, func(tx pgx.Tx) error {
+		o, id, e := s.UpsertOne(ctx, tx, in, creatorID)
+		outcome, userID = o, id
+		return e
+	})
+	if txErr != nil {
+		return "", 0, txErr
+	}
+	return outcome, userID, nil
+}
+
 // Import processes a roster of students, performing an upsert for each row.
 // It uses a single outer transaction with savepoints to allow partial successes.
 func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows []ParsedStudentRow) (ImportReport, error) {
@@ -60,6 +119,17 @@ func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows [
 				})
 				continue
 			}
+			// student_id_ext becomes the login username (UNIQUE NOT NULL), so it
+			// must be present or the row cannot produce a valid account.
+			if row.StudentIDExt == "" {
+				report.Skipped++
+				report.Errors = append(report.Errors, ImportRowError{
+					Row:           row.RowNumber,
+					StudentNumber: row.StudentNumber,
+					Message:       "Student ID is required",
+				})
+				continue
+			}
 
 			// Establish savepoint for this row
 			savepointName := fmt.Sprintf("row_%d", row.RowNumber)
@@ -68,31 +138,17 @@ func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows [
 				return fmt.Errorf("failed to establish savepoint: %w", err)
 			}
 
-			// ARCH-002: Hash student_number for initial password
-			hash, err := bcrypt.GenerateFromPassword([]byte(row.StudentNumber), bcrypt.DefaultCost)
-			if err != nil {
-				// This is a system error, but we treat it as a row error to keep moving
-				tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepointName)
-				report.Skipped++
-				report.Errors = append(report.Errors, ImportRowError{
-					Row:           row.RowNumber,
-					StudentNumber: row.StudentNumber,
-					Message:       fmt.Sprintf("failed to hash password: %v", err),
-				})
-				continue
-			}
-
-			importRow := models.StudentImportRow{
+			// Route through the SHARED UpsertOne so a bulk row is identical to a
+			// single POST /students create (hashing + upsert live in one place).
+			outcome, _, err := s.UpsertOne(ctx, tx, StudentUpsertInput{
 				StudentNumber: row.StudentNumber,
 				StudentIDExt:  row.StudentIDExt,
 				SecLec:        row.SecLec,
 				SecLab:        row.SecLab,
 				FirstName:     row.FirstName,
 				LastName:      row.LastName,
-				PasswordHash:  string(hash),
-			}
-
-			outcome, _, err := s.repo.UpsertStudentByNumber(ctx, tx, importRow, creatorID)
+				Email:         row.Email,
+			}, creatorID)
 			if err != nil {
 				// Rollback to savepoint on error
 				tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepointName)

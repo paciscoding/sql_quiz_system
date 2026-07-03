@@ -923,6 +923,21 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_exam_intro_images_order ON app.examination_intro_images(examination_id, sort_order)`,
+		// Auditable password-change log. new_password_enc holds AES-256-GCM
+		// ciphertext of the new password value (the key lives only in env), nonce
+		// is the 12-byte GCM nonce. changed_by is the acting user (= user_id for
+		// self_change). ON DELETE CASCADE keeps events tied to the user's lifetime.
+		`CREATE TABLE IF NOT EXISTS app.password_events (
+			id               SERIAL PRIMARY KEY,
+			user_id          INTEGER NOT NULL REFERENCES app.system_users(id) ON DELETE CASCADE,
+			changed_by       INTEGER REFERENCES app.system_users(id),
+			source           TEXT NOT NULL CHECK (source IN ('create','self_change','admin_reset','forgot_reset')),
+			new_password_enc BYTEA NOT NULL,
+			nonce            BYTEA NOT NULL,
+			notified_admin   BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_password_events_user ON app.password_events(user_id, created_at DESC);`,
 	}
 
 	for _, q := range queries {
@@ -968,6 +983,27 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		// Column-order grading toggle. DEFAULT FALSE so existing questions are unaffected.
 		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS strict_column_order BOOLEAN NOT NULL DEFAULT FALSE",
 		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS strict_column_order BOOLEAN NOT NULL DEFAULT FALSE",
+		// Auth/password-management (2026-07-01). email stays NULL (reserved for
+		// future delivery; no capture UI). token_version powers immediate session
+		// invalidation on password change/reset.
+		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS email TEXT",
+		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0",
+		// Forgot-password throttle clock. Independent of PASSWORD_LOG_KEY: the
+		// 5-minute throttle reads THIS column, so it fires even when password-event
+		// logging is disabled (no encryption key). Nullable: never reset = never set.
+		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS last_forgot_reset_at TIMESTAMPTZ",
+		// Forgot-password OTP verification (2026-07-02). Step 1 emails a one-time
+		// code; step 2 verifies it before any password is regenerated. Only the
+		// SHA-256 hash of the code is stored, with its expiry and an attempt
+		// counter that caps verification tries.
+		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS reset_otp_hash TEXT",
+		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS reset_otp_expires_at TIMESTAMPTZ",
+		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS reset_otp_attempts INTEGER NOT NULL DEFAULT 0",
+		// Forgot-password (2026-07-01): widen the password_events.source CHECK to
+		// admit the new 'forgot_reset' value. Drop+recreate is idempotent and does
+		// not break existing rows (all existing sources remain in the widened set).
+		"ALTER TABLE app.password_events DROP CONSTRAINT IF EXISTS password_events_source_check",
+		"ALTER TABLE app.password_events ADD CONSTRAINT password_events_source_check CHECK (source IN ('create','self_change','admin_reset','forgot_reset'))",
 	}
 
 	for _, q := range extraMigrations {

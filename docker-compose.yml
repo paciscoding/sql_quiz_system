@@ -29,6 +29,10 @@ services:
       PORT: 8080
       JWT_SECRET: ${JWT_SECRET}
       ALLOWED_ORIGINS: http://localhost,http://localhost:80
+      EMAIL_SENDER_ADDRESS: ${EMAIL_SENDER_ADDRESS}
+      EMAIL_SENDER_APP_PASSWORD: ${EMAIL_SENDER_APP_PASSWORD}
+      PASSWORD_LOG_KEY: ${PASSWORD_LOG_KEY}
+      ADMIN_NOTIFY_EMAIL: ${ADMIN_NOTIFY_EMAIL}
     restart: always
 
   frontend:

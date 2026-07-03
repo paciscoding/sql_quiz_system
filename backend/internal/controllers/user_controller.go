@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,11 +12,12 @@ import (
 )
 
 type UserController struct {
-	authService *services.AuthService
+	authService    *services.AuthService
+	studentService *services.StudentImportService
 }
 
-func NewUserController(authService *services.AuthService) *UserController {
-	return &UserController{authService: authService}
+func NewUserController(authService *services.AuthService, studentService *services.StudentImportService) *UserController {
+	return &UserController{authService: authService, studentService: studentService}
 }
 
 func (ctrl *UserController) Login(c *gin.Context) {
@@ -44,12 +46,15 @@ func (ctrl *UserController) ChangePassword(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.authService.ChangePassword(c.Request.Context(), currentUser.ID, req.OldPassword, req.NewPassword); err != nil {
+	token, err := ctrl.authService.ChangeOwnPassword(c.Request.Context(), currentUser, req.OldPassword, req.NewPassword)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Password updated successfully"})
+	// Returns a fresh JWT (token_version bumped) so the current device stays
+	// logged in while other devices' tokens are invalidated.
+	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
 func (ctrl *UserController) ListStudents(c *gin.Context) {
@@ -107,6 +112,9 @@ func (ctrl *UserController) DeleteUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 }
 
+// CreateAccount handles POST /api/v1/users (Admin, Lecturer). It creates a
+// LECTURER or ADMIN account with a server-generated password. A STUDENT role is
+// rejected with 400 pointing at /students.
 func (ctrl *UserController) CreateAccount(c *gin.Context) {
 	// Get creator from context (set by middleware)
 	userVal, _ := c.Get("user")
@@ -118,32 +126,153 @@ func (ctrl *UserController) CreateAccount(c *gin.Context) {
 		return
 	}
 
-	id, err := ctrl.authService.CreateAccount(c.Request.Context(), creator, req)
+	id, password, err := ctrl.authService.CreateStaff(c.Request.Context(), creator, req)
 	if err != nil {
+		if errors.Is(err, services.ErrStudentRoleNotAllowed) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"message": "User created successfully", "id": id})
+	c.JSON(http.StatusCreated, gin.H{"id": id, "generated_password": password})
 }
 
-func (ctrl *UserController) CreateAccountsBulk(c *gin.Context) {
+// CreateStudent handles POST /api/v1/students (Admin, Lecturer). It creates or
+// upserts a single student through the SAME shared path as the CSV importer, so
+// a manual add and a one-row import produce an identical row. The default
+// password is the student_number.
+func (ctrl *UserController) CreateStudent(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	creator := userVal.(models.User)
 
-	var req models.BulkCreateUserRequest
+	var req models.StudentImportRow
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	ids, err := ctrl.authService.CreateAccountsBulk(c.Request.Context(), creator, req)
-	if err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+	if req.StudentNumber == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "student_number is required"})
+		return
+	}
+	// student_id_ext is the login username, so it is mandatory for students.
+	if req.StudentIDExt == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "student_id is required"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"message": "Bulk users created successfully", "ids": ids})
+	outcome, id, err := ctrl.studentService.CreateSingle(c.Request.Context(), creator.ID, services.StudentUpsertInput{
+		StudentNumber: req.StudentNumber,
+		StudentIDExt:  req.StudentIDExt,
+		SecLec:        req.SecLec,
+		SecLab:        req.SecLab,
+		FirstName:     req.FirstName,
+		LastName:      req.LastName,
+		Email:         req.Email,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Default password = student_number. Log a `create` event only for new rows.
+	if outcome == "created" {
+		ctrl.authService.LogStudentCreate(c.Request.Context(), creator, id, req.StudentNumber, req.StudentIDExt, req.Email)
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":               id,
+		"created":          outcome == "created",
+		"default_password": req.StudentNumber,
+	})
+}
+
+// forgotPasswordMessage is the single, generic response for step 1 of the
+// public forgot-password flow (code delivery). It is returned identically
+// whether or not the account exists / has an email, so the endpoint cannot be
+// used to enumerate usernames.
+const forgotPasswordMessage = "If an account with that username exists and has an email on file, a verification code has been sent."
+
+// forgotPasswordVerifiedMessage is the success response for step 2 of the
+// public forgot-password flow: the code was accepted and the new password is
+// on its way by email.
+const forgotPasswordVerifiedMessage = "Verification successful. A new password has been sent to your email."
+
+// ForgotPassword handles the PUBLIC POST /api/v1/forgot-password endpoint (no
+// auth middleware) — step 1 of the two-step flow: it emails a one-time
+// verification code. It always responds 200 with an identical generic body.
+func (ctrl *UserController) ForgotPassword(c *gin.Context) {
+	var req models.ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		// Even a malformed body gets the generic 200 to avoid signalling anything.
+		c.JSON(http.StatusOK, gin.H{"message": forgotPasswordMessage})
+		return
+	}
+	// The service is enumeration-safe (returns nil in all non-fatal cases). We
+	// ignore its error entirely and always return the same body.
+	_ = ctrl.authService.ForgotPassword(c.Request.Context(), req.Username)
+	c.JSON(http.StatusOK, gin.H{"message": forgotPasswordMessage})
+}
+
+// VerifyForgotPassword handles the PUBLIC POST /api/v1/forgot-password/verify
+// endpoint (no auth middleware) — step 2 of the two-step flow. Every failure
+// (malformed body, unknown user, wrong/expired code, too many attempts) gets
+// the IDENTICAL generic 400 so the endpoint reveals nothing about which check
+// failed. Success triggers the actual password regeneration + credential email.
+func (ctrl *UserController) VerifyForgotPassword(c *gin.Context) {
+	var req models.ForgotPasswordVerifyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": services.ErrInvalidResetCode.Error()})
+		return
+	}
+	if err := ctrl.authService.VerifyForgotPassword(c.Request.Context(), req.Username, req.OTP); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": services.ErrInvalidResetCode.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": forgotPasswordVerifiedMessage})
+}
+
+// ResetPassword handles POST /api/v1/users/:id/reset-password (Admin only).
+func (ctrl *UserController) ResetPassword(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	actor := userVal.(models.User)
+
+	idStr := c.Param("id")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	password, err := ctrl.authService.ResetPassword(c.Request.Context(), actor, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"generated_password": password})
+}
+
+// GetPasswordEvents handles GET /api/v1/users/:id/password-events (Admin only).
+func (ctrl *UserController) GetPasswordEvents(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	actor := userVal.(models.User)
+
+	idStr := c.Param("id")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	keyConfigured, events, err := ctrl.authService.GetPasswordEventsView(c.Request.Context(), actor, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"key_configured": keyConfigured, "events": events})
 }
 
 // AuthMiddleware extracts the JWT and validates the user
@@ -163,7 +292,9 @@ func AuthMiddleware(authService *services.AuthService) gin.HandlerFunc {
 			return
 		}
 
-		user, err := authService.ValidateToken(parts[1])
+		// AuthenticateRequest also verifies the token_version against the DB, so a
+		// token minted before a password change/reset is rejected immediately.
+		user, err := authService.AuthenticateRequest(c.Request.Context(), parts[1])
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
 			c.Abort()

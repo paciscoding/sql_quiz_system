@@ -28,6 +28,7 @@ function makeRouter() {
     routes: [
       { path: '/', component: { template: '<div />' } },
       { path: '/login', component: { template: '<div />' } },
+      { path: '/forgot-password', component: { template: '<div />' } },
       { path: '/dashboard', component: { template: '<div />' } },
     ],
   })
@@ -196,6 +197,24 @@ describe('LoginView novalidate + ARIA (TODO-083)', () => {
 
     expect(wrapper.find('label[for="login-username"]').text()).toContain('*')
     expect(wrapper.find('label[for="login-password"]').text()).toContain('*')
+
+    wrapper.unmount()
+  })
+
+  it('shows a "Forgot password?" link pointing to /forgot-password', async () => {
+    const router = makeRouter()
+    await router.push('/login')
+    const LoginView = (await import('../../components/LoginView.vue')).default
+    const wrapper = mount(LoginView, {
+      global: { plugins: [router] },
+    })
+    await flushPromises()
+
+    const link = wrapper.find('[data-testid="forgot-password-link"]')
+    expect(link.exists()).toBe(true)
+    expect(link.text().toLowerCase()).toContain('forgot password')
+    // RouterLink renders an <a href="/forgot-password">
+    expect(link.attributes('href')).toBe('/forgot-password')
 
     wrapper.unmount()
   })

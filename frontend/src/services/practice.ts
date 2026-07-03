@@ -117,9 +117,9 @@ export interface PreviewResult {
 async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
   const token = localStorage.getItem('sql_quiz_token')
   const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> || {}),
-    'Authorization': `Bearer ${token}`
+    ...(options.headers as Record<string, string> || {})
   }
+  if (token) headers['Authorization'] = `Bearer ${token}`
   const response = await fetch(path, { ...options, headers })
   if (response.status === 423) {
     const { notify } = useNotifications()

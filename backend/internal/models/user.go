@@ -17,6 +17,7 @@ type User struct {
 	Role          Role      `json:"role"`
 	CreatedBy     *int      `json:"created_by"`
 	CreatedAt     time.Time `json:"created_at"`
+	Email         *string   `json:"email,omitempty"`
 	StudentNumber *string   `json:"student_number,omitempty"`
 	StudentIDExt  *string   `json:"student_id_ext,omitempty"`
 	SecLec        *string   `json:"sec_lec,omitempty"`
@@ -39,6 +40,7 @@ type CreateUserRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Role     Role   `json:"role"`
+	Email    string `json:"email"`
 }
 
 type StudentImportRow struct {
@@ -48,6 +50,7 @@ type StudentImportRow struct {
 	SecLab        string `json:"sec_lab"`
 	FirstName     string `json:"first_name"`
 	LastName      string `json:"last_name"`
+	Email         string `json:"email"`
 	PasswordHash  string `json:"password_hash"`
 }
 
@@ -58,4 +61,18 @@ type BulkCreateUserRequest struct {
 type ChangePasswordRequest struct {
 	OldPassword string `json:"old_password"`
 	NewPassword string `json:"new_password"`
+}
+
+// ForgotPasswordRequest is the body for the public POST /forgot-password
+// endpoint (step 1: send a verification code). Only the username is needed;
+// the response is always generic.
+type ForgotPasswordRequest struct {
+	Username string `json:"username"`
+}
+
+// ForgotPasswordVerifyRequest is the body for the public POST
+// /forgot-password/verify endpoint (step 2: submit the emailed code).
+type ForgotPasswordVerifyRequest struct {
+	Username string `json:"username"`
+	OTP      string `json:"otp"`
 }

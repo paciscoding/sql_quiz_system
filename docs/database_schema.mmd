@@ -1,29 +1,32 @@
 erDiagram
-    APP_SYSTEM_USERS ||--o{ APP_EXAMINATIONS     : "creates"
-    APP_SYSTEM_USERS ||--o{ APP_SYSTEM_USERS     : "manages"
-    APP_SYSTEM_USERS ||--o{ APP_EXAM_STUDENTS    : "enrolls"
-    APP_SYSTEM_USERS ||--o{ APP_QUESTIONS        : "authors"
-    APP_SYSTEM_USERS ||--o{ APP_SUBMISSIONS      : "submits"
-    APP_EXAMINATIONS ||--o{ APP_QUESTIONS        : "contains"
-    APP_EXAMINATIONS ||--o{ APP_EXAM_STUDENTS    : "has"
-    APP_EXAMINATIONS ||--o{ APP_SUBMISSIONS      : "scopes"
-    APP_EXAMINATIONS ||--o| APP_EXAM_SANDBOXES   : "owns"
-    APP_QUESTIONS    ||--o{ APP_SUBMISSIONS      : "answered_by"
-    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_QUESTIONS : "created_by"
-    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_ATTEMPTS  : "student_id"
-    APP_PRACTICE_QUESTIONS ||--o{ APP_PRACTICE_ATTEMPTS : "practice_question_id"
-    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_CATEGORIES : "created_by"
-    APP_PRACTICE_CATEGORIES ||--o{ APP_PRACTICE_QUESTIONS : "category_id"
+    APP_SYSTEM_USERS ||--o{ APP_EXAMINATIONS               : "creates"
+    APP_SYSTEM_USERS ||--o{ APP_SYSTEM_USERS               : "manages"
+    APP_SYSTEM_USERS ||--o{ APP_EXAM_STUDENTS              : "enrolls"
+    APP_SYSTEM_USERS ||--o{ APP_QUESTIONS                  : "authors"
+    APP_SYSTEM_USERS ||--o{ APP_SUBMISSIONS                : "submits"
+    APP_SYSTEM_USERS ||--o{ APP_SCHEMA_IMPORT_AUDIT        : "imports"
+    APP_EXAMINATIONS ||--o{ APP_QUESTIONS                  : "contains"
+    APP_EXAMINATIONS ||--o{ APP_EXAM_STUDENTS              : "has"
+    APP_EXAMINATIONS ||--o{ APP_SUBMISSIONS                : "scopes"
+    APP_EXAMINATIONS ||--o| APP_EXAM_SANDBOXES             : "owns"
+    APP_EXAMINATIONS ||--o{ APP_EXAMINATION_INTRO_IMAGES   : "illustrates"
+    APP_QUESTIONS    ||--o{ APP_SUBMISSIONS                : "answered_by"
+    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_QUESTIONS         : "created_by"
+    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_ATTEMPTS          : "student_id"
+    APP_PRACTICE_QUESTIONS ||--o{ APP_PRACTICE_ATTEMPTS    : "practice_question_id"
+    APP_SYSTEM_USERS ||--o{ APP_PRACTICE_CATEGORIES        : "created_by"
+    APP_PRACTICE_CATEGORIES ||--o{ APP_PRACTICE_QUESTIONS  : "category_id"
+    APP_PRACTICE_CATEGORIES ||--o{ APP_PRACTICE_CATEGORY_INTRO_IMAGES : "illustrates"
 
     APP_SYSTEM_USERS {
         int id PK
-        string username
+        string username UK
         string password_hash
         string role
         int created_by FK
         timestamp created_at
-        string student_number
-        string student_id_ext
+        string student_number UK
+        string student_id_ext UK
         string sec_lec
         string sec_lab
         string first_name
@@ -38,7 +41,11 @@ erDiagram
         timestamp created_at
         timestamp activated_at
         timestamp archived_at
+        timestamp scheduled_start_at
+        timestamp scheduled_end_at
         boolean block_practice_during_exam
+        text introduction
+        string curriculum_schema
     }
 
     APP_QUESTIONS {
@@ -52,6 +59,7 @@ erDiagram
         string requirement
         boolean strict_ordering
         boolean strict_attributes
+        boolean strict_column_order
         jsonb expected_result
         jsonb expected_columns
         string expected_result_status
@@ -69,7 +77,7 @@ erDiagram
     }
 
     APP_SUBMISSIONS {
-        bigint id PK
+        int id PK
         int exam_id FK
         int student_id FK
         int question_id FK
@@ -94,7 +102,9 @@ erDiagram
         int created_by FK
         timestamp created_at
         timestamp updated_at
+        text introduction
     }
+
     APP_PRACTICE_QUESTIONS {
         int id PK
         int created_by FK
@@ -107,6 +117,7 @@ erDiagram
         numeric points
         boolean strict_ordering
         boolean strict_attrs
+        boolean strict_column_order
         jsonb expected_result
         jsonb expected_columns
         text expected_result_status
@@ -124,4 +135,41 @@ erDiagram
         boolean is_correct
         jsonb validation_details
         timestamp submitted_at
+    }
+
+    APP_PRACTICE_SANDBOX_STATE {
+        int id PK "singleton, id = 1"
+        string schema_name
+        timestamp created_at
+        timestamp last_reset_at
+    }
+
+    APP_SCHEMA_IMPORT_AUDIT {
+        int id PK
+        int imported_by FK
+        timestamp imported_at
+        int byte_size
+        int table_count
+    }
+
+    APP_EXAMINATION_INTRO_IMAGES {
+        int id PK
+        int examination_id FK
+        int sort_order
+        string mime_type
+        int byte_size
+        bytea image_bytes
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    APP_PRACTICE_CATEGORY_INTRO_IMAGES {
+        int id PK
+        int category_id FK
+        int sort_order
+        string mime_type
+        int byte_size
+        bytea image_bytes
+        timestamp created_at
+        timestamp updated_at
     }

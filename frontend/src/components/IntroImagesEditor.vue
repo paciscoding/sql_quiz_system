@@ -79,6 +79,10 @@ onUnmounted(() => {
     URL.revokeObjectURL(url)
   }
   thumbUrls.value = {}
+  for (const timer of uploadTimers) {
+    clearTimeout(timer)
+  }
+  uploadTimers.clear()
 })
 
 // ─── Upload ──────────────────────────────────────────────────────────────────
@@ -90,6 +94,10 @@ interface UploadEntry {
 }
 
 const uploads = ref<UploadEntry[]>([])
+
+// Track pending "remove upload entry" timers so they can be cleared if the
+// component unmounts before they fire (otherwise they splice a stale array).
+const uploadTimers = new Set<ReturnType<typeof setTimeout>>()
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5 MB
 
@@ -123,10 +131,12 @@ async function onFileChange(event: Event) {
       notify(msg, 'error')
     } finally {
       // Remove this entry after a brief delay so the user can see the result
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        uploadTimers.delete(timer)
         const idx = uploads.value.indexOf(entry)
         if (idx !== -1) uploads.value.splice(idx, 1)
       }, 2000)
+      uploadTimers.add(timer)
     }
   }
 

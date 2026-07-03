@@ -20,6 +20,7 @@ type ParsedStudentRow struct {
 	SecLab        string
 	FirstName     string
 	LastName      string
+	Email         string
 }
 
 var headerAliases = map[string][]string{
@@ -29,6 +30,8 @@ var headerAliases = map[string][]string{
 	"SecLab":        {"seclab", "sec_lab", "lab_section"},
 	"FirstName":     {"first name", "first_name", "firstname", "given name"},
 	"LastName":      {"last name", "last_name", "lastname", "surname", "family name"},
+	// Email is OPTIONAL: absent → empty. Alias-tolerant.
+	"Email": {"email", "e-mail", "email address", "e_mail", "mail"},
 }
 
 // ParseRoster parses a CSV or XLSX roster file into a slice of ParsedStudentRow.
@@ -118,9 +121,15 @@ func ParseRoster(filename string, r io.Reader) ([]ParsedStudentRow, error) {
 			RowNumber: i + 1,
 		}
 
-		// Ensure we don't index out of bounds if a row is shorter than the header
+		// Ensure we don't index out of bounds if a row is shorter than the header,
+		// and return "" for optional columns (e.g. Email) that are simply absent —
+		// without a presence check, a missing column's zero-value index (0) would
+		// wrongly alias the first column.
 		getValue := func(canonical string) string {
-			idx := indices[canonical]
+			idx, ok := indices[canonical]
+			if !ok {
+				return ""
+			}
 			if idx < len(row) {
 				return strings.TrimSpace(row[idx])
 			}
@@ -133,6 +142,8 @@ func ParseRoster(filename string, r io.Reader) ([]ParsedStudentRow, error) {
 		parsed.SecLab = getValue("SecLab")
 		parsed.FirstName = getValue("FirstName")
 		parsed.LastName = getValue("LastName")
+		// Email is optional; getValue returns "" when the column is absent.
+		parsed.Email = getValue("Email")
 
 		if parsed.StudentNumber == "" && parsed.StudentIDExt == "" && parsed.SecLec == "" &&
 			parsed.SecLab == "" && parsed.FirstName == "" && parsed.LastName == "" {

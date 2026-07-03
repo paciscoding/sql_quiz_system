@@ -183,14 +183,14 @@ describe('reorderExamIntroImages — REGRESSION: /order path', () => {
 // ---------------------------------------------------------------------------
 
 describe('token forwarding', () => {
-  it('sends null token when localStorage has no token set', async () => {
+  it('omits the Authorization header when localStorage has no token set', async () => {
     localStorage.removeItem('sql_quiz_token')
     globalThis.fetch = makeFetchMock(200, { images: [] })
 
     await listCategoryIntroImages(1)
 
     const [, opts] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]
-    // Token is null — Authorization header should say "Bearer null"
-    expect((opts?.headers as Record<string, string>)?.Authorization).toBe('Bearer null')
+    // No token — Authorization header must be absent (never "Bearer null")
+    expect((opts?.headers as Record<string, string>)?.Authorization).toBeUndefined()
   })
 })

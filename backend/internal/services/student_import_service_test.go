@@ -90,9 +90,9 @@ func TestStudentImportService(t *testing.T) {
 		service := NewStudentImportService(repo)
 
 		report, err := service.Import(ctx, 99, []ParsedStudentRow{
-			{RowNumber: 2, StudentNumber: "2001"},
-			{RowNumber: 3, StudentNumber: "2002"},
-			{RowNumber: 4, StudentNumber: "2003"},
+			{RowNumber: 2, StudentNumber: "2001", StudentIDExt: "E2001"},
+			{RowNumber: 3, StudentNumber: "2002", StudentIDExt: "E2002"},
+			{RowNumber: 4, StudentNumber: "2003", StudentIDExt: "E2003"},
 		})
 		if err != nil {
 			t.Fatalf("Import returned error: %v", err)
@@ -112,9 +112,9 @@ func TestStudentImportService(t *testing.T) {
 		service := NewStudentImportService(repo)
 
 		report, err := service.Import(ctx, 99, []ParsedStudentRow{
-			{RowNumber: 2, StudentNumber: "3001"},
+			{RowNumber: 2, StudentNumber: "3001", StudentIDExt: "E3001"},
 			{RowNumber: 3, StudentNumber: ""},
-			{RowNumber: 4, StudentNumber: "3003"},
+			{RowNumber: 4, StudentNumber: "3003", StudentIDExt: "E3003"},
 		})
 		if err != nil {
 			t.Fatalf("Import returned error: %v", err)
@@ -132,6 +132,39 @@ func TestStudentImportService(t *testing.T) {
 			t.Fatalf("unexpected error record: %+v", report.Errors[0])
 		}
 		if report.Errors[0].Message != "Student number is required" {
+			t.Fatalf("unexpected error message: %q", report.Errors[0].Message)
+		}
+	})
+
+	t.Run("blank student id is skipped", func(t *testing.T) {
+		repo := &fakeImportRepo{
+			outcomes: []string{"created", "created"},
+		}
+		service := NewStudentImportService(repo)
+
+		// student_id_ext is the login username now — a row missing it is skipped
+		// (not upserted) even though its student_number is present.
+		report, err := service.Import(ctx, 99, []ParsedStudentRow{
+			{RowNumber: 2, StudentNumber: "4001", StudentIDExt: "E4001"},
+			{RowNumber: 3, StudentNumber: "4002", StudentIDExt: ""},
+			{RowNumber: 4, StudentNumber: "4003", StudentIDExt: "E4003"},
+		})
+		if err != nil {
+			t.Fatalf("Import returned error: %v", err)
+		}
+		if report.Created != 2 || report.Skipped != 1 {
+			t.Fatalf("unexpected report counts: %+v", report)
+		}
+		if len(repo.upsertCalls) != 2 {
+			t.Fatalf("expected 2 upsert calls, got %d", len(repo.upsertCalls))
+		}
+		if len(report.Errors) != 1 || report.Errors[0].Row != 3 {
+			t.Fatalf("expected 1 error on row 3, got %+v", report.Errors)
+		}
+		if report.Errors[0].StudentNumber != "4002" {
+			t.Fatalf("error should carry the student_number: %+v", report.Errors[0])
+		}
+		if report.Errors[0].Message != "Student ID is required" {
 			t.Fatalf("unexpected error message: %q", report.Errors[0].Message)
 		}
 	})

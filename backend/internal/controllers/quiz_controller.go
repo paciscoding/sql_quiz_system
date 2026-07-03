@@ -269,6 +269,8 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 	}
 	if err := ctrl.repo.CreateSubmission(ctx, sub); err != nil {
 		fmt.Printf("Warning: failed to persist submission: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist submission"})
+		return
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -427,13 +429,15 @@ func (ctrl *QuizController) StreamExamStatus(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "access_token is required"})
 		return
 	}
-	user, err := ctrl.authService.ValidateToken(token)
+	// Use AuthenticateRequest (not signature-only ValidateToken) so a token whose
+	// token_version was bumped by a password reset/change is rejected here too —
+	// the SSE stream must honour the same immediate-invalidation guarantee.
+	ctx := c.Request.Context()
+	user, err := ctrl.authService.AuthenticateRequest(ctx, token)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 		return
 	}
-
-	ctx := c.Request.Context()
 
 	// Verify the exam exists
 	exam, err := ctrl.repo.GetExamByID(ctx, examID)

@@ -198,7 +198,9 @@ onMounted(async () => {
       headers: { 'Authorization': `Bearer ${token}` }
     })
     if (response.ok) enrolledExams.value = await response.json()
-  } catch (err) {}
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load your exams.' })
+  }
 })
 
 function selectExam(exam: Examination) {
@@ -244,7 +246,9 @@ const fetchQuestions = async () => {
       headers: { 'Authorization': `Bearer ${token}` }
     })
     if (response.ok) questions.value = await response.json()
-  } catch (err) {}
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load questions.' })
+  }
 }
 
 const { inFlight: submitLoading, run: submitAnswer } = useSingleFlight(async () => {

@@ -180,7 +180,7 @@ func (s *ValidationService) compareRows(teacher, student map[string]interface{},
 		// Strict attributes: keys must match
 		for k, v := range teacher {
 			sv, ok := student[k]
-			if !ok || fmt.Sprintf("%v", v) != fmt.Sprintf("%v", sv) {
+			if !ok || !valuesEqual(v, sv) {
 				return false
 			}
 		}
@@ -189,19 +189,19 @@ func (s *ValidationService) compareRows(teacher, student map[string]interface{},
 
 	// Non-strict attributes: only values must match, regardless of key names
 	// Collect all values from both rows
-	var tVals, sVals []string
+	var tVals, sVals []any
 	for _, v := range teacher {
-		tVals = append(tVals, fmt.Sprintf("%v", v))
+		tVals = append(tVals, v)
 	}
 	for _, v := range student {
-		sVals = append(sVals, fmt.Sprintf("%v", v))
+		sVals = append(sVals, v)
 	}
 
 	// Compare values sets
 	for _, tv := range tVals {
 		found := false
 		for i, sv := range sVals {
-			if tv == sv {
+			if valuesEqual(tv, sv) {
 				found = true
 				sVals = append(sVals[:i], sVals[i+1:]...)
 				break
@@ -212,4 +212,88 @@ func (s *ValidationService) compareRows(teacher, student map[string]interface{},
 		}
 	}
 	return true
+}
+
+// numericEpsilon is the tolerance used when comparing two numeric cell values.
+// It absorbs float-formatting drift (e.g. 1.0000000001 vs 1.0) without merging
+// genuinely different values.
+const numericEpsilon = 1e-9
+
+// valuesEqual compares two SQL result cell values with type awareness. It is a
+// strict superset of the previous fmt.Sprintf("%v", ...) equality for the common
+// fixed-schema case:
+//   - both nil            -> equal; exactly one nil -> not equal
+//   - both numeric        -> compare magnitudes within numericEpsilon, so
+//     int64(1) equals float64(1.0)
+//   - both string/[]byte  -> compare as strings
+//   - both bool           -> compare as bools
+//   - otherwise/mismatched-> fall back to fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+func valuesEqual(a, b any) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	if af, aok := toFloat(a); aok {
+		if bf, bok := toFloat(b); bok {
+			diff := af - bf
+			if diff < 0 {
+				diff = -diff
+			}
+			return diff <= numericEpsilon
+		}
+	}
+
+	if as, aok := toStringValue(a); aok {
+		if bs, bok := toStringValue(b); bok {
+			return as == bs
+		}
+	}
+
+	if ab, aok := a.(bool); aok {
+		if bb, bok := b.(bool); bok {
+			return ab == bb
+		}
+	}
+
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+// toFloat reports whether v is a supported numeric type and, if so, its float64
+// value. json.Number is included because encoding/json can decode numbers into it.
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
+}
+
+// toStringValue reports whether v is a string or []byte and, if so, its string form.
+func toStringValue(v any) (string, bool) {
+	switch s := v.(type) {
+	case string:
+		return s, true
+	case []byte:
+		return string(s), true
+	default:
+		return "", false
+	}
 }

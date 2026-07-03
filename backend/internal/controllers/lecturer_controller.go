@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -684,6 +685,8 @@ func (ctrl *LecturerController) ExportScoresCSV(c *gin.Context) {
 	header = append(header, examTitles...)
 	header = append(header, "PracticeTotal", "GrandTotal")
 	if err := writer.Write(header); err != nil {
+		// Streaming has begun; cannot switch to an HTTP error. Record server-side.
+		log.Printf("consolidated CSV export: failed writing header row: %v", err)
 		return
 	}
 
@@ -699,8 +702,15 @@ func (ctrl *LecturerController) ExportScoresCSV(c *gin.Context) {
 		row = append(row, fmt.Sprintf("%.2f", s.PracticeTotal))
 		row = append(row, fmt.Sprintf("%.2f", s.GrandTotal))
 		if err := writer.Write(row); err != nil {
-			return
+			// Response is mid-stream; record the corruption and stop writing.
+			log.Printf("consolidated CSV export: failed writing row for student %q: %v", s.StudentNumber, err)
+			break
 		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		log.Printf("consolidated CSV export: writer flush error: %v", err)
 	}
 }
 

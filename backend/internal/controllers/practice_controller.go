@@ -110,6 +110,8 @@ func (ctrl *PracticeController) Submit(c *gin.Context) {
 	}
 	if persistErr := ctrl.repo.CreatePracticeAttempt(ctx, &attempt); persistErr != nil {
 		fmt.Printf("Warning: failed to persist practice attempt: %v\n", persistErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist practice attempt"})
+		return
 	}
 
 	if err != nil {

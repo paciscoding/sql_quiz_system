@@ -17,11 +17,10 @@ import (
 )
 
 func main() {
-	// Database connection string from environment or default
+	// Database connection string from environment (required; no default).
 	connString := os.Getenv("DATABASE_URL")
 	if connString == "" {
-		// Default for local development
-		connString = "postgres://postgres:password@localhost:5432/sql_quiz?sslmode=disable"
+		log.Fatal("DATABASE_URL is required")
 	}
 
 	// Initialize Repository
@@ -72,17 +71,24 @@ func main() {
 	}
 	authService := services.NewAuthService(repo, jwtSecret)
 
-	// Seed Admin
-	adminUser := os.Getenv("ADMIN_USER")
-	if adminUser == "" {
-		adminUser = "admin"
-	}
-	adminPass := os.Getenv("ADMIN_PASS")
-	if adminPass == "" {
-		adminPass = "admin123"
+	// Email delivery: real Gmail SMTP when EMAIL_SENDER_ADDRESS is configured,
+	// otherwise the no-op stub. The app password is never logged.
+	if senderAddr := os.Getenv(services.EmailSenderAddressEnv); senderAddr != "" {
+		smtpSender := services.NewSMTPEmailSender()
+		authService.SetEmailSender(smtpSender)
+		log.Printf("email: SMTP sender active (from=%s host=%s)", smtpSender.From(), smtpSender.Host())
+	} else {
+		log.Printf("email: NoopEmailSender active (%s unset; emails are logged, not sent)", services.EmailSenderAddressEnv)
 	}
 
-	if err := authService.SeedAdminAccount(ctx, adminUser, adminPass); err != nil {
+	// Seed Admin only when both credentials are provided via env (no defaults).
+	// If either is unset, skip seeding — a prior boot may already have created an
+	// admin, so startup must still succeed.
+	adminUser := os.Getenv("ADMIN_USER")
+	adminPass := os.Getenv("ADMIN_PASS")
+	if adminUser == "" || adminPass == "" {
+		log.Printf("Warning: ADMIN_USER and/or ADMIN_PASS unset; skipping default admin seeding")
+	} else if err := authService.SeedAdminAccount(ctx, adminUser, adminPass); err != nil {
 		log.Printf("Warning: Failed to seed admin: %v", err)
 	}
 
@@ -90,7 +96,7 @@ func main() {
 	quizCtrl := controllers.NewQuizController(valService, submissionQueue, repo, hub, authService)
 	lecturerCtrl := controllers.NewLecturerController(repo, hub)
 	lecturerCtrl.SetStudentImportService(studentImportService)
-	userCtrl := controllers.NewUserController(authService)
+	userCtrl := controllers.NewUserController(authService, studentImportService)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
 	// Practice is live during exams by default; this gate only blocks practice
 	// when an active exam has its block_practice_during_exam toggle on (OQ-1).
@@ -117,6 +123,11 @@ func main() {
 	v1 := r.Group("/api/v1")
 	{
 		v1.POST("/login", userCtrl.Login)
+		// Public forgot-password step 1: NO auth middleware. Always returns a generic 200.
+		v1.POST("/forgot-password", userCtrl.ForgotPassword)
+		// Public forgot-password step 2: NO auth middleware. Verifies the emailed
+		// code; every failure returns the same generic 400.
+		v1.POST("/forgot-password/verify", userCtrl.VerifyForgotPassword)
 
 		// Protected User Routes
 		user := v1.Group("/users")
@@ -132,6 +143,9 @@ func main() {
 				adminUsers.GET("/all", userCtrl.GetAllUsers)
 				adminUsers.PUT("/:id", userCtrl.UpdateUser)
 				adminUsers.DELETE("/:id", userCtrl.DeleteUser)
+				// Password management (admin only).
+				adminUsers.POST("/:id/reset-password", userCtrl.ResetPassword)
+				adminUsers.GET("/:id/password-events", userCtrl.GetPasswordEvents)
 			}
 		}
 
@@ -191,7 +205,8 @@ func main() {
 			staff.GET("/lecturer/scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetConsolidatedScores)
 			staff.GET("/lecturer/export-scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ExportScoresCSV)
 			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccount)
-			staff.POST("/users/bulk", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccountsBulk)
+			// Single-student create/upsert — shares the importer's parity path.
+			staff.POST("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateStudent)
 		}
 
 		// Practice student routes. Live during exams unless an active exam has the

@@ -30,11 +30,12 @@ const navRef = ref<HTMLElement | null>(null)
 
 const isMobile = ref(window.matchMedia('(max-width: 1023.98px)').matches)
 let mqCleanup: (() => void) | null = null
+let resizeObserver: ResizeObserver | null = null
 
 watch(() => route.fullPath, () => { navOpen.value = false })
 
 onMounted(() => {
-  const resizeObserver = new ResizeObserver(() => {
+  resizeObserver = new ResizeObserver(() => {
     if (document.body.clientWidth >= 1024) navOpen.value = false
   })
   resizeObserver.observe(document.body)
@@ -45,7 +46,11 @@ onMounted(() => {
   mqCleanup = () => mq.removeEventListener('change', mqHandler)
 })
 
-onBeforeUnmount(() => { mqCleanup?.() })
+onBeforeUnmount(() => {
+  mqCleanup?.()
+  resizeObserver?.disconnect()
+  resizeObserver = null
+})
 
 useKeyboardShortcut({
   combo: 'Escape',

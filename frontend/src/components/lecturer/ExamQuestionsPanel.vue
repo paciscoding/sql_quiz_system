@@ -314,6 +314,10 @@ watch(() => question.value.requirement, (val) => {
   }, 600)
 })
 
+onUnmounted(() => {
+  if (requirementDebounceTimer != null) window.clearTimeout(requirementDebounceTimer)
+})
+
 watch(requirementDraftKey, (key) => {
   showDraftBanner.value = !!localStorage.getItem(key)
 }, { immediate: true })

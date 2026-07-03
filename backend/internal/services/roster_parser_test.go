@@ -43,6 +43,14 @@ func TestParseRoster(t *testing.T) {
 			},
 		},
 		{
+			name:     "(c2) CSV with an optional Email column (alias 'E-mail')",
+			filename: "roster.csv",
+			content:  bytes.NewBufferString("StudentNumber,StudentIDExt,SecLec,SecLab,FirstName,LastName,E-mail\n123,EXT123,L1,B1,John,Doe,john@example.com"),
+			expectedRows: []ParsedStudentRow{
+				{RowNumber: 2, StudentNumber: "123", StudentIDExt: "EXT123", SecLec: "L1", SecLab: "B1", FirstName: "John", LastName: "Doe", Email: "john@example.com"},
+			},
+		},
+		{
 			name:          "(d) CSV missing the 'Last Name' header",
 			filename:      "roster.csv",
 			content:       bytes.NewBufferString("StudentNumber,StudentIDExt,SecLec,SecLab,FirstName\n123,EXT123,L1,B1,John"),

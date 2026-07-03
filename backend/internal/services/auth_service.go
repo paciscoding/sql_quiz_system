@@ -1,8 +1,11 @@
 package services
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -16,14 +19,34 @@ type AuthService struct {
 	repo          *repository.PostgresRepository
 	jwtSecret     []byte
 	loginAttempts sync.Map
+
+	// cipher is nil when PASSWORD_LOG_KEY is unset/invalid: password-event
+	// logging is disabled but login and password changes still work.
+	cipher     *PasswordCipher
+	email      EmailSender
+	adminEmail string
 }
 
 func NewAuthService(repo *repository.PostgresRepository, secret string) *AuthService {
+	cipher, ok := NewPasswordCipherFromEnv()
+	if ok {
+		log.Printf("auth: password-event logging enabled (encryption key configured)")
+	}
 	return &AuthService{
-		repo:      repo,
-		jwtSecret: []byte(secret),
+		repo:       repo,
+		jwtSecret:  []byte(secret),
+		cipher:     cipher,
+		email:      NoopEmailSender{},
+		adminEmail: os.Getenv("ADMIN_NOTIFY_EMAIL"),
 	}
 }
+
+// SetEmailSender overrides the email delivery implementation (used for wiring
+// and tests). The default is NoopEmailSender.
+func (s *AuthService) SetEmailSender(sender EmailSender) { s.email = sender }
+
+// KeyConfigured reports whether the password-event encryption key is available.
+func (s *AuthService) KeyConfigured() bool { return s.cipher != nil }
 
 func (s *AuthService) Login(ctx context.Context, username, password string) (models.LoginResponse, error) {
 	// Rate Limiting: 5 attempts per 10 minutes
@@ -57,7 +80,12 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (mod
 	// Success: clear attempts
 	s.loginAttempts.Delete(username)
 
-	token, err := s.generateToken(user)
+	version, err := s.repo.GetTokenVersion(ctx, user.ID)
+	if err != nil {
+		return models.LoginResponse{}, err
+	}
+
+	token, err := s.generateToken(user, version)
 	if err != nil {
 		return models.LoginResponse{}, err
 	}
@@ -86,40 +114,378 @@ func (s *AuthService) DeleteUser(ctx context.Context, id int) error {
 	return s.repo.DeleteUser(ctx, id)
 }
 
-func (s *AuthService) CreateAccount(ctx context.Context, creator models.User, req models.CreateUserRequest) (int, error) {
-	// Role Hierarchical Validation
-	if creator.Role == models.RoleLecturer && req.Role != models.RoleStudent {
-		return 0, errors.New("lecturers can only create student accounts")
+// ErrStudentRoleNotAllowed is returned by CreateStaff when the request asks for
+// a STUDENT account. Controllers map this to 400 and point the caller at the
+// dedicated /students endpoint (which drives the single-student parity path).
+var ErrStudentRoleNotAllowed = errors.New("STUDENT accounts must be created via /api/v1/students")
+
+// CreateStaff creates a LECTURER or ADMIN account with a SERVER-GENERATED
+// password (the caller may not supply one). It records a `create` password
+// event and emails the credential. The returned password is shown to the admin
+// exactly once. The existing role hierarchy is preserved: a lecturer may not
+// create an admin.
+func (s *AuthService) CreateStaff(ctx context.Context, creator models.User, req models.CreateUserRequest) (int, string, error) {
+	if req.Role == models.RoleStudent {
+		return 0, "", ErrStudentRoleNotAllowed
+	}
+	if req.Role != models.RoleLecturer && req.Role != models.RoleAdmin {
+		return 0, "", errors.New("role must be LECTURER or ADMIN")
 	}
 	if creator.Role == models.RoleStudent {
-		return 0, errors.New("students cannot create accounts")
+		return 0, "", errors.New("students cannot create accounts")
+	}
+	// Role hierarchy: a lecturer cannot create an admin.
+	if creator.Role == models.RoleLecturer && req.Role == models.RoleAdmin {
+		return 0, "", errors.New("lecturers cannot create admin accounts")
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	password := GeneratePassword()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
+	creatorID := creator.ID
+	// email is optional; store NULL when empty so the column stays nullable.
+	var emailPtr *string
+	if req.Email != "" {
+		emailPtr = &req.Email
+	}
 	user := models.User{
 		Username:  req.Username,
 		Password:  string(hash),
 		Role:      req.Role,
-		CreatedBy: &creator.ID,
+		CreatedBy: &creatorID,
+		Email:     emailPtr,
+	}
+	id, err := s.repo.CreateUser(ctx, user)
+	if err != nil {
+		return 0, "", err
 	}
 
-	return s.repo.CreateUser(ctx, user)
+	// New account starts at token_version 0 (no prior tokens exist).
+	s.logPasswordEvent(ctx, id, &creatorID, models.PasswordEventCreate, password)
+	// SendCredential skips silently when the address is empty.
+	if err := s.email.SendCredential(req.Email, req.Username, password); err != nil {
+		log.Printf("auth: SendCredential failed for new user %q: %v", req.Username, err)
+	}
+	return id, password, nil
 }
 
-func (s *AuthService) CreateAccountsBulk(ctx context.Context, creator models.User, req models.BulkCreateUserRequest) ([]int, error) {
-	var ids []int
-	for _, userReq := range req.Users {
-		id, err := s.CreateAccount(ctx, creator, userReq)
-		if err != nil {
-			return ids, fmt.Errorf("failed at user %s: %w", userReq.Username, err)
-		}
-		ids = append(ids, id)
+// LogStudentCreate records the `create` password event for a student created
+// through the shared single-student path. The default password is the
+// student_number. Best-effort: never fails the create.
+func (s *AuthService) LogStudentCreate(ctx context.Context, creator models.User, studentID int, defaultPassword, username, email string) {
+	creatorID := creator.ID
+	s.logPasswordEvent(ctx, studentID, &creatorID, models.PasswordEventCreate, defaultPassword)
+	// SendCredential skips silently when email is empty (most students have none).
+	if err := s.email.SendCredential(email, username, defaultPassword); err != nil {
+		log.Printf("auth: SendCredential failed for new student %q: %v", username, err)
 	}
-	return ids, nil
+}
+
+// ForgotResetThrottle is the minimum interval between honoured forgot-password
+// requests for a single account. A request inside this window is silently
+// dropped (the generic success response is still returned).
+const ForgotResetThrottle = 5 * time.Minute
+
+// Forgot-password OTP verification parameters. Step 1 emails a one-time code;
+// step 2 (VerifyForgotPassword) must present it before a new password is
+// generated.
+const (
+	// ResetOTPLength is the number of decimal digits in a verification code.
+	ResetOTPLength = 6
+	// ResetOTPTTL is how long a verification code stays valid after step 1.
+	ResetOTPTTL = 10 * time.Minute
+	// ResetOTPMaxAttempts caps verification tries per issued code.
+	ResetOTPMaxAttempts = 5
+)
+
+// ErrInvalidResetCode is the single sentinel returned for EVERY step-2 failure
+// (unknown username, no email, no/expired code, too many attempts, wrong code)
+// so the endpoint never reveals which condition failed.
+var ErrInvalidResetCode = errors.New("invalid or expired code")
+
+// ForgotPassword handles step 1 of the public, unauthenticated two-step
+// forgot-password flow: it issues a one-time verification code and emails it to
+// the account's address. No password is changed at this stage — that happens
+// only after VerifyForgotPassword accepts the code. The flow is deliberately
+// enumeration-safe on TWO axes:
+//
+//   - Result: it returns nil in every non-fatal case (unknown user, no email on
+//     file, throttled) so the caller always emits the same generic 200 without
+//     leaking whether the account exists.
+//   - Timing: the synchronous portion is uniformly fast on EVERY path. The
+//     blocking SMTP round-trip is deferred to a background goroutine, so the
+//     response latency no longer reveals valid targets.
+//
+// When the user exists AND has an email AND is not throttled, beginForgotReset
+// authorizes the request, stamps the throttle clock, and stores the code's
+// SHA-256 hash + expiry — all synchronously, so a rapid verify cannot race the
+// store. Only the email delivery is asynchronous.
+func (s *AuthService) ForgotPassword(ctx context.Context, username string) error {
+	user, otp, authorized := s.beginForgotReset(ctx, username)
+	if !authorized {
+		return nil
+	}
+	// Defer the blocking SMTP send so the response time is identical to the
+	// unknown/no-email/throttled paths.
+	go s.sendResetCode(user, otp)
+	return nil
+}
+
+// beginForgotReset is the SYNCHRONOUS, fast portion of forgot-password step 1.
+// It resolves the user, requires an email on file, evaluates the abuse
+// throttle, and — when the request is authorized — stamps last_forgot_reset_at
+// to now() AND stores the freshly generated code (SHA-256 hash + expiry,
+// attempts reset) BEFORE returning. Stamping synchronously both drives the
+// throttle and narrows the TOCTOU window for concurrent duplicate requests;
+// storing the code synchronously means a verify request arriving right after
+// the generic 200 can never observe a missing code. It returns
+// (user, otp, true) only when the caller should proceed to email the code.
+//
+// The throttle decision relies exclusively on system_users.last_forgot_reset_at,
+// NOT on the password_events audit trail. This makes it independent of
+// PASSWORD_LOG_KEY: without an encryption key no password event is written, yet
+// the throttle still fires correctly.
+func (s *AuthService) beginForgotReset(ctx context.Context, username string) (models.User, string, bool) {
+	user, err := s.repo.GetUserByUsername(ctx, username)
+	if err != nil {
+		// Unknown username (or lookup failure): do not leak via error/timing.
+		return models.User{}, "", false
+	}
+	if user.Email == nil || *user.Email == "" {
+		// No email on file — nothing to deliver to. Silent no-op.
+		return models.User{}, "", false
+	}
+
+	// Abuse throttle: key-independent, reads last_forgot_reset_at only.
+	if last, err := s.repo.GetLastForgotResetAt(ctx, user.ID); err == nil && last != nil {
+		if time.Since(*last) < ForgotResetThrottle {
+			log.Printf("auth: forgot-password throttled for user_id=%d (last reset %s ago)", user.ID, time.Since(*last))
+			return models.User{}, "", false
+		}
+	}
+
+	// Authorize now: stamp the throttle clock synchronously, before any async
+	// work is spawned, so a rapid second request is throttled immediately.
+	if err := s.repo.SetLastForgotResetAt(ctx, user.ID); err != nil {
+		log.Printf("auth: forgot-password failed to stamp throttle clock for user_id=%d: %v", user.ID, err)
+		return models.User{}, "", false
+	}
+
+	// Issue the one-time code: only its SHA-256 hash is persisted, alongside the
+	// expiry, and the attempt counter is reset.
+	otp := GenerateResetOTP()
+	if err := s.repo.SetResetOTP(ctx, user.ID, hashResetOTP(otp), time.Now().Add(ResetOTPTTL)); err != nil {
+		log.Printf("auth: forgot-password failed to store reset code for user_id=%d: %v", user.ID, err)
+		return models.User{}, "", false
+	}
+	return user, otp, true
+}
+
+// sendResetCode is the ASYNCHRONOUS portion of forgot-password step 1: it only
+// emails the verification code. Failures are logged, never returned, and the
+// code itself is never logged.
+func (s *AuthService) sendResetCode(user models.User, otp string) {
+	if user.Email == nil || *user.Email == "" {
+		return
+	}
+	if err := s.email.SendResetCode(*user.Email, user.Username, otp); err != nil {
+		log.Printf("auth: forgot-password SendResetCode failed for %q: %v", user.Username, err)
+	}
+}
+
+// VerifyForgotPassword handles step 2 of the forgot-password flow: it checks
+// the submitted one-time code and, on success, clears the code synchronously
+// (so it cannot be replayed) and triggers the actual password regeneration +
+// credential email asynchronously via performForgotReset. Every failure mode
+// returns the single sentinel ErrInvalidResetCode.
+func (s *AuthService) VerifyForgotPassword(ctx context.Context, username, otp string) error {
+	user, err := s.verifyResetOTP(ctx, username, otp)
+	if err != nil {
+		return err
+	}
+	// Defer the expensive work (bcrypt + synchronous SMTP send) as in step 1.
+	// Use a fresh context: the request context is cancelled the instant the
+	// handler returns.
+	go s.performForgotReset(context.Background(), user)
+	return nil
+}
+
+// verifyResetOTP is the SYNCHRONOUS verification core of step 2. It never
+// distinguishes failure causes: unknown username, no email on file, no code
+// outstanding, expired code, exhausted attempts, and a wrong code all collapse
+// into ErrInvalidResetCode. The attempt counter is incremented atomically
+// BEFORE the code comparison, so failed guesses are always counted, and the
+// comparison itself is constant-time over the SHA-256 digests.
+func (s *AuthService) verifyResetOTP(ctx context.Context, username, otp string) (models.User, error) {
+	user, err := s.repo.GetUserByUsername(ctx, username)
+	if err != nil {
+		return models.User{}, ErrInvalidResetCode
+	}
+	if user.Email == nil || *user.Email == "" {
+		return models.User{}, ErrInvalidResetCode
+	}
+
+	hash, expiresAt, attempts, err := s.repo.GetResetOTP(ctx, user.ID)
+	if err != nil || hash == nil || expiresAt == nil {
+		return models.User{}, ErrInvalidResetCode
+	}
+	if time.Now().After(*expiresAt) {
+		return models.User{}, ErrInvalidResetCode
+	}
+	if attempts >= ResetOTPMaxAttempts {
+		return models.User{}, ErrInvalidResetCode
+	}
+
+	// Count the attempt FIRST (atomically), so a wrong guess below is already
+	// recorded and concurrent guesses cannot slip past the cap.
+	newCount, err := s.repo.IncrementResetOTPAttempts(ctx, user.ID)
+	if err != nil {
+		return models.User{}, ErrInvalidResetCode
+	}
+	if newCount > ResetOTPMaxAttempts {
+		return models.User{}, ErrInvalidResetCode
+	}
+
+	if subtle.ConstantTimeCompare([]byte(hashResetOTP(otp)), []byte(*hash)) != 1 {
+		return models.User{}, ErrInvalidResetCode
+	}
+
+	// Clear the code synchronously so it cannot be replayed, even by a request
+	// racing the async reset below.
+	if err := s.repo.ClearResetOTP(ctx, user.ID); err != nil {
+		log.Printf("auth: forgot-password failed to clear reset code for user_id=%d: %v", user.ID, err)
+		return models.User{}, ErrInvalidResetCode
+	}
+	return user, nil
+}
+
+// performForgotReset is the ASYNCHRONOUS, heavy portion of the forgot-password
+// flow, run only after VerifyForgotPassword has accepted the one-time code. It
+// generates a new password, hashes and persists it, bumps token_version
+// (evicting existing sessions), writes the `forgot_reset` audit event (only when
+// an encryption key is configured), and emails the credential. It is a directly
+// callable method (not a closure) so tests can exercise it synchronously without
+// depending on goroutine timing. All failures are logged, never returned, and the
+// plaintext password is never logged.
+func (s *AuthService) performForgotReset(ctx context.Context, user models.User) {
+	if user.Email == nil || *user.Email == "" {
+		return
+	}
+	password := GeneratePassword()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("auth: forgot-password hash failed for user_id=%d: %v", user.ID, err)
+		return
+	}
+	if err := s.repo.UpdateUserPassword(ctx, user.ID, string(hash)); err != nil {
+		log.Printf("auth: forgot-password persist failed for user_id=%d: %v", user.ID, err)
+		return
+	}
+	if err := s.repo.BumpTokenVersion(ctx, user.ID); err != nil {
+		log.Printf("auth: forgot-password token bump failed for user_id=%d: %v", user.ID, err)
+	}
+
+	changedBy := user.ID
+	// Audit event: only persisted when a PASSWORD_LOG_KEY is configured. The
+	// throttle above does NOT depend on this write.
+	s.logPasswordEvent(ctx, user.ID, &changedBy, models.PasswordEventForgotReset, password)
+	if err := s.email.SendCredential(*user.Email, user.Username, password); err != nil {
+		log.Printf("auth: forgot-password SendCredential failed for %q: %v", user.Username, err)
+	}
+}
+
+// ResetPassword (admin-only) generates a new password for targetID, updates the
+// login hash, bumps token_version (evicting existing sessions), records an
+// `admin_reset` event, and emails the new credential. Returns the new password
+// once.
+func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targetID int) (string, error) {
+	target, err := s.repo.GetUserByID(ctx, targetID)
+	if err != nil {
+		return "", err
+	}
+
+	password := GeneratePassword()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	if err := s.repo.UpdateUserPassword(ctx, targetID, string(hash)); err != nil {
+		return "", err
+	}
+	if err := s.repo.BumpTokenVersion(ctx, targetID); err != nil {
+		return "", err
+	}
+
+	actorID := actor.ID
+	s.logPasswordEvent(ctx, targetID, &actorID, models.PasswordEventAdminReset, password)
+	if err := s.email.SendCredential("", target.Username, password); err != nil {
+		log.Printf("auth: SendCredential failed for reset of %q: %v", target.Username, err)
+	}
+	return password, nil
+}
+
+// GetPasswordEventsView returns the decrypted changelog for a user (admin-only).
+// The access itself is logged (metadata only). When the encryption key is not
+// configured, keyConfigured is false and NewPassword is omitted from each entry.
+func (s *AuthService) GetPasswordEventsView(ctx context.Context, actor models.User, targetID int) (keyConfigured bool, events []models.PasswordEventView, err error) {
+	log.Printf("auth: admin %q (id=%d) viewed password events for user_id=%d", actor.Username, actor.ID, targetID)
+	rows, err := s.repo.GetPasswordEvents(ctx, targetID)
+	if err != nil {
+		return s.cipher != nil, nil, err
+	}
+	views := make([]models.PasswordEventView, 0, len(rows))
+	for _, r := range rows {
+		v := models.PasswordEventView{
+			Source:            r.Source,
+			ChangedByUsername: r.ChangedByUsername,
+			CreatedAt:         r.CreatedAt,
+		}
+		if s.cipher != nil {
+			if pt, derr := s.cipher.Decrypt(r.NewPasswordEnc, r.Nonce); derr == nil {
+				v.NewPassword = pt
+			} else {
+				log.Printf("auth: failed to decrypt password event for user_id=%d: %v", targetID, derr)
+			}
+		}
+		views = append(views, v)
+	}
+	return s.cipher != nil, views, nil
+}
+
+// logPasswordEvent encrypts and persists a password event, then best-effort
+// notifies the admin. When no encryption key is configured, logging is disabled
+// (the operation itself is unaffected).
+func (s *AuthService) logPasswordEvent(ctx context.Context, userID int, changedBy *int, source, plaintext string) {
+	if s.cipher == nil {
+		log.Printf("auth: password-event logging disabled (no key); skipping %s event for user_id=%d", source, userID)
+		return
+	}
+	ct, nonce, err := s.cipher.Encrypt(plaintext)
+	if err != nil {
+		log.Printf("auth: encrypt password event failed (user_id=%d, source=%s): %v", userID, source, err)
+		return
+	}
+	ev := models.PasswordEvent{
+		UserID:         userID,
+		ChangedBy:      changedBy,
+		Source:         source,
+		NewPasswordEnc: ct,
+		Nonce:          nonce,
+	}
+	id, err := s.repo.InsertPasswordEvent(ctx, ev)
+	if err != nil {
+		log.Printf("auth: insert password event failed (user_id=%d, source=%s): %v", userID, source, err)
+		return
+	}
+	ev.ID = id
+	if s.adminEmail != "" {
+		if err := s.email.SendChangeNotice(s.adminEmail, ev); err != nil {
+			log.Printf("auth: SendChangeNotice failed (user_id=%d): %v", userID, err)
+		}
+	}
 }
 
 func (s *AuthService) SeedAdminAccount(ctx context.Context, username, password string) error {
@@ -143,36 +509,58 @@ func (s *AuthService) SeedAdminAccount(ctx context.Context, username, password s
 	return err
 }
 
-func (s *AuthService) ChangePassword(ctx context.Context, userID int, oldPassword, newPassword string) error {
-	user, err := s.repo.GetUserByID(ctx, userID)
+// ChangeOwnPassword verifies the old password, sets the new one, records a
+// `self_change` event, and bumps token_version — which invalidates every
+// previously-issued token for the user, including on their other devices. To
+// keep the current device logged in, it returns a freshly minted JWT carrying
+// the new token_version.
+func (s *AuthService) ChangeOwnPassword(ctx context.Context, current models.User, oldPassword, newPassword string) (string, error) {
+	user, err := s.repo.GetUserByID(ctx, current.ID)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(oldPassword)); err != nil {
-		return errors.New("invalid old password")
+		return "", errors.New("invalid old password")
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if err := s.repo.UpdateUserPassword(ctx, current.ID, string(hash)); err != nil {
+		return "", err
+	}
+	if err := s.repo.BumpTokenVersion(ctx, current.ID); err != nil {
+		return "", err
 	}
 
-	return s.repo.UpdateUserPassword(ctx, userID, string(hash))
+	changedBy := current.ID
+	s.logPasswordEvent(ctx, current.ID, &changedBy, models.PasswordEventSelfChange, newPassword)
+
+	// Mint a fresh token so the caller's current device stays logged in.
+	version, err := s.repo.GetTokenVersion(ctx, current.ID)
+	if err != nil {
+		return "", err
+	}
+	return s.generateToken(user, version)
 }
 
-func (s *AuthService) generateToken(user models.User) (string, error) {
+func (s *AuthService) generateToken(user models.User, tokenVersion int) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id":  user.ID,
-		"username": user.Username,
-		"role":     user.Role,
-		"exp":      time.Now().Add(time.Hour * 24).Unix(),
+		"user_id":       user.ID,
+		"username":      user.Username,
+		"role":          user.Role,
+		"token_version": tokenVersion,
+		"exp":           time.Now().Add(time.Hour * 24).Unix(),
 	})
 
 	return token.SignedString(s.jwtSecret)
 }
 
-func (s *AuthService) ValidateToken(tokenString string) (models.User, error) {
+// parseToken validates the JWT signature/claims and returns the embedded user
+// plus the token_version claim. It does NOT check the version against the DB.
+func (s *AuthService) parseToken(tokenString string) (models.User, int, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -181,12 +569,12 @@ func (s *AuthService) ValidateToken(tokenString string) (models.User, error) {
 	}, jwt.WithValidMethods([]string{"HS256"}))
 
 	if err != nil || !token.Valid {
-		return models.User{}, errors.New("invalid token")
+		return models.User{}, 0, errors.New("invalid token")
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return models.User{}, errors.New("invalid claims")
+		return models.User{}, 0, errors.New("invalid claims")
 	}
 
 	userID, ok1 := claims["user_id"].(float64)
@@ -194,12 +582,42 @@ func (s *AuthService) ValidateToken(tokenString string) (models.User, error) {
 	role, ok3 := claims["role"].(string)
 
 	if !ok1 || !ok2 || !ok3 {
-		return models.User{}, errors.New("invalid claims format")
+		return models.User{}, 0, errors.New("invalid claims format")
+	}
+
+	// token_version is optional for backward compatibility; absent → 0.
+	version := 0
+	if v, ok := claims["token_version"].(float64); ok {
+		version = int(v)
 	}
 
 	return models.User{
 		ID:       int(userID),
 		Username: username,
 		Role:     models.Role(role),
-	}, nil
+	}, version, nil
+}
+
+// ValidateToken validates signature and claims only (no token_version check).
+func (s *AuthService) ValidateToken(tokenString string) (models.User, error) {
+	user, _, err := s.parseToken(tokenString)
+	return user, err
+}
+
+// AuthenticateRequest validates the token AND compares its token_version to the
+// user's current value. A mismatch (password changed/reset since issue) returns
+// an error so the middleware can reject with 401.
+func (s *AuthService) AuthenticateRequest(ctx context.Context, tokenString string) (models.User, error) {
+	user, version, err := s.parseToken(tokenString)
+	if err != nil {
+		return models.User{}, err
+	}
+	current, err := s.repo.GetTokenVersion(ctx, user.ID)
+	if err != nil {
+		return models.User{}, errors.New("invalid token")
+	}
+	if version != current {
+		return models.User{}, errors.New("token invalidated by password change")
+	}
+	return user, nil
 }

@@ -20,9 +20,9 @@ export interface ReorderEntry {
 async function schemaFetch(path: string, options: RequestInit = {}): Promise<any> {
   const token = localStorage.getItem('sql_quiz_token')
   const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> ?? {}),
-    Authorization: `Bearer ${token}`
+    ...(options.headers as Record<string, string> ?? {})
   }
+  if (token) headers['Authorization'] = `Bearer ${token}`
   const res = await fetch(path, { ...options, headers })
   if (!res.ok) {
     let body: any = {}
@@ -64,7 +64,7 @@ export function uploadCategoryIntroImage(
     const token = localStorage.getItem('sql_quiz_token')
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/v1/lecturer/practice/categories/${catId}/intro-images`)
-    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
 
     if (onProgress) {
       xhr.upload.addEventListener('progress', (e) => {
@@ -133,7 +133,7 @@ export function uploadExamIntroImage(
     const token = localStorage.getItem('sql_quiz_token')
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/v1/lecturer/exams/${examId}/intro-images`)
-    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
 
     if (onProgress) {
       xhr.upload.addEventListener('progress', (e) => {
@@ -179,8 +179,10 @@ export function uploadExamIntroImage(
 
 export async function categoryImageBlobUrl(catId: number, imgId: number): Promise<string> {
   const token = localStorage.getItem('sql_quiz_token')
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
   const res = await fetch(`/api/v1/practice/categories/${catId}/intro-images/${imgId}`, {
-    headers: { Authorization: `Bearer ${token}` }
+    headers
   })
   if (!res.ok) throw new Error(`Failed to fetch image: HTTP ${res.status}`)
   const blob = await res.blob()
@@ -189,8 +191,10 @@ export async function categoryImageBlobUrl(catId: number, imgId: number): Promis
 
 export async function examImageBlobUrl(examId: number, imgId: number): Promise<string> {
   const token = localStorage.getItem('sql_quiz_token')
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
   const res = await fetch(`/api/v1/quiz/exams/${examId}/intro-images/${imgId}`, {
-    headers: { Authorization: `Bearer ${token}` }
+    headers
   })
   if (!res.ok) throw new Error(`Failed to fetch image: HTTP ${res.status}`)
   const blob = await res.blob()
