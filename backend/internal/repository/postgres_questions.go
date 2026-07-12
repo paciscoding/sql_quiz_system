@@ -10,12 +10,15 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
 
-func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Question) error {
+// CreateQuestion captures the correct-result set and persists the question,
+// returning its id. A question with ID==0 is created with a fresh auto-assigned
+// id; a question with ID>0 upserts (updates) that existing row.
+func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Question) (int, error) {
 	// Pre-flight: Check if exam is active
 	if q.ExamID != nil {
 		exam, err := r.GetExamByID(ctx, *q.ExamID)
 		if err == nil && exam.IsActive {
-			return fmt.Errorf("%w: cannot modify questions of an active examination", ErrExamActive)
+			return 0, fmt.Errorf("%w: cannot modify questions of an active examination", ErrExamActive)
 		}
 	}
 
@@ -79,40 +82,61 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 	})
 
 	if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
-		return err
+		return 0, err
 	}
 
-	query := `
-	INSERT INTO app.questions (
-		id, exam_id, target_table, correct_sql, question_type, points, requirement,
-		strict_ordering, strict_attributes, strict_column_order,
-		expected_result, expected_columns, expected_result_status,
-		expected_result_captured_at, capture_error, created_by, updated_at
-	)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15, NOW())
-	ON CONFLICT (id) DO UPDATE SET
-		exam_id = EXCLUDED.exam_id,
-		target_table = EXCLUDED.target_table,
-		correct_sql = EXCLUDED.correct_sql,
-		question_type = EXCLUDED.question_type,
-		points = EXCLUDED.points,
-		requirement = EXCLUDED.requirement,
-		strict_ordering = EXCLUDED.strict_ordering,
-		strict_attributes = EXCLUDED.strict_attributes,
-		strict_column_order = EXCLUDED.strict_column_order,
-		expected_result = EXCLUDED.expected_result,
-		expected_columns = EXCLUDED.expected_columns,
-		expected_result_status = EXCLUDED.expected_result_status,
-		expected_result_captured_at = NOW(),
-		capture_error = EXCLUDED.capture_error,
-		updated_at = NOW()`
+	// Persist. When no client id is supplied (create), omit the id column so the
+	// sequence default assigns a fresh one — this closes the historic id=0
+	// collision. When an id IS supplied (update), upsert that specific row.
+	// RETURNING id surfaces the real id in both cases.
+	var newID int
+	if q.ID == 0 {
+		const insertQ = `
+		INSERT INTO app.questions (
+			exam_id, target_table, correct_sql, question_type, points, requirement,
+			strict_ordering, strict_attributes, strict_column_order,
+			expected_result, expected_columns, expected_result_status,
+			expected_result_captured_at, capture_error, created_by, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, NOW())
+		RETURNING id`
+		err = r.pool.QueryRow(ctx, insertQ,
+			q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
+			q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
+			expectedResult, expectedCols, status, captureErr, q.CreatedBy).Scan(&newID)
+	} else {
+		const upsertQ = `
+		INSERT INTO app.questions (
+			id, exam_id, target_table, correct_sql, question_type, points, requirement,
+			strict_ordering, strict_attributes, strict_column_order,
+			expected_result, expected_columns, expected_result_status,
+			expected_result_captured_at, capture_error, created_by, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15, NOW())
+		ON CONFLICT (id) DO UPDATE SET
+			exam_id = EXCLUDED.exam_id,
+			target_table = EXCLUDED.target_table,
+			correct_sql = EXCLUDED.correct_sql,
+			question_type = EXCLUDED.question_type,
+			points = EXCLUDED.points,
+			requirement = EXCLUDED.requirement,
+			strict_ordering = EXCLUDED.strict_ordering,
+			strict_attributes = EXCLUDED.strict_attributes,
+			strict_column_order = EXCLUDED.strict_column_order,
+			expected_result = EXCLUDED.expected_result,
+			expected_columns = EXCLUDED.expected_columns,
+			expected_result_status = EXCLUDED.expected_result_status,
+			expected_result_captured_at = NOW(),
+			capture_error = EXCLUDED.capture_error,
+			updated_at = NOW()
+		RETURNING id`
+		err = r.pool.QueryRow(ctx, upsertQ,
+			q.ID, q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
+			q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
+			expectedResult, expectedCols, status, captureErr, q.CreatedBy).Scan(&newID)
+	}
 
-	_, err = r.pool.Exec(ctx, query,
-		q.ID, q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
-		q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.CreatedBy)
-
-	return err
+	return newID, err
 }
 
 // PreviewCorrectSQL is the backward-compatible wrapper that always previews

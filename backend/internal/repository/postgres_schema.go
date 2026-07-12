@@ -108,6 +108,39 @@ func (r *PostgresRepository) QueryStudentSQL(ctx context.Context, schema, sql st
 	return results, rows.Err()
 }
 
+// migrateQuestionsIdentity repairs the legacy app.questions.id column, which was
+// a plain `INTEGER PRIMARY KEY` with no default. A question created without a
+// client-supplied id inserted id=0, and every subsequent no-id insert collided
+// on that row (ON CONFLICT (id) DO UPDATE), silently overwriting prior questions
+// across all exams. This attaches a sequence-backed default so omitted ids
+// auto-assign, seeding the sequence past any existing rows. Idempotent: the
+// guard only fires when the id column still has no default (covers fresh
+// installs and legacy databases alike; explicit ids are still accepted for the
+// update path).
+func (r *PostgresRepository) migrateQuestionsIdentity(ctx context.Context) error {
+	_, err := r.pool.Exec(ctx, `
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_attrdef d
+		JOIN pg_class c ON c.oid = d.adrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.adnum
+		WHERE n.nspname = 'app' AND c.relname = 'questions' AND a.attname = 'id'
+	) THEN
+		CREATE SEQUENCE IF NOT EXISTS app.questions_id_seq OWNED BY app.questions.id;
+		ALTER TABLE app.questions ALTER COLUMN id SET DEFAULT nextval('app.questions_id_seq');
+		PERFORM setval('app.questions_id_seq',
+			GREATEST(COALESCE((SELECT MAX(id) FROM app.questions), 0), 0) + 1, false);
+	END IF;
+END $$;`)
+	if err != nil {
+		return fmt.Errorf("questions identity migration: %w", err)
+	}
+	return nil
+}
+
 // GrantSchemaPermissions gives the restricted user CRUD access to a schema
 // migrateUniqueEmailIndex enforces that no two accounts share an email address
 // via a PARTIAL unique index (NULL emails remain unconstrained, so the many
@@ -1082,6 +1115,12 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 	// Dup-scans first so pre-existing duplicates don't brick startup.
 	if err := r.migrateUniqueEmailIndex(ctx); err != nil {
 		return fmt.Errorf("email uniqueness migration failed: %w", err)
+	}
+
+	// Attach an auto-increment default to app.questions.id so questions created
+	// without a client id no longer collide on id=0. Idempotent.
+	if err := r.migrateQuestionsIdentity(ctx); err != nil {
+		return fmt.Errorf("questions identity migration failed: %w", err)
 	}
 
 	// Practice-categories migration: add practice_questions.category_id, backfill
