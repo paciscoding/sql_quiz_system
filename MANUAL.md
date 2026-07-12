@@ -18,7 +18,14 @@ The Administrator is responsible for system infrastructure and the initial creat
 - **URL:** `http://localhost` (Click "Login")
 - **Username:** `admin`
 - **Password:** `admin123`
-*(Note: Change your password immediately via the **"Profile"** settings or the `/api/v1/users/password` endpoint for security.)*
+*(Note: Change your password immediately via the **"Profile"** settings or the `/api/v1/user/password` endpoint for security.)*
+
+### Account & Password Administration
+- **Staff accounts** are created under **"Manage Accounts"**; the system generates the password and shows it **once** — copy it before closing the dialog.
+- **Reset a password** for any user via the admin action — this generates a new password and **logs the user out of all devices**.
+- **Resend a credential** re-emails the user's current password (requires an email on file and `PASSWORD_LOG_KEY` configured); it does not change the password.
+- **Password events** shows a per-user audit trail of password changes.
+- Users who forget their password can self-serve from the login page (see the Student workflow's *Forgot Password* note) if they have an email on file.
 
 ### Managing Staff (Lecturers)
 1. Navigate to the **"Manage Accounts"** tab.
@@ -31,13 +38,13 @@ The Administrator is responsible for system infrastructure and the initial creat
 ## 2. Lecturer Workflow (Exam Preparation)
 Lecturers prepare the curriculum, initialize the database schema, and enroll students.
 
-### Step 1: Initialize the Exam Database
-Before any questions can be created or answered, you must set up the database structure:
-1. Navigate to the **"Questions"** tab.
-2. Locate the **"Initialize Exam Database"** card.
-3. Paste your full SQL setup script (e.g., `company_elmasri_postgres.sql`) into the textarea.
-4. Click **"Import Schema & Data"**.
-   - *This will create all tables in the `public` schema. SELECT questions read this schema directly under a SELECT-only role; DML questions clone it into a single per-exam sandbox at activation time. The lecturer never pays a per-student clone cost.*
+### Step 1: Initialize the Exam Database (per-exam curriculum)
+Before any questions can be created or answered, set up that exam's database structure:
+1. Open the exam from the exam list, then select the **"Schema"** sub-tab in its workspace.
+2. Paste your full SQL setup script (e.g., `company_elmasri_postgres.sql`) into the textarea.
+3. Click **"Import"**. If the exam already has a curriculum, you'll be asked to **confirm replacement**.
+   - *This imports into the exam's **own** isolated schema (`curriculum_exam_{id}`), not the shared `public` schema — each exam's curriculum is independent. Use unqualified table names (no `public.x`). SELECT questions read this schema directly under a SELECT-only role; DML questions clone it into a single per-exam sandbox at activation time. The lecturer never pays a per-student clone cost.*
+   - *(A legacy global "import into `public`" endpoint still exists for scripting but is no longer surfaced in the dashboard.)*
 
 ### Step 2: Manage Questions
 *Allowed only while the examination is **inactive** (`is_active = false`). The system rejects question edits on active exams to keep the cached Correct Result safe.*
@@ -59,8 +66,8 @@ When the question is saved, the system **immediately runs your Correct SQL** on 
 
 1. Navigate to the **"Manage Accounts"** tab.
 2. Create student accounts individually.
-3. For bulk creation (150+ students), use the API: `POST /api/v1/users/bulk`.
-4. Assign students to the examination via **"Assign Students"** on the exam dashboard.
+3. For bulk creation (150+ students), use the **roster import** (Step 3b) — there is no separate bulk-user endpoint.
+4. Assign students to the examination via the exam workspace's **"Roster"** sub-tab (**"Enroll Students"**).
 
 ### Step 3b: Importing a Class Roster
 Instead of creating student accounts individually, you can bulk-import an entire class roster from a spreadsheet:
@@ -90,10 +97,15 @@ Students should change their password on first login via the **"Profile"** setti
 **Re-import behaviour:** Re-uploading the same roster updates name and section columns but **does not reset passwords**. Students who have already changed their password keep it after a re-import.
 
 ### Step 4: Activate the Examination
-Activation is the point of no return for question edits. Click **"Activate"** on the examination card.
+Activation is the point of no return for question edits. Use the **"Activate"** control on the examination card. You can activate two ways:
 
-- **Pre-flight check.** The system refuses to activate unless every question has a successfully captured Correct Result. If any question is in `failed` or `pending` state, the dialog lists them and you must fix them first.
-- **Once active**, students enrolled in the exam will see it in their dashboard. Curriculum imports, question edits, and student assignments are blocked until you deactivate.
+- **Instant** — the exam becomes live immediately.
+- **Scheduled** — supply a **start time** (and optionally an **end time**), in UTC. The exam shows as **scheduled** until the start time passes, then flips to **active** on its own (no background job — the state is computed on read and pushed to waiting students over a live connection). A scheduled **end time** flips it to **ended** automatically.
+
+Each exam card shows a badge for its current effective state: **inactive / scheduled / active / ended**.
+
+- **Pre-flight check.** The system refuses to activate unless every question has a successfully captured Correct Result **and** the exam has at least one question. If any question is in `failed` or `pending` state, the dialog lists them and you must fix them first.
+- **Once active**, enrolled students see the exam in their dashboard. Curriculum imports, question edits, and student assignments are blocked until you deactivate.
 
 ### Step 5: End the Examination
 Click **"Deactivate"** on the examination card. This:
@@ -104,20 +116,27 @@ Click **"Deactivate"** on the examination card. This:
 ### Practice Questions
 The practice module lets you publish questions students can attempt at any time outside of active exams.
 
+#### Practice Categories (per-category databases)
+Practice questions are organised into **categories**, and **each category owns its own database schema** (`practice_cat_{id}`), fully isolated from the exam curriculum in `public`:
+1. In the **"Practice"** tab, create a category ("New Category") or use the built-in **Uncategorized** fallback (which cannot be deleted).
+2. Select the category and **import a database** into it (paste unqualified SQL; confirm replacement if it already has tables). Both SELECT and DML questions in that category run against its schema.
+3. Deleting a category that still has questions is blocked unless you force it.
+4. Each category can carry its own **introduction** text and intro images, shown to students.
+
 #### Authoring Practice Questions
-1. Navigate to the **"Practice"** tab in the Lecturer dashboard.
+1. In the **"Practice"** tab, pick the **category** the question belongs to.
 2. Fill in the question form: Type (QUERY or DML), Target Table (DML only), Correct SQL, and Points.
 3. Click **"Save Practice Question"**.
-   - The system immediately runs your Correct SQL against the practice schema, captures the expected result, and shows a capture-status badge (green = captured, red = failed with error, amber = pending).
+   - The system immediately runs your Correct SQL against the category's schema, captures the expected result, and shows a capture-status badge (green = captured, red = failed with error, amber = pending).
    - Fix the SQL and re-save if the badge is red.
-4. To view all practice questions, click the **"List Practice Questions"** button.
+4. Click **"List Practice Questions"** to view all of them.
 5. To delete a question, click **"Delete"** next to it. Deletions do not affect existing attempt records.
 
 #### Resetting the Practice Sandbox
-The practice sandbox (sandbox_practice schema) is shared across all students. If the curriculum schema (public.*) changes — e.g., after importing a new schema — the practice sandbox must be manually reset:
-1. Click **"Reset Practice Sandbox"** in the Practice tab.
-2. The system drops sandbox_practice and re-clones every table from public.* using the same LIKE INCLUDING ALL + INSERT ... SELECT pattern as exam sandbox initialization.
-3. **Caution:** Any in-flight practice DML submission will see an error if a reset races with it. Perform resets when student traffic is low.
+If a category's imported schema changes, you can rebuild the practice databases from the **"Practice"** tab:
+1. Click **"Reset Practice Sandbox"**.
+2. The system rebuilds the practice schema(s) and returns the `reset_at` timestamp.
+3. **Caution:** An in-flight practice DML submission can error if a reset races with it. Perform resets when student traffic is low. *(A hardening item to hold a sentinel advisory lock for the duration of the rebuild is tracked but not yet implemented — see `TODO.md`.)*
 
 ### Step 6: Reviewing and Exporting Results
 Once students have completed their assessments, you can review their performance:
@@ -138,6 +157,13 @@ Students interact only with the examination interface.
 ### Logging In
 1. Log in with the credentials provided by your Lecturer.
 2. Your **Student ID** is automatically identified by the system; you do not need to enter it manually.
+
+**Forgot your password?** If your account has an email on file, use **"Forgot password"** on the login screen: enter your username to receive a 6-digit code by email, then enter the code to have a new password emailed to you. The code expires in 10 minutes.
+
+### Selecting an Exam & the Waiting Page
+1. Pick an exam you're enrolled in.
+2. If the exam is **scheduled** but hasn't started yet, you land on a **waiting page**. You do **not** need to refresh — when the lecturer's start time arrives (or they activate manually), the page switches to the live exam automatically over a live connection.
+3. Once **active**, the exam interface opens.
 
 ### Submitting Answers
 1. Select the **Question Number**.

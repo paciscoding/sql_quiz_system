@@ -33,14 +33,22 @@ The core sprint goals have been achieved. The system successfully validates stud
 - **Phase 2 — Active**: Student submissions and real-time grading.
 - **Phase 3 — Archive**: Sandbox cleanup and score persistence.
 
-#### Student Management
+**Scheduling note.** Activation is not only a manual click. An exam carries optional `scheduled_start_at` / `scheduled_end_at` timestamps (RFC3339 UTC), and a single `ExaminationEffectiveState` helper derives a lazy *effective state* over the half-open window `[start, end)`: `inactive` (never activated), `scheduled` (activated but before `start`), `active` (within the window or an instant activation with no start), `ended` (past `end`). There is **no background scheduler** — the state is computed on read, and the DML sandbox is prepared lazily the first time an enrolled student pulls the questions of an exam that has become effectively `active`. Submission gates key off the effective state (`active`), not the raw `is_active` flag.
+
+#### Live Exam Start (SSE)
+- Students select an enrolled exam and, if it is `scheduled`, land on a **waiting page** rather than a hard error.
+- The backend exposes `GET /api/v1/quiz/exams/:id/stream` (Server-Sent Events, JWT via `access_token` query param since `EventSource` cannot set headers). It pushes `exam-status` frames carrying `effective_state` + `server_time`; the client transitions from *waiting* to *active* the moment the exam flips, with a periodic poll fallback if the stream drops. WebSocket and an Nginx-level load-balancer were rejected in favour of the in-process SSE `Hub`.
+
+#### Student Management & Authentication
 - Manual creation and bulk roster import (.csv/.xlsx) are supported.
-- Automatic account generation with student numbers as credentials.
+- Automatic account generation with student numbers as credentials; staff (lecturer/admin) passwords are **server-generated** and shown once.
 - Examination enrollment and performance tracking.
+- **Email-based password management**: optional email on every account; self-service change-password; a two-step **forgot-password** flow (6-digit OTP emailed, then a fresh password issued); admin **reset-password** / **resend-credential** actions; and a per-user **password-events** audit trail (optionally storing the recoverable password under `PASSWORD_LOG_KEY`). Every password change bumps a JWT `token_version` that evicts stale sessions. Real SMTP delivery is Gmail STARTTLS (best-effort; sends are skipped silently when no address is on file).
 
 #### Practice Mode
-- Isolated practice sandbox for students to hone their skills outside of exam periods.
-- Automatic locking during active examinations to preserve system resources.
+- Practice questions are organised into **categories**, each owning its own isolated schema (`practice_cat_{id}`) into which a lecturer imports a database — fully separate from the exam curriculum in `public`.
+- Both SELECT and DML practice submissions run against the category schema (SELECT read-only, DML via savepoint-rollback), so students can hone skills outside exam periods.
+- Practice stays **live during exams by default**; a lecturer can opt an individual exam into freezing practice (`block_practice_during_exam`), which returns HTTP 423 on practice submit/preview while that exam is active.
 
 ##### Lowered Operation Strategy (Optimized Check)
 The evaluation lifecycle is split into four phases. Each phase has a fixed set of operations and is gated on the examination's activation state, so the minimization holds end-to-end.

@@ -81,21 +81,32 @@ func main() {
 		log.Printf("email: NoopEmailSender active (%s unset; emails are logged, not sent)", services.EmailSenderAddressEnv)
 	}
 
-	// Seed Admin only when both credentials are provided via env (no defaults).
-	// If either is unset, skip seeding — a prior boot may already have created an
-	// admin, so startup must still succeed.
+	// Seed Admin on first startup. The password is server-generated (never set by
+	// hand); it is emailed to ADMIN_EMAIL and also printed once below as a
+	// no-lockout fallback. Idempotent — a prior boot's admin is left untouched, so
+	// startup still succeeds when ADMIN_USER is unset or the admin already exists.
 	adminUser := os.Getenv("ADMIN_USER")
-	adminPass := os.Getenv("ADMIN_PASS")
-	if adminUser == "" || adminPass == "" {
-		log.Printf("Warning: ADMIN_USER and/or ADMIN_PASS unset; skipping default admin seeding")
-	} else if err := authService.SeedAdminAccount(ctx, adminUser, adminPass); err != nil {
-		log.Printf("Warning: Failed to seed admin: %v", err)
+	adminEmail := os.Getenv("ADMIN_EMAIL")
+	if adminUser == "" {
+		log.Printf("Warning: ADMIN_USER unset; skipping default admin seeding")
+	} else {
+		if adminEmail == "" {
+			log.Printf("Warning: ADMIN_EMAIL unset; the generated admin password will only be printed below, not emailed")
+		}
+		if pw, err := authService.SeedAdminAccount(ctx, adminUser, adminEmail); err != nil {
+			log.Printf("Warning: Failed to seed admin: %v", err)
+		} else if pw != "" {
+			// First seed only. This is the sole bootstrap channel if email is off
+			// or SMTP fails, so log it once here.
+			log.Printf("Seeded admin %q with generated password: %s", adminUser, pw)
+		}
 	}
 
 	// Initialize Controllers
 	quizCtrl := controllers.NewQuizController(valService, submissionQueue, repo, hub, authService)
 	lecturerCtrl := controllers.NewLecturerController(repo, hub)
 	lecturerCtrl.SetStudentImportService(studentImportService)
+	lecturerCtrl.SetAuthService(authService)
 	userCtrl := controllers.NewUserController(authService, studentImportService)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
 	// Practice is live during exams by default; this gate only blocks practice
@@ -145,6 +156,7 @@ func main() {
 				adminUsers.DELETE("/:id", userCtrl.DeleteUser)
 				// Password management (admin only).
 				adminUsers.POST("/:id/reset-password", userCtrl.ResetPassword)
+				adminUsers.POST("/:id/resend-credential", userCtrl.ResendCredential)
 				adminUsers.GET("/:id/password-events", userCtrl.GetPasswordEvents)
 			}
 		}
@@ -203,7 +215,6 @@ func main() {
 			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)
 			staff.GET("/lecturer/scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetConsolidatedScores)
-			staff.GET("/lecturer/export-scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ExportScoresCSV)
 			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccount)
 			// Single-student create/upsert — shares the importer's parity path.
 			staff.POST("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateStudent)

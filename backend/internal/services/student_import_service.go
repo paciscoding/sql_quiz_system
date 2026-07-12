@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -23,6 +24,18 @@ type ImportRowError struct {
 	Message       string `json:"message"`
 }
 
+// CreatedStudent carries the generated credential for a newly-inserted student
+// so the caller can email it and/or surface it to the admin. UserID is used
+// internally to log the password event and is not serialized.
+type CreatedStudent struct {
+	UserID        int    `json:"-"`
+	Row           int    `json:"row"`
+	StudentNumber string `json:"student_number"`
+	StudentIDExt  string `json:"student_id_ext"`
+	Email         string `json:"email"`
+	Password      string `json:"password"`
+}
+
 // ImportReport summarizes the outcome of the import operation.
 type ImportReport struct {
 	Total   int              `json:"total"`
@@ -30,6 +43,9 @@ type ImportReport struct {
 	Updated int              `json:"updated"`
 	Skipped int              `json:"skipped"`
 	Errors  []ImportRowError `json:"errors"`
+	// CreatedAccounts lists the generated credentials for every newly-inserted
+	// student (empty for updates). The caller emails these and shows them once.
+	CreatedAccounts []CreatedStudent `json:"created_accounts"`
 }
 
 // StudentImportService coordinates the roster import logic with per-row savepoints.
@@ -56,22 +72,25 @@ type StudentUpsertInput struct {
 }
 
 // UpsertOne is the SINGLE source of truth for turning roster fields into a
-// system_users row. It hashes the default password (= student_number) and calls
-// the repository upsert on the supplied transaction. Both the bulk importer and
-// the single-student endpoint funnel through here, so a one-row import and a
-// manual add produce an identical row by construction.
-func (s *StudentImportService) UpsertOne(ctx context.Context, tx pgx.Tx, in StudentUpsertInput, creatorID int) (outcome string, userID int, err error) {
-	// Both identifiers are mandatory: student_number is the upsert key + default
-	// password, student_id_ext is the login username (UNIQUE NOT NULL).
+// system_users row. It generates a random password, hashes it, and calls the
+// repository upsert on the supplied transaction. Both the bulk importer and the
+// single-student endpoint funnel through here, so a one-row import and a manual
+// add produce an identical row by construction. The returned plaintext password
+// is only meaningful when outcome == "created": the upsert leaves password_hash
+// untouched on conflict, so an update keeps the student's existing password.
+func (s *StudentImportService) UpsertOne(ctx context.Context, tx pgx.Tx, in StudentUpsertInput, creatorID int) (outcome string, userID int, password string, err error) {
+	// Both identifiers are mandatory: student_number is the upsert key,
+	// student_id_ext is the login username (UNIQUE NOT NULL).
 	if in.StudentNumber == "" {
-		return "", 0, fmt.Errorf("student number is required")
+		return "", 0, "", fmt.Errorf("student number is required")
 	}
 	if in.StudentIDExt == "" {
-		return "", 0, fmt.Errorf("student ID is required")
+		return "", 0, "", fmt.Errorf("student ID is required")
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(in.StudentNumber), bcrypt.DefaultCost)
+	password = GeneratePassword()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	row := models.StudentImportRow{
 		StudentNumber: in.StudentNumber,
@@ -83,22 +102,26 @@ func (s *StudentImportService) UpsertOne(ctx context.Context, tx pgx.Tx, in Stud
 		Email:         in.Email,
 		PasswordHash:  string(hash),
 	}
-	return s.repo.UpsertStudentByNumber(ctx, tx, row, creatorID)
+	outcome, userID, err = s.repo.UpsertStudentByNumber(ctx, tx, row, creatorID)
+	if err != nil && repository.IsEmailConflict(err) {
+		return "", 0, "", ErrEmailInUse
+	}
+	return outcome, userID, password, err
 }
 
 // CreateSingle upserts one student in its own transaction. It shares UpsertOne
-// with the bulk path, guaranteeing manual==bulk parity. The default password is
-// the student_number.
-func (s *StudentImportService) CreateSingle(ctx context.Context, creatorID int, in StudentUpsertInput) (outcome string, userID int, err error) {
+// with the bulk path, guaranteeing manual==bulk parity. It returns the
+// generated password, meaningful only when outcome == "created".
+func (s *StudentImportService) CreateSingle(ctx context.Context, creatorID int, in StudentUpsertInput) (outcome string, userID int, password string, err error) {
 	txErr := s.repo.WithTransaction(ctx, func(tx pgx.Tx) error {
-		o, id, e := s.UpsertOne(ctx, tx, in, creatorID)
-		outcome, userID = o, id
+		o, id, pw, e := s.UpsertOne(ctx, tx, in, creatorID)
+		outcome, userID, password = o, id, pw
 		return e
 	})
 	if txErr != nil {
-		return "", 0, txErr
+		return "", 0, "", txErr
 	}
-	return outcome, userID, nil
+	return outcome, userID, password, nil
 }
 
 // Import processes a roster of students, performing an upsert for each row.
@@ -140,7 +163,7 @@ func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows [
 
 			// Route through the SHARED UpsertOne so a bulk row is identical to a
 			// single POST /students create (hashing + upsert live in one place).
-			outcome, _, err := s.UpsertOne(ctx, tx, StudentUpsertInput{
+			outcome, uid, password, err := s.UpsertOne(ctx, tx, StudentUpsertInput{
 				StudentNumber: row.StudentNumber,
 				StudentIDExt:  row.StudentIDExt,
 				SecLec:        row.SecLec,
@@ -169,6 +192,14 @@ func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows [
 
 			if outcome == "created" {
 				report.Created++
+				report.CreatedAccounts = append(report.CreatedAccounts, CreatedStudent{
+					UserID:        uid,
+					Row:           row.RowNumber,
+					StudentNumber: row.StudentNumber,
+					StudentIDExt:  row.StudentIDExt,
+					Email:         row.Email,
+					Password:      password,
+				})
 			} else if outcome == "updated" {
 				report.Updated++
 			} else {

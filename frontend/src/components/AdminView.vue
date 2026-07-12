@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
 import { useConfirm } from '../services/confirm_service'
 import { useFormValidation, required } from '../composables/useFormValidation'
@@ -10,6 +10,7 @@ import {
   createStaff,
   addStudent,
   resetPassword,
+  resendCredential,
   getPasswordEvents,
   type StaffRole,
   type PasswordEvent,
@@ -18,6 +19,7 @@ import Spinner from './Spinner.vue'
 import EmptyState from './EmptyState.vue'
 import Skeleton from './Skeleton.vue'
 import BulkImportStudents from './BulkImportStudents.vue'
+import EmailReveal from './EmailReveal.vue'
 
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
@@ -28,8 +30,25 @@ const newStaff = ref<{ username: string; role: StaffRole; email: string }>({
   role: 'LECTURER',
   email: '',
 })
-const staffReveal = ref<{ username: string; password: string } | null>(null)
-const staffEmailNotice = ref(false)
+const staffReveal = ref<{ id: number; username: string; email: string; password: string } | null>(null)
+// Inline email preview + real re-send state for the staff credential reveal.
+const showEmailPreview = ref(false)
+const resendNotice = ref('')
+
+// The exact credential email the backend sends (mirrors SMTPEmailSender.SendCredential).
+const emailPreview = computed(() => {
+  if (!staffReveal.value) return null
+  const { username, email, password } = staffReveal.value
+  return {
+    to: email,
+    subject: 'Your SQL Quiz System credentials',
+    body:
+      `Hello,\n\n` +
+      `An account password has been set for username "${username}".\n\n` +
+      `Password: ${password}\n\n` +
+      `Please sign in and change it if you wish.\n`,
+  }
+})
 
 // --- Add student (roster fields) — default password = student number ---
 const newStudent = ref({
@@ -41,7 +60,7 @@ const newStudent = ref({
   last_name: '',
   email: '',
 })
-const studentReveal = ref<{ student_number: string; username: string; password: string } | null>(null)
+const studentReveal = ref<{ student_number: string; username: string; email: string; password: string } | null>(null)
 
 // --- Per-user reset-password reveal ---
 const resetReveal = ref<{ username: string; password: string } | null>(null)
@@ -86,11 +105,17 @@ async function copyToClipboard(text: string) {
   }
 }
 
-function sendCredentialEmail() {
-  // Email delivery is a backend stub for now (spec §7). Surface the pending state.
-  staffEmailNotice.value = true
-  notify('Email delivery pending — this is not wired up yet.', 'info')
-}
+const { inFlight: resendLoading, run: resendCredentialEmail } = useSingleFlight(async () => {
+  if (!staffReveal.value) return
+  try {
+    const res = await resendCredential(staffReveal.value.id)
+    resendNotice.value = `Credential email sent to ${res.emailed_to}.`
+    notify(`Credential email sent to ${res.emailed_to}.`, 'success')
+  } catch (err) {
+    resendNotice.value = ''
+    handleApiError(err, { fallback: 'Failed to resend credential email' })
+  }
+})
 
 const fetchUsers = async () => {
   listLoading.value = true
@@ -120,8 +145,9 @@ const { inFlight: createStaffLoading, run: createStaffAction } = useSingleFlight
       role: newStaff.value.role,
       ...(email ? { email } : {}),
     })
-    staffReveal.value = { username, password: res.generated_password }
-    staffEmailNotice.value = false
+    staffReveal.value = { id: res.id, username, email, password: res.generated_password }
+    showEmailPreview.value = false
+    resendNotice.value = ''
     notify(`Account ${username} created successfully.`, 'success')
     newStaff.value = { username: '', role: 'LECTURER', email: '' }
     newStaffForm.reset()
@@ -140,10 +166,17 @@ const { inFlight: addStudentLoading, run: addStudentAction } = useSingleFlight(a
       ...rosterFields,
       ...(trimmedEmail ? { email: trimmedEmail } : {}),
     })
-    studentReveal.value = {
-      student_number: newStudent.value.student_number,
-      username: newStudent.value.student_id_ext,
-      password: res.default_password,
+    // Only a newly-created student has a generated password to reveal; an update
+    // preserves the existing password, so there is nothing to show.
+    if (res.created && res.generated_password) {
+      studentReveal.value = {
+        student_number: newStudent.value.student_number,
+        username: newStudent.value.student_id_ext,
+        email: trimmedEmail,
+        password: res.generated_password,
+      }
+    } else {
+      studentReveal.value = null
     }
     notify(`Student ${newStudent.value.student_number} ${res.created ? 'created' : 'updated'}.`, 'success')
     newStudent.value = {
@@ -282,7 +315,7 @@ onMounted(fetchUsers)
             </select>
           </div>
           <div class="field">
-            <label for="staff-email-input">Email <span class="muted">(optional)</span></label>
+            <label for="staff-email-input">Email <span class="muted">*</span></label>
             <input id="staff-email-input" class="input" type="email" data-testid="staff-email-input"
               v-model="newStaff.email" autocomplete="email" placeholder="name@example.com" />
           </div>
@@ -298,12 +331,29 @@ onMounted(fetchUsers)
           <code class="reveal-secret">{{ staffReveal.password }}</code>
           <div class="reveal-actions">
             <button type="button" class="btn btn-sm" data-testid="staff-copy" @click="copyToClipboard(staffReveal.password)">Copy</button>
-            <button type="button" class="btn btn-sm" data-testid="staff-email" @click="sendCredentialEmail">Email</button>
+            <button type="button" class="btn btn-sm" data-testid="staff-email-preview-toggle"
+              :aria-expanded="showEmailPreview" @click="showEmailPreview = !showEmailPreview"
+              :disabled="!staffReveal.email">
+              {{ showEmailPreview ? 'Hide email' : 'Preview email' }}
+            </button>
+            <button type="button" class="btn btn-sm" data-testid="staff-email-resend"
+              :disabled="!staffReveal.email || resendLoading" @click="resendCredentialEmail">
+              <Spinner v-if="resendLoading" size="sm" inline />{{ resendLoading ? 'Sending' : 'Re-send email' }}
+            </button>
             <button type="button" class="btn btn-sm" @click="staffReveal = null">Dismiss</button>
           </div>
-          <p v-if="staffEmailNotice" data-testid="staff-email-notice" class="reveal-notice">
-            Email delivery pending — SMTP is not wired up yet.
+          <p v-if="!staffReveal.email" class="reveal-notice">
+            No email on file for this account — add one on the create form to email credentials.
           </p>
+          <!-- Inline preview of the exact email the backend sends -->
+          <div v-if="showEmailPreview && emailPreview" data-testid="staff-email-preview" class="email-preview">
+            <div class="email-preview-head">
+              <span><strong>To:</strong> {{ emailPreview.to }}</span>
+              <span><strong>Subject:</strong> {{ emailPreview.subject }}</span>
+            </div>
+            <pre class="email-preview-body">{{ emailPreview.body }}</pre>
+          </div>
+          <p v-if="resendNotice" data-testid="staff-email-notice" class="reveal-notice">{{ resendNotice }}</p>
         </div>
       </div>
 
@@ -366,12 +416,16 @@ onMounted(fetchUsers)
 
         <div v-if="studentReveal" data-testid="student-password-reveal" class="reveal-panel">
           <p class="reveal-title">Login username: <strong>{{ studentReveal.username }}</strong></p>
-          <p class="reveal-title">Default password for <strong>{{ studentReveal.student_number }}</strong>:</p>
+          <p class="reveal-title">Generated password (shown once):</p>
           <code class="reveal-secret">{{ studentReveal.password }}</code>
           <div class="reveal-actions">
             <button type="button" class="btn btn-sm" @click="copyToClipboard(studentReveal.password)">Copy</button>
             <button type="button" class="btn btn-sm" @click="studentReveal = null">Dismiss</button>
           </div>
+          <p class="reveal-notice">
+            <template v-if="studentReveal.email">✉ Emailed to {{ studentReveal.email }}.</template>
+            <template v-else>No email on file — copy and hand this password to the student.</template>
+          </p>
         </div>
       </div>
 
@@ -442,6 +496,7 @@ onMounted(fetchUsers)
                 <th>Username</th>
                 <th>Role</th>
                 <th>Name</th>
+                <th>Email</th>
                 <th>Actions</th>
               </tr>
             </thead>
@@ -478,7 +533,10 @@ onMounted(fetchUsers)
                   </template>
                 </td>
                 <td>
-                  <div style="display: flex; gap: 8px;">
+                  <EmailReveal :value="user.email" />
+                </td>
+                <td>
+                  <div class="row-actions">
                     <template v-if="editingUser?.id === user.id">
                       <button class="btn btn-sm btn-primary" :disabled="saveUserLoading" @click="saveUser">Save</button>
                       <button class="btn btn-sm" @click="cancelEdit">Cancel</button>
@@ -586,6 +644,7 @@ h2 {
 }
 .reveal-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
   align-items: center;
   margin-top: var(--space-2);
@@ -594,5 +653,43 @@ h2 {
   margin: var(--space-2) 0 0 0;
   font-size: 0.85rem;
   color: var(--color-text-muted);
+}
+
+/* Per-row action buttons stack vertically so the User Management table stays
+   within its column instead of overflowing horizontally. */
+.row-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+}
+.row-actions .btn { width: 100%; white-space: nowrap; }
+
+/* Inline credential-email preview */
+.email-preview {
+  margin-top: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+.email-preview-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border-soft);
+  background: var(--color-surface-sunk);
+  font-size: 0.82rem;
+}
+.email-preview-body {
+  margin: 0;
+  padding: var(--space-3);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-text);
 }
 </style>

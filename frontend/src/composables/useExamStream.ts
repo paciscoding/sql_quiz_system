@@ -8,7 +8,8 @@ type EffectiveState = 'inactive' | 'scheduled' | 'active' | 'ended'
  * exposes the current effective_state of the exam.
  *
  * Authentication: EventSource cannot send Authorization headers, so the JWT
- * is passed as ?access_token= (mirrors the export-scores ?token= pattern).
+ * is passed as ?access_token= in the query string, and this endpoint's handler
+ * reads the token from there (unlike header-only routes).
  *
  * Also runs a 15-second fallback poll while in WAITING state (inactive/scheduled).
  * The first of SSE event or fallback poll to detect 'active' wins.

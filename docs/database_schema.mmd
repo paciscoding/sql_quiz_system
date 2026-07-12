@@ -5,6 +5,7 @@ erDiagram
     APP_SYSTEM_USERS ||--o{ APP_QUESTIONS                  : "authors"
     APP_SYSTEM_USERS ||--o{ APP_SUBMISSIONS                : "submits"
     APP_SYSTEM_USERS ||--o{ APP_SCHEMA_IMPORT_AUDIT        : "imports"
+    APP_SYSTEM_USERS ||--o{ APP_PASSWORD_EVENTS           : "password_history"
     APP_EXAMINATIONS ||--o{ APP_QUESTIONS                  : "contains"
     APP_EXAMINATIONS ||--o{ APP_EXAM_STUDENTS              : "has"
     APP_EXAMINATIONS ||--o{ APP_SUBMISSIONS                : "scopes"
@@ -31,6 +32,9 @@ erDiagram
         string sec_lab
         string first_name
         string last_name
+        string email
+        int token_version
+        timestamp last_forgot_reset_at
     }
 
     APP_EXAMINATIONS {
@@ -172,4 +176,15 @@ erDiagram
         bytea image_bytes
         timestamp created_at
         timestamp updated_at
+    }
+
+    APP_PASSWORD_EVENTS {
+        int id PK
+        int user_id FK
+        int changed_by FK
+        string source "create|self_change|admin_reset|forgot_reset"
+        bytea new_password_enc
+        bytea nonce
+        boolean notified_admin
+        timestamp created_at
     }

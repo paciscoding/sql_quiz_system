@@ -13,15 +13,37 @@ interface ImportError {
   message: string
 }
 
+interface CreatedAccount {
+  row: number
+  student_number: string
+  student_id_ext: string
+  email: string
+  password: string
+}
+
 interface ImportReport {
   total: number
   created: number
   updated: number
   skipped: number
   errors: ImportError[]
+  created_accounts: CreatedAccount[]
 }
 
 const { notify } = useNotifications()
+
+async function copyPassword(text: string) {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      notify('Password copied to clipboard.', 'success')
+    } else {
+      notify('Clipboard not available in this browser.', 'error')
+    }
+  } catch {
+    notify('Failed to copy password.', 'error')
+  }
+}
 
 const selectedFile = ref<File | null>(null)
 const topLevelError = ref('')
@@ -132,6 +154,33 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
         <div class="summary-cell">
           <div class="summary-value summary-skipped">{{ result.skipped }}</div>
           <div class="summary-label">Skipped</div>
+        </div>
+      </div>
+
+      <div v-if="result.created_accounts && result.created_accounts.length > 0" class="created-section">
+        <h3>Created Accounts ({{ result.created_accounts.length }})</h3>
+        <p class="desc">Passwords are shown once. Students with an email were sent theirs; copy and hand-deliver the rest.</p>
+        <div class="errors-table-wrap">
+          <table class="errors-table" data-testid="created-accounts-table">
+            <thead>
+              <tr>
+                <th>Login ID</th>
+                <th>Email</th>
+                <th>Password</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="a in result.created_accounts" :key="a.row">
+                <td>{{ a.student_id_ext }}</td>
+                <td>{{ a.email ? `✉ ${a.email}` : '—' }}</td>
+                <td><code class="pw-cell">{{ a.password }}</code></td>
+                <td>
+                  <button type="button" class="copy-btn" @click="copyPassword(a.password)">Copy</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -326,4 +375,25 @@ h3 {
   font-weight: 700;
   text-align: center;
 }
+
+.created-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.pw-cell {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  user-select: all;
+}
+.copy-btn {
+  padding: 2px 10px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.copy-btn:hover { background: var(--color-surface-muted); }
 </style>

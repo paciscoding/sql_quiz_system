@@ -48,7 +48,8 @@ export interface AddStudentRequest {
 export interface AddStudentResponse {
   id: number
   created: boolean
-  default_password: string
+  /** Server-generated password, present only when a new row was created. */
+  generated_password?: string
 }
 
 export interface ResetPasswordResponse {
@@ -157,6 +158,19 @@ export async function resetPassword(id: number): Promise<ResetPasswordResponse> 
     headers: authHeaders(),
   })
   return parseOrThrow<ResetPasswordResponse>(res, 'Failed to reset password')
+}
+
+export interface ResendCredentialResponse {
+  emailed_to: string
+}
+
+/** POST /api/v1/users/:id/resend-credential — re-email the user's current credential. */
+export async function resendCredential(id: number): Promise<ResendCredentialResponse> {
+  const res = await fetch(`/api/v1/users/${id}/resend-credential`, {
+    method: 'POST',
+    headers: authHeaders(),
+  })
+  return parseOrThrow<ResendCredentialResponse>(res, 'Failed to resend credential email')
 }
 
 /** GET /api/v1/users/:id/password-events — admin changelog for a user. */

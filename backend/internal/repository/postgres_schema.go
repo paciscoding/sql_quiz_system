@@ -3,7 +3,9 @@ package repository
 import (
 	"context"
 	"fmt"
+	"log"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -107,6 +109,64 @@ func (r *PostgresRepository) QueryStudentSQL(ctx context.Context, schema, sql st
 }
 
 // GrantSchemaPermissions gives the restricted user CRUD access to a schema
+// migrateUniqueEmailIndex enforces that no two accounts share an email address
+// via a PARTIAL unique index (NULL emails remain unconstrained, so the many
+// students without an address never collide). It is safe to run on a populated
+// database: it first scans for existing duplicate emails and, if any exist, logs
+// them and SKIPS creating the index so startup still succeeds. The operator
+// resolves the duplicates and the index is created on the next boot. Idempotent.
+func (r *PostgresRepository) migrateUniqueEmailIndex(ctx context.Context) error {
+	// Already enforced? Nothing to do.
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 'idx_system_users_email')`,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("email index existence check: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	// Dup-scan: use the SAME predicate as the index (email IS NOT NULL) so the
+	// scan can never miss a collision the index would hit.
+	rows, err := r.pool.Query(ctx,
+		`SELECT email, COUNT(*) AS n FROM app.system_users
+		 WHERE email IS NOT NULL
+		 GROUP BY email HAVING COUNT(*) > 1
+		 ORDER BY n DESC, email ASC`)
+	if err != nil {
+		return fmt.Errorf("email dup-scan: %w", err)
+	}
+	var dups []string
+	for rows.Next() {
+		var email string
+		var n int
+		if err := rows.Scan(&email, &n); err != nil {
+			rows.Close()
+			return err
+		}
+		dups = append(dups, fmt.Sprintf("%s (×%d)", email, n))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(dups) > 0 {
+		log.Printf("WARNING: email uniqueness NOT enforced — %d duplicate email(s) already exist; "+
+			"resolve them and restart to enable the constraint: %s", len(dups), strings.Join(dups, ", "))
+		return nil
+	}
+
+	if _, err := r.pool.Exec(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_system_users_email ON app.system_users(email) WHERE email IS NOT NULL`,
+	); err != nil {
+		return fmt.Errorf("create unique email index: %w", err)
+	}
+	log.Printf("email uniqueness enforced (idx_system_users_email)")
+	return nil
+}
+
 func (r *PostgresRepository) GrantSchemaPermissions(ctx context.Context, schema string) error {
 	safeSchema := pgx.Identifier{schema}.Sanitize()
 	queries := []string{
@@ -1010,6 +1070,12 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		if _, err := r.pool.Exec(ctx, q); err != nil {
 			return fmt.Errorf("migration failed: %w", err)
 		}
+	}
+
+	// Enforce unique account emails (partial: NULL emails stay unconstrained).
+	// Dup-scans first so pre-existing duplicates don't brick startup.
+	if err := r.migrateUniqueEmailIndex(ctx); err != nil {
+		return fmt.Errorf("email uniqueness migration failed: %w", err)
 	}
 
 	// Practice-categories migration: add practice_questions.category_id, backfill

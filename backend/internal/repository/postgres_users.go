@@ -6,8 +6,24 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
+
+// emailUniqueIndex is the name of the partial unique index on system_users.email
+// (see migrateUniqueEmailIndex). Used to recognize email-collision errors.
+const emailUniqueIndex = "idx_system_users_email"
+
+// IsEmailConflict reports whether err is a Postgres unique-violation raised by
+// the account-email uniqueness index, so callers can surface a clean "email
+// already in use" message instead of a raw driver error.
+func IsEmailConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505" && pgErr.ConstraintName == emailUniqueIndex
+	}
+	return false
+}
 
 func (r *PostgresRepository) CreateUser(ctx context.Context, u models.User) (int, error) {
 	query := `INSERT INTO app.system_users (username, password_hash, role, created_by, email) VALUES ($1, $2, $3, $4, $5) RETURNING id`

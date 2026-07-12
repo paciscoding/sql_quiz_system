@@ -27,6 +27,12 @@ type SubmissionQueue struct {
 	jobTimeout time.Duration
 	wg         sync.WaitGroup
 	once       sync.Once
+
+	// mu guards closed and serialises sends against the close in Shutdown.
+	// Run takes RLock (many concurrent senders are fine); Shutdown takes the
+	// exclusive Lock, so a send can never race the close of jobCh.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewSubmissionQueue creates a new SubmissionQueue and starts its worker goroutine.
@@ -53,23 +59,28 @@ func (q *SubmissionQueue) worker() {
 		default:
 		}
 
-		done := make(chan error, 1)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					done <- fmt.Errorf("submission queue: panic: %v", r)
-				}
-			}()
-			done <- j.fn()
-		}()
-
-		select {
-		case e := <-done:
-			j.replyCh <- e
-		case <-j.ctx.Done():
-			j.replyCh <- j.ctx.Err()
-		}
+		// Run inline. The worker's single WaitGroup registration (see
+		// NewSubmissionQueue) then genuinely covers in-flight execution, so
+		// Shutdown's wg.Wait blocks until fn returns. A detached goroutine here
+		// would let the worker abandon fn on ctx timeout and advance/exit while
+		// the real work kept running — leaking that goroutine and racing with
+		// Shutdown and the caller (the -race failure this replaced).
+		//
+		// Caller-side timeout responsiveness is unaffected: Run's own select on
+		// runCtx.Done() still returns to the caller without waiting for fn.
+		j.replyCh <- q.runJob(j)
 	}
+}
+
+// runJob executes j.fn, recovering any panic into an error so the single
+// worker goroutine survives a panicking job.
+func (q *SubmissionQueue) runJob(j job) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("submission queue: panic: %v", r)
+		}
+	}()
+	return j.fn()
 }
 
 // Run enqueues fn for serial execution by the single worker goroutine.
@@ -77,13 +88,6 @@ func (q *SubmissionQueue) worker() {
 // (whichever is shorter). Returns ErrQueueFull if the channel is at capacity,
 // ErrQueueShutdown if Shutdown was called.
 func (q *SubmissionQueue) Run(ctx context.Context, fn func() error) (err error) {
-	// Protect against send on closed channel after Shutdown.
-	defer func() {
-		if r := recover(); r != nil {
-			err = ErrQueueShutdown
-		}
-	}()
-
 	runCtx, cancel := context.WithTimeout(ctx, q.jobTimeout)
 	defer cancel()
 
@@ -93,24 +97,41 @@ func (q *SubmissionQueue) Run(ctx context.Context, fn func() error) (err error) 
 		ctx:     runCtx,
 	}
 
+	// Enqueue under RLock so the send cannot race Shutdown's close of jobCh.
+	// The non-blocking select keeps the critical section short.
+	q.mu.RLock()
+	if q.closed {
+		q.mu.RUnlock()
+		return ErrQueueShutdown
+	}
 	select {
 	case q.jobCh <- j:
-		// Job enqueued; wait for reply.
-		select {
-		case e := <-j.replyCh:
-			return e
-		case <-runCtx.Done():
-			return runCtx.Err()
-		}
+		q.mu.RUnlock()
 	default:
+		q.mu.RUnlock()
 		return ErrQueueFull
+	}
+
+	// Enqueued; wait for the worker's reply or a caller-side timeout. Returning
+	// on runCtx.Done() here (without waiting for fn) is what keeps Run responsive
+	// to the per-job timeout even though the worker runs fn inline.
+	select {
+	case e := <-j.replyCh:
+		return e
+	case <-runCtx.Done():
+		return runCtx.Err()
 	}
 }
 
 // Shutdown closes the job channel (draining in-flight jobs) and waits for the
 // worker goroutine to exit. ctx controls how long to wait.
 func (q *SubmissionQueue) Shutdown(ctx context.Context) error {
-	q.once.Do(func() { close(q.jobCh) })
+	q.once.Do(func() {
+		q.mu.Lock()
+		q.closed = true
+		close(q.jobCh)
+		q.mu.Unlock()
+	})
 	done := make(chan struct{})
 	go func() {
 		q.wg.Wait()

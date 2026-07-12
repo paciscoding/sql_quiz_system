@@ -4,7 +4,7 @@
  *
  * Covered:
  *  1. Create-staff form has NO password input and reveals generated_password on success.
- *  2. Add-student form posts the roster fields and reveals default_password.
+ *  2. Add-student form posts the roster fields and reveals the generated password.
  *  3. Per-user Reset action calls the endpoint and reveals the new generated_password.
  *  4. Password-history renders events, and shows the "key not configured" notice
  *     when key_configured=false.
@@ -98,7 +98,8 @@ describe('AdminView — create staff', () => {
     expect(reveal.exists()).toBe(true)
     expect(reveal.text()).toContain('GEN-STAFF-PW')
     expect(wrapper.find('[data-testid="staff-copy"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="staff-email"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="staff-email-preview-toggle"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="staff-email-resend"]').exists()).toBe(true)
   })
 
   it('includes the optional email in the create-staff payload when filled', async () => {
@@ -161,32 +162,48 @@ describe('AdminView — create staff', () => {
     expect(options).not.toContain('STUDENT')
   })
 
-  it('email button surfaces a "delivery pending" notice', async () => {
+  it('previews the credential email and re-sends it to the stored address', async () => {
+    let resendCalled = false
     installFetch((url, opts) => {
       if (url.includes('/api/v1/users/all')) return jsonResponse(USERS_FIXTURE)
       if (url.endsWith('/api/v1/users') && opts?.method === 'POST')
         return jsonResponse({ id: 5, generated_password: 'GEN-STAFF-PW' })
+      if (url.includes('/resend-credential') && opts?.method === 'POST') {
+        resendCalled = true
+        return jsonResponse({ emailed_to: 'lecturer@example.com' })
+      }
       return jsonResponse({})
     })
     const wrapper = await mountAdmin()
     await wrapper.find('[data-testid="staff-username"]').setValue('newlecturer')
+    await wrapper.find('[data-testid="staff-email-input"]').setValue('lecturer@example.com')
     await wrapper.find('[data-testid="create-staff-form"]').trigger('submit')
     await flushPromises()
 
-    await wrapper.find('[data-testid="staff-email"]').trigger('click')
+    // Toggle reveals the exact email (recipient + generated password).
+    await wrapper.find('[data-testid="staff-email-preview-toggle"]').trigger('click')
     await flushPromises()
-    expect(wrapper.text().toLowerCase()).toContain('email delivery pending')
+    const preview = wrapper.find('[data-testid="staff-email-preview"]')
+    expect(preview.exists()).toBe(true)
+    expect(preview.text()).toContain('lecturer@example.com')
+    expect(preview.text()).toContain('GEN-STAFF-PW')
+
+    // Re-send calls the backend and confirms the recipient.
+    await wrapper.find('[data-testid="staff-email-resend"]').trigger('click')
+    await flushPromises()
+    expect(resendCalled).toBe(true)
+    expect(wrapper.find('[data-testid="staff-email-notice"]').text()).toContain('lecturer@example.com')
   })
 })
 
 describe('AdminView — add student', () => {
-  it('posts the roster fields and reveals the default password', async () => {
+  it('posts the roster fields and reveals the generated password', async () => {
     let postBody: any = null
     installFetch((url, opts) => {
       if (url.includes('/api/v1/users/all')) return jsonResponse(USERS_FIXTURE)
       if (url.endsWith('/api/v1/students') && opts?.method === 'POST') {
         postBody = JSON.parse(String(opts.body))
-        return jsonResponse({ id: 9, created: true, default_password: '20231234' })
+        return jsonResponse({ id: 9, created: true, generated_password: 'GEN-STU-PW' })
       }
       return jsonResponse({})
     })
@@ -212,8 +229,10 @@ describe('AdminView — add student', () => {
 
     const reveal = wrapper.find('[data-testid="student-password-reveal"]')
     expect(reveal.exists()).toBe(true)
-    expect(reveal.text()).toContain('20231234')
-    // Reveal surfaces the login username = the Student ID (student_id_ext).
+    // Reveal surfaces the generated password (NOT the student number) ...
+    expect(reveal.text()).toContain('GEN-STU-PW')
+    expect(reveal.text()).not.toContain('20231234')
+    // ... and the login username = the Student ID (student_id_ext).
     expect(reveal.text()).toContain('EXT-1')
   })
 
@@ -223,7 +242,7 @@ describe('AdminView — add student', () => {
       if (url.includes('/api/v1/users/all')) return jsonResponse(USERS_FIXTURE)
       if (url.endsWith('/api/v1/students') && opts?.method === 'POST') {
         posted = true
-        return jsonResponse({ id: 9, created: true, default_password: '20231234' })
+        return jsonResponse({ id: 9, created: true, generated_password: 'GEN-STU-PW' })
       }
       return jsonResponse({})
     })

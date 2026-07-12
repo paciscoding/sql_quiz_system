@@ -206,7 +206,7 @@ The legacy `ResetTable(schema, target)` per-DML-table reset flow is **superseded
 - **Multi-select Enrollment:** Replace manual ID input with a reactive student selection list.
 - **Global Notifications:** Centralized toast alert system for user feedback.
 - **Submission Audit:** New `GET /api/v1/lecturer/exams/:id/submissions` endpoint for lecturers.
-- **Configurable Admin:** Environment variables `ADMIN_USER` and `ADMIN_PASS` for secure seeding.
+- **Configurable Admin:** Environment variables `ADMIN_USER` and `ADMIN_EMAIL` for secure seeding — the admin password is server-generated and emailed to `ADMIN_EMAIL` (printed to the log if unset), never set by hand.
 
 ### Changed
 - **Strict-Mode Refactor:** Simplified to `strict_ordering` and `strict_attributes`; removed `strict_record_order`.

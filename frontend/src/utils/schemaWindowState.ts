@@ -7,13 +7,21 @@ export interface WindowState {
   currentIndex: number
 }
 
-function storageKey(scope: 'category' | 'exam', id: number): string {
-  return `schema-window:${scope}:${id}`
+// `variant` distinguishes multiple windows that share the same scope+id — e.g.
+// the schema-diagram image window ('diagram') vs. the text introduction window
+// ('intro') for the same category. Defaults to 'diagram' so existing callers and
+// persisted keys are unchanged.
+export type WindowVariant = 'diagram' | 'intro'
+
+function storageKey(scope: 'category' | 'exam', id: number, variant: WindowVariant): string {
+  return variant === 'diagram'
+    ? `schema-window:${scope}:${id}`
+    : `schema-window:${variant}:${scope}:${id}`
 }
 
-export function loadState(scope: 'category' | 'exam', id: number): WindowState | null {
+export function loadState(scope: 'category' | 'exam', id: number, variant: WindowVariant = 'diagram'): WindowState | null {
   try {
-    const raw = localStorage.getItem(storageKey(scope, id))
+    const raw = localStorage.getItem(storageKey(scope, id, variant))
     if (!raw) return null
     return JSON.parse(raw) as WindowState
   } catch {
@@ -26,8 +34,8 @@ export function loadState(scope: 'category' | 'exam', id: number): WindowState |
 // but writes for distinct keys (e.g. two windows mounted at once) never drop each other.
 const _saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-export function saveState(scope: 'category' | 'exam', id: number, state: WindowState): void {
-  const key = storageKey(scope, id)
+export function saveState(scope: 'category' | 'exam', id: number, state: WindowState, variant: WindowVariant = 'diagram'): void {
+  const key = storageKey(scope, id, variant)
   const existing = _saveTimers.get(key)
   if (existing !== undefined) clearTimeout(existing)
   const t = setTimeout(() => {

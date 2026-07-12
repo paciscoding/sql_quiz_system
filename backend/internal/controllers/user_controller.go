@@ -132,6 +132,10 @@ func (ctrl *UserController) CreateAccount(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		if errors.Is(err, services.ErrEmailInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -141,8 +145,8 @@ func (ctrl *UserController) CreateAccount(c *gin.Context) {
 
 // CreateStudent handles POST /api/v1/students (Admin, Lecturer). It creates or
 // upserts a single student through the SAME shared path as the CSV importer, so
-// a manual add and a one-row import produce an identical row. The default
-// password is the student_number.
+// a manual add and a one-row import produce an identical row. New students get a
+// server-generated password, emailed when an address is present and shown once.
 func (ctrl *UserController) CreateStudent(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	creator := userVal.(models.User)
@@ -162,7 +166,7 @@ func (ctrl *UserController) CreateStudent(c *gin.Context) {
 		return
 	}
 
-	outcome, id, err := ctrl.studentService.CreateSingle(c.Request.Context(), creator.ID, services.StudentUpsertInput{
+	outcome, id, password, err := ctrl.studentService.CreateSingle(c.Request.Context(), creator.ID, services.StudentUpsertInput{
 		StudentNumber: req.StudentNumber,
 		StudentIDExt:  req.StudentIDExt,
 		SecLec:        req.SecLec,
@@ -172,20 +176,24 @@ func (ctrl *UserController) CreateStudent(c *gin.Context) {
 		Email:         req.Email,
 	})
 	if err != nil {
+		if errors.Is(err, services.ErrEmailInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Default password = student_number. Log a `create` event only for new rows.
+	resp := gin.H{"id": id, "created": outcome == "created"}
+	// Only a newly-inserted row has a fresh password (the upsert preserves an
+	// existing student's password on conflict). Log the event + email + reveal it
+	// only in that case.
 	if outcome == "created" {
-		ctrl.authService.LogStudentCreate(c.Request.Context(), creator, id, req.StudentNumber, req.StudentIDExt, req.Email)
+		ctrl.authService.LogStudentCreate(c.Request.Context(), creator, id, password, req.StudentIDExt, req.Email)
+		resp["generated_password"] = password
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
-		"id":               id,
-		"created":          outcome == "created",
-		"default_password": req.StudentNumber,
-	})
+	c.JSON(http.StatusCreated, resp)
 }
 
 // forgotPasswordMessage is the single, generic response for step 1 of the
@@ -252,6 +260,30 @@ func (ctrl *UserController) ResetPassword(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"generated_password": password})
+}
+
+// ResendCredential handles POST /api/v1/users/:id/resend-credential (Admin only).
+// Re-emails the user's current credential to their stored address.
+func (ctrl *UserController) ResendCredential(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	actor := userVal.(models.User)
+
+	idStr := c.Param("id")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	emailedTo, err := ctrl.authService.ResendCredential(c.Request.Context(), actor, id)
+	if err != nil {
+		// These are operator-facing preconditions (no email / no key / nothing to
+		// send), not server faults — report them as 400.
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"emailed_to": emailedTo})
 }
 
 // GetPasswordEvents handles GET /api/v1/users/:id/password-events (Admin only).

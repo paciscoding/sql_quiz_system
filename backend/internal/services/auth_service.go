@@ -119,6 +119,11 @@ func (s *AuthService) DeleteUser(ctx context.Context, id int) error {
 // dedicated /students endpoint (which drives the single-student parity path).
 var ErrStudentRoleNotAllowed = errors.New("STUDENT accounts must be created via /api/v1/students")
 
+// ErrEmailInUse is returned when a create/import would assign an email address
+// that another account already holds (enforced by a unique index). Controllers
+// map this to 409 Conflict.
+var ErrEmailInUse = errors.New("email already in use")
+
 // CreateStaff creates a LECTURER or ADMIN account with a SERVER-GENERATED
 // password (the caller may not supply one). It records a `create` password
 // event and emails the credential. The returned password is shown to the admin
@@ -160,6 +165,9 @@ func (s *AuthService) CreateStaff(ctx context.Context, creator models.User, req 
 	}
 	id, err := s.repo.CreateUser(ctx, user)
 	if err != nil {
+		if repository.IsEmailConflict(err) {
+			return 0, "", ErrEmailInUse
+		}
 		return 0, "", err
 	}
 
@@ -172,14 +180,15 @@ func (s *AuthService) CreateStaff(ctx context.Context, creator models.User, req 
 	return id, password, nil
 }
 
-// LogStudentCreate records the `create` password event for a student created
-// through the shared single-student path. The default password is the
-// student_number. Best-effort: never fails the create.
-func (s *AuthService) LogStudentCreate(ctx context.Context, creator models.User, studentID int, defaultPassword, username, email string) {
+// LogStudentCreate records the `create` password event for a newly-created
+// student and emails the server-generated credential when an address is on file.
+// Used by both the single-student endpoint and the bulk importer (once per newly
+// inserted row). Best-effort: never fails the create.
+func (s *AuthService) LogStudentCreate(ctx context.Context, creator models.User, studentID int, password, username, email string) {
 	creatorID := creator.ID
-	s.logPasswordEvent(ctx, studentID, &creatorID, models.PasswordEventCreate, defaultPassword)
-	// SendCredential skips silently when email is empty (most students have none).
-	if err := s.email.SendCredential(email, username, defaultPassword); err != nil {
+	s.logPasswordEvent(ctx, studentID, &creatorID, models.PasswordEventCreate, password)
+	// SendCredential skips silently when email is empty (some students have none).
+	if err := s.email.SendCredential(email, username, password); err != nil {
 		log.Printf("auth: SendCredential failed for new student %q: %v", username, err)
 	}
 }
@@ -427,6 +436,42 @@ func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targ
 	return password, nil
 }
 
+// ResendCredential re-emails a user's current credential to their stored email
+// address (admin-only). The password is recovered from the most recent
+// changelog entry (newest first) rather than being re-generated, so the account
+// keeps working and existing sessions are not evicted. Requires an email on file
+// and a configured encryption key (to recover the plaintext). Returns the
+// address the mail was sent to.
+func (s *AuthService) ResendCredential(ctx context.Context, actor models.User, targetID int) (string, error) {
+	target, err := s.repo.GetUserByID(ctx, targetID)
+	if err != nil {
+		return "", err
+	}
+	if target.Email == nil || *target.Email == "" {
+		return "", errors.New("user has no email address on file")
+	}
+	if s.cipher == nil {
+		return "", errors.New("password encryption key not configured; cannot recover the password to resend")
+	}
+	rows, err := s.repo.GetPasswordEvents(ctx, targetID)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", errors.New("no password on record to resend")
+	}
+	latest := rows[0] // GetPasswordEvents returns newest first.
+	password, derr := s.cipher.Decrypt(latest.NewPasswordEnc, latest.Nonce)
+	if derr != nil {
+		return "", errors.New("failed to recover the stored password")
+	}
+	log.Printf("auth: admin %q (id=%d) resent credential email for user_id=%d", actor.Username, actor.ID, targetID)
+	if err := s.email.SendCredential(*target.Email, target.Username, password); err != nil {
+		return "", err
+	}
+	return *target.Email, nil
+}
+
 // GetPasswordEventsView returns the decrypted changelog for a user (admin-only).
 // The access itself is logged (metadata only). When the encryption key is not
 // configured, keyConfigured is false and NewPassword is omitted from each entry.
@@ -488,25 +533,49 @@ func (s *AuthService) logPasswordEvent(ctx context.Context, userID int, changedB
 	}
 }
 
-func (s *AuthService) SeedAdminAccount(ctx context.Context, username, password string) error {
+// SeedAdminAccount creates the initial admin on first startup. The password is
+// server-generated (never supplied by hand) and returned so the caller can log
+// it once as a bootstrap fallback; when email is set it is also emailed to that
+// address (the account owner / author), which is stored on the account so the
+// admin can use the forgot-password flow. Idempotent: if the admin already
+// exists it returns "" and does nothing (no re-generate, no re-email).
+func (s *AuthService) SeedAdminAccount(ctx context.Context, username, email string) (string, error) {
 	_, err := s.repo.GetUserByUsername(ctx, username)
 	if err == nil {
-		return nil // Admin exists
+		return "", nil // Admin exists
 	}
 
+	password := GeneratePassword()
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return err
+		return "", err
 	}
 
+	// Store the email so the seed admin can receive credentials and reset codes;
+	// keep the column NULL when no address is configured.
+	var emailPtr *string
+	if email != "" {
+		emailPtr = &email
+	}
 	user := models.User{
 		Username: username,
 		Password: string(hash),
 		Role:     models.RoleAdmin,
+		Email:    emailPtr,
 	}
 
-	_, err = s.repo.CreateUser(ctx, user)
-	return err
+	id, err := s.repo.CreateUser(ctx, user)
+	if err != nil {
+		return "", err
+	}
+
+	// System-seeded: no human actor, so changedBy is nil.
+	s.logPasswordEvent(ctx, id, nil, models.PasswordEventCreate, password)
+	// SendCredential skips silently when the address is empty.
+	if err := s.email.SendCredential(email, username, password); err != nil {
+		log.Printf("auth: SendCredential failed for seed admin %q: %v", username, err)
+	}
+	return password, nil
 }
 
 // ChangeOwnPassword verifies the old password, sets the new one, records a

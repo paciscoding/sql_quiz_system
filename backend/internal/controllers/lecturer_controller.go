@@ -1,13 +1,10 @@
 package controllers
 
 import (
-	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +55,7 @@ type LecturerExaminationResponse struct {
 type LecturerController struct {
 	repo          *repository.PostgresRepository
 	importService *services.StudentImportService
+	authService   *services.AuthService
 	hub           *services.Hub
 }
 
@@ -73,6 +71,12 @@ func buildExamStatusEvent(examID int, phase string) string {
 
 func (ctrl *LecturerController) SetStudentImportService(importService *services.StudentImportService) {
 	ctrl.importService = importService
+}
+
+// SetAuthService wires the auth service so the bulk importer can log a `create`
+// password event and email the generated credential for each new student.
+func (ctrl *LecturerController) SetAuthService(authService *services.AuthService) {
+	ctrl.authService = authService
 }
 
 func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
@@ -600,6 +604,16 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 		return
 	}
 
+	// Post-commit: log a `create` event and email the generated credential for
+	// each newly inserted student. Best-effort — LogStudentCreate never fails the
+	// import, and SendCredential is a no-op when the student has no email. Large
+	// rosters send many emails synchronously; Gmail daily limits may throttle.
+	if ctrl.authService != nil {
+		for _, cs := range report.CreatedAccounts {
+			ctrl.authService.LogStudentCreate(c.Request.Context(), lecturer, cs.UserID, cs.Password, cs.StudentIDExt, cs.Email)
+		}
+	}
+
 	c.JSON(http.StatusOK, report)
 }
 
@@ -651,67 +665,6 @@ func (ctrl *LecturerController) GetConsolidatedScores(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, scores)
-}
-
-func (ctrl *LecturerController) ExportScoresCSV(c *gin.Context) {
-	scores, err := ctrl.repo.GetConsolidatedScores(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Identify all unique exam titles for dynamic columns
-	examTitlesMap := make(map[string]bool)
-	for _, s := range scores {
-		for title := range s.ExamScores {
-			examTitlesMap[title] = true
-		}
-	}
-	var examTitles []string
-	for title := range examTitlesMap {
-		examTitles = append(examTitles, title)
-	}
-	sort.Strings(examTitles)
-
-	c.Header("Content-Description", "File Transfer")
-	c.Header("Content-Disposition", "attachment; filename=consolidated_scores.csv")
-	c.Header("Content-Type", "text/csv")
-
-	writer := csv.NewWriter(c.Writer)
-	defer writer.Flush()
-
-	// Header
-	header := []string{"StudentNumber", "Username", "FirstName", "LastName", "SecLec", "SecLab"}
-	header = append(header, examTitles...)
-	header = append(header, "PracticeTotal", "GrandTotal")
-	if err := writer.Write(header); err != nil {
-		// Streaming has begun; cannot switch to an HTTP error. Record server-side.
-		log.Printf("consolidated CSV export: failed writing header row: %v", err)
-		return
-	}
-
-	// Data
-	for _, s := range scores {
-		row := []string{
-			s.StudentNumber, s.Username, s.FirstName, s.LastName, s.SecLec, s.SecLab,
-		}
-		for _, title := range examTitles {
-			score := s.ExamScores[title]
-			row = append(row, fmt.Sprintf("%.2f", score))
-		}
-		row = append(row, fmt.Sprintf("%.2f", s.PracticeTotal))
-		row = append(row, fmt.Sprintf("%.2f", s.GrandTotal))
-		if err := writer.Write(row); err != nil {
-			// Response is mid-stream; record the corruption and stop writing.
-			log.Printf("consolidated CSV export: failed writing row for student %q: %v", s.StudentNumber, err)
-			break
-		}
-	}
-
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		log.Printf("consolidated CSV export: writer flush error: %v", err)
-	}
 }
 
 // ─── Exam Intro Images (staff mutations) ─────────────────────────────────────

@@ -29,19 +29,42 @@ System tables in `app`:
 
 | Table                     | Purpose                                                                                                                |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `app.system_users`        | Identity table for admins, lecturers, students. Single table with a `role` discriminator.                              |
-| `app.examinations`        | Examination definitions. Lifecycle flags: `is_active`, `activated_at`, `archived_at`.                                  |
+| `app.system_users`        | Identity table for admins, lecturers, students. Single table with a `role` discriminator. Carries optional `email` and a `token_version` counter bumped on every password change to evict stale JWTs. |
+| `app.examinations`        | Examination definitions. Lifecycle flags: `is_active`, `activated_at`, `archived_at`; scheduling window `scheduled_start_at` / `scheduled_end_at`; `curriculum_schema`, `introduction`, `block_practice_during_exam`. |
 | `app.questions`           | Question definitions **plus the cached Correct Result** (`expected_result`, `expected_columns`, capture status).        |
 | `app.exam_students`       | Junction table for student enrollment (records `assigned_by`, `assigned_at`).                                          |
 | `app.submissions`         | Per-attempt durable record of every student submission and its score.                                                  |
 | `app.exam_sandboxes`      | Tracks which `sandbox_exam_{examID}` schemas exist (one row per exam), with `created_at` / `dropped_at` for cleanup bookkeeping. |
+| `app.examination_intro_images` | PNG/JPEG intro images attached to an exam's introduction (bytes + `mime_type`, `sort_order`, `byte_size`).         |
+| `app.password_events`     | Audit trail of password mutations (`self_change`, `create`, `admin_reset`, `forgot_reset`), optionally storing the encrypted password when `PASSWORD_LOG_KEY` is set. |
+| `app.schema_import_audit` | One row per schema/curriculum import (global, per-exam, or per-category) recording the importing lecturer.              |
+| `app.practice_questions`  | Practice question bank (separate from `app.questions`), each with a NOT-NULL `category_id` FK and its own cached Correct Result. |
+| `app.practice_categories` | Practice categories; each owns a `practice_cat_{id}` schema. Includes a protected `Uncategorized` fallback.            |
+| `app.practice_attempts`   | Per-attempt history for practice submissions (practice questions allow unlimited retries).                             |
+| `app.practice_category_intro_images` | Intro images for a practice category (same shape as the exam variant).                                       |
+| `app.practice_sandbox_state` | Bookkeeping for practice schema rebuilds (`reset_at`).                                                              |
 
 The full ER definition lives in `docs/database_schema.mmd`. Render with `mmdc -i database_schema.mmd -o database_schema.png`.
 
 ![Database Schema](docs/database_schema.png)
 
 ## Phase Lifecycle
-Examination evaluation is split into four phases, gated on `app.examinations.is_active`. The optimizations (cached Correct Result, lazy sandbox, no per-submission teacher SQL) all rely on these phase boundaries holding.
+Examination evaluation is split into four phases. The optimizations (cached Correct Result, lazy sandbox, no per-submission teacher SQL) all rely on these phase boundaries holding.
+
+### Effective state & scheduling (no background scheduler)
+Gating keys off a computed **effective state**, not the raw `is_active` boolean. An exam carries optional `scheduled_start_at` / `scheduled_end_at` (RFC3339 UTC), and the single helper `ExaminationEffectiveState(exam)` derives one of four phases over the half-open window `[start, end)`:
+
+| `effective_state` | Meaning |
+| ----------------- | ------- |
+| `inactive` | Never activated (`is_active = false`, no window). |
+| `scheduled` | Activated, but `now < scheduled_start_at`. Students see a **waiting page**. |
+| `active` | Within `[start, end)` — or an instant activation with no `start`. Submissions accepted. |
+| `ended` | `now >= scheduled_end_at`. Submissions rejected; results still readable. |
+
+There is **no cron/background scheduler**: the state is computed on read, and the DML sandbox is prepared **lazily** the first time an enrolled student pulls the questions of an exam that has become effectively `active` (`GetExamQuestions` → `EnsureExamSandboxReady`). `ActivateExamination` accepts `mode: "instant"` (start = `now()`) or `mode: "scheduled"` (explicit `scheduled_start_at`, optional end); `DeactivateExamination` can likewise set a future `scheduled_end_at` (keeping the sandbox) or archive immediately.
+
+### Live exam-start (SSE)
+`GET /api/v1/quiz/exams/:id/stream` is a Server-Sent Events endpoint (JWT via `?access_token=` since `EventSource` can't set headers). An in-process `Hub` (`sse_hub.go`) pushes `exam-status` frames — `{exam_id, effective_state, server_time}` — on connect and whenever an exam's state is broadcast (activation, or the lazy `active` transition in `GetExamQuestions`). A `: ping` keep-alive is emitted every 20 s; Hub sends are non-blocking (a full 4-slot per-subscriber buffer drops that frame). The frontend `useExamStream.ts` composable consumes it and moves a student from the waiting page to the live exam the instant it flips, with a ~15 s poll of `GET /quiz/exams` as fallback if the stream drops. WebSocket and an Nginx-LB approach were both rejected in favour of this single-process Hub.
 
 ### Phase 0 — Lecturer Prep (`is_active = false`, submissions rejected)
 1. **Curriculum Import** — `ImportSchema` populates `public.*`. Allowed only when no examination is currently active (otherwise 409).
@@ -64,7 +87,7 @@ Examination evaluation is split into four phases, gated on `app.examinations.is_
    - `AssignStudents` for this exam → 409.
    - Only `DeactivateExamination` is permitted on the exam itself.
 
-### Phase 2 — Active Exam (submission event loop, `is_active = true`)
+### Phase 2 — Active Exam (submission event loop, effective state `active`)
 Phase 2 has two paths, chosen by `question.question_type`. Both share `app.questions.expected_result` as the only source of truth — neither re-executes teacher SQL.
 
 #### SELECT (Query) path — lock-free, no clone
@@ -126,6 +149,14 @@ Phase 2 evaluates DML inside the shared per-exam sandbox, serialised by the glob
 The legacy "Backup → Teacher → Diff → Restore" loop and the `ResetTable(schema, target)` workaround are **removed**: the savepoint+rollback inside the global FIFO queue is the only mechanism that resets state between submissions.
 
 ---
+
+## Identity, Auth & Password Management
+- **JWT with token versioning.** Login returns a 24 h JWT carrying `user_id, username, role, token_version`. `AuthMiddleware` rejects any token whose `token_version` is behind the user's current counter, so a password change/reset **evicts every previously-issued session**. Login is rate-limited in-memory (5 attempts / 10 min per username, cleared on success).
+- **Account creation.** Staff accounts (`POST /users`, LECTURER/ADMIN) get a **server-generated** password shown once; STUDENT accounts are created via `POST /students` or the roster import (`username`/initial `password` = student number). Role hierarchy is enforced (lecturers can't mint admins).
+- **Self-service change** (`POST /user/password`) returns a fresh JWT so the current device stays logged in while others are evicted.
+- **Forgot-password (two-step, enumeration-safe).** `POST /forgot-password` always returns the same generic 200 (uniform timing; SMTP send deferred to a goroutine) and emails a 6-digit OTP (10-min TTL, hashed at rest, ≤5 verify attempts, one honoured request / 5 min). `POST /forgot-password/verify` issues a new password on success and bumps `token_version`.
+- **Admin actions.** `reset-password` (regenerate + evict sessions), `resend-credential` (re-email the current password, recovered from `app.password_events` — requires `PASSWORD_LOG_KEY`, no regenerate/evict), and `password-events` (audit view; the view itself is logged).
+- **Email delivery.** Gmail SMTP over STARTTLS (port 587); header values are CR/LF-sanitised against injection. All sends are best-effort and are **skipped silently when no address is on file** (only `resend-credential` surfaces a send failure, as 400).
 
 ## Architecture Q&A (Design Decisions)
 
@@ -216,13 +247,11 @@ Upon submitting the final question of an active examination, the student is pres
 - **Max Score**: sum of `points` for all questions in the exam.
 
 ### Lecturer Score Export
-Lecturers can download a comprehensive CSV report (`GET /api/v1/lecturer/export-scores`) containing the performance of all students across all assessments.
-- **Dynamic Columns**: The CSV header is generated dynamically based on the set of all examinations created.
-- **Columns**: `StudentNumber`, `FirstName`, `LastName`, `SecLec`, `SecLab`, `[Exam 1 Title]`, `[Exam 2 Title]`, ..., `PracticeTotal`, `GrandTotal`.
+The backend exposes `GET /api/v1/lecturer/scores` (`GetConsolidatedScores`), returning per-student rows with `exam_scores` keyed by exam title plus a practice total; `GET /api/v1/lecturer/exams/max-scores` supplies the denominators. **CSV generation is client-side** — `LecturerResults.vue` builds two separate downloads (`exam_scores.csv` and `practice_scores.csv`) from that JSON. There is **no** server-side `export-scores` endpoint.
+- **Dynamic Columns**: The exam CSV header is generated from the set of exam titles present in the consolidated payload.
 - **Aggregates**:
   - **Exam Column**: Sum of `score` for the student's latest submissions in that exam.
   - **PracticeTotal**: Sum of `points` for all practice questions solved by the student.
-  - **GrandTotal**: Sum of all exam scores and the practice total.
 
 ---
 

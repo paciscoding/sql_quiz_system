@@ -129,6 +129,7 @@ func buildMessage(from, to, subject, body string, date time.Time) []byte {
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	b.WriteString("\r\n")
+
 	// Normalise body line endings to CRLF for RFC-5322 compliance.
 	for i, line := range splitLines(body) {
 		if i > 0 {

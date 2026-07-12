@@ -3,7 +3,7 @@ import { ref, onMounted, watch, computed } from 'vue'
 import SqlEditor from './SqlEditor.vue'
 import BackLink from './BackLink.vue'
 import ResultTable from './ResultTable.vue'
-import SchemaIntroduction from './SchemaIntroduction.vue'
+import SchemaIntroWindow from './SchemaIntroWindow.vue'
 import SchemaImageWindow from './SchemaImageWindow.vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
 import { useNotifications } from '../services/notification_service'
@@ -256,31 +256,27 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
         </div>
       </div>
 
-      <!-- Category Introduction Panel (shown when a category Schema button is clicked) -->
-      <div v-if="activeCategoryIntroId !== null" class="card intro-panel" style="grid-column: 1 / -1;">
-        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4);">
-          <h3 style="margin: 0;">
-            Category Introduction
-            <span v-if="activeIntro" class="muted" style="font-size: 0.85rem; font-weight: 500;"> — {{ activeIntro.category_name }}</span>
-          </h3>
-          <button class="btn btn-secondary" style="font-size: 0.8rem; padding: var(--space-1) var(--space-3);" @click="closeCategoryIntro">Dismiss</button>
-        </div>
-        <div v-if="introLoading" class="muted" style="text-align: center; padding: var(--space-6);">Loading schema...</div>
-        <template v-else-if="activeIntro">
-          <SchemaImageWindow
-            v-if="catIntroImages.length > 0"
-            scope="category"
-            :owner-id="activeCategoryIntroId!"
-            :images="catIntroImages"
-          />
-          <SchemaIntroduction
-            :introduction="activeIntro.introduction"
-            :tables="activeIntro.tables"
-            :imported="activeIntro.imported"
-            mode="student"
-          />
-        </template>
-      </div>
+      <!-- Category schema + introduction — floating windows (position:fixed), not
+           inline layout, so they no longer force a full-width grid row. Opened by
+           the per-category Schema button; each is independently draggable. -->
+      <template v-if="activeCategoryIntroId !== null && activeIntro">
+        <SchemaImageWindow
+          v-if="catIntroImages.length > 0"
+          scope="category"
+          :owner-id="activeCategoryIntroId!"
+          :images="catIntroImages"
+        />
+        <SchemaIntroWindow
+          scope="category"
+          :owner-id="activeCategoryIntroId!"
+          :introduction="activeIntro.introduction"
+          :tables="activeIntro.tables"
+          :imported="activeIntro.imported"
+          :category-name="activeIntro.category_name"
+          mode="student"
+          @close="closeCategoryIntro"
+        />
+      </template>
 
       <!-- Editor Section -->
       <div class="card editor-card" ref="editorWrapRef">

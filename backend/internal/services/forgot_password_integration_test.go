@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -78,13 +79,21 @@ func mkUserWithEmail(t *testing.T, repo *repository.PostgresRepository, role mod
 	username := fmt.Sprintf("fp_%s_%d", role, time.Now().UnixNano())
 	var emailPtr *string
 	if email != "" {
+		// Uniquify the address so the account-email unique index does not collide
+		// across the many tests that pass the same literal on the shared DB. The
+		// returned user carries the actual address; assert against *user.Email.
+		if at := strings.IndexByte(email, '@'); at >= 0 {
+			email = fmt.Sprintf("%s+%d%s", email[:at], time.Now().UnixNano(), email[at:])
+		} else {
+			email = fmt.Sprintf("%s+%d", email, time.Now().UnixNano())
+		}
 		emailPtr = &email
 	}
 	id, err := repo.CreateUser(ctx, models.User{Username: username, Password: string(hash), Role: role, Email: emailPtr})
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	return models.User{ID: id, Username: username, Role: role}
+	return models.User{ID: id, Username: username, Role: role, Email: emailPtr}
 }
 
 // TestPerformForgotReset_HappyPath proves the ASYNC worker (invoked directly, so
@@ -110,7 +119,7 @@ func TestPerformForgotReset_HappyPath(t *testing.T) {
 		t.Fatalf("expected exactly one credential email, got %d", sender.count())
 	}
 	sent := sender.calls[0]
-	if sent.to != "student@example.com" {
+	if sent.to != *user.Email {
 		t.Fatalf("expected email to the user's address, got %q", sent.to)
 	}
 	// New password must actually be the one emailed and must log in.
@@ -218,7 +227,7 @@ func TestForgotPassword_EmailsCodeNotPassword(t *testing.T) {
 		t.Fatalf("ForgotPassword: %v", err)
 	}
 	sent := sender.waitForCode(t)
-	if sent.to != "student@example.com" {
+	if sent.to != *user.Email {
 		t.Fatalf("expected the code emailed to the user's address, got %q", sent.to)
 	}
 	// The emailed code matches the stored hash.

@@ -5,6 +5,7 @@ import { handleApiError, toApiError } from '../../services/error_handler'
 import Skeleton from '../Skeleton.vue'
 import EmptyState from '../EmptyState.vue'
 import Spinner from '../Spinner.vue'
+import { toCsv, downloadCsv } from '../../utils/csv'
 
 interface ConsolidatedScore {
   student_id: number
@@ -86,9 +87,32 @@ const fetchExamMaxScores = async () => {
   }
 }
 
-const exportCSV = () => {
-  const token = localStorage.getItem('sql_quiz_token')
-  window.open(`/api/v1/lecturer/export-scores?token=${token}`, '_blank')
+// Exam and practice scores are exported as two SEPARATE CSVs, built client-side
+// from consolidatedScores (already fetched over an authenticated fetch). This
+// avoids the previous window.open('?token=') download, which could not send the
+// Authorization header and 401'd ("Authorization header required").
+const IDENTITY_HEADER = ['StudentNumber', 'Username', 'FirstName', 'LastName', 'SecLec', 'SecLab']
+
+const identityCells = (s: ConsolidatedScore) =>
+  [s.student_number, s.username, s.first_name, s.last_name, s.sec_lec, s.sec_lab]
+
+const exportExamCSV = () => {
+  const titles = allExamTitles.value
+  const header = [...IDENTITY_HEADER, ...titles, 'ExamTotal']
+  const rows = consolidatedScores.value.map(s => {
+    const examCells = titles.map(t => (s.exam_scores[t] ?? 0).toFixed(2))
+    const examTotal = titles.reduce((acc, t) => acc + (s.exam_scores[t] ?? 0), 0)
+    return [...identityCells(s), ...examCells, examTotal.toFixed(2)]
+  })
+  downloadCsv('exam_scores.csv', toCsv(header, rows))
+}
+
+const exportPracticeCSV = () => {
+  const header = [...IDENTITY_HEADER, 'PracticeTotal']
+  const rows = consolidatedScores.value.map(s =>
+    [...identityCells(s), s.practice_total.toFixed(2)]
+  )
+  downloadCsv('practice_scores.csv', toCsv(header, rows))
 }
 
 const allExamTitles = computed(() => {
@@ -179,7 +203,10 @@ onMounted(() => {
   <div class="lecturer-form card">
     <div class="results-header">
       <h2>Consolidated Student Performance</h2>
-      <button @click="exportCSV" class="secondary-btn" style="margin: 0;">Export Scores (CSV)</button>
+      <div class="export-actions">
+        <button @click="exportExamCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Exam Scores (CSV)</button>
+        <button @click="exportPracticeCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Practice Scores (CSV)</button>
+      </div>
     </div>
 
     <!-- Exam filter for drill-down -->
@@ -315,6 +342,12 @@ onMounted(() => {
   justify-content: space-between;
   align-items: center;
   margin-bottom: var(--space-4);
+}
+
+.export-actions {
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
 }
 
 .secondary-btn {
