@@ -171,6 +171,9 @@ func (s *SubmissionExportService) ExportNow(ctx context.Context) (ExportResult, 
 	}
 
 	start := st.LastExportAt
+	// windowEnd is app wall-clock; the delta assumes submission INSERTs are short
+	// single-statement commits, so a row with submitted_at <= windowEnd committing
+	// after this cycle's SELECT snapshot is not expected in practice.
 	end := s.now()
 	res := ExportResult{Enabled: true, WindowStart: start, WindowEnd: end}
 
@@ -190,6 +193,10 @@ func (s *SubmissionExportService) ExportNow(ctx context.Context) (ExportResult, 
 			return res, err
 		}
 		return res, nil
+	}
+
+	if s.cfg.Recipient == "" {
+		return res, fmt.Errorf("submission-export: recipient not configured (set EXPORT_ADMIN_EMAIL or ADMIN_EMAIL); holding watermark")
 	}
 
 	stamp := end.UTC().Format("20060102")

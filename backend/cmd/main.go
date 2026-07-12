@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,7 +86,12 @@ func main() {
 		if exportRecipient == "" {
 			exportRecipient = os.Getenv("ADMIN_EMAIL")
 		}
-		exportEnabledDefault := os.Getenv(services.ExportEnabledEnv) != "false" // default true
+		exportEnabledDefault := true
+		if v := os.Getenv(services.ExportEnabledEnv); v != "" {
+			if parsed, perr := strconv.ParseBool(v); perr == nil {
+				exportEnabledDefault = parsed
+			}
+		}
 		if err := repo.EnsureExportState(ctx, exportEnabledDefault); err != nil {
 			log.Printf("submission-export: seed state failed: %v", err)
 		}
@@ -94,7 +100,11 @@ func main() {
 			Recipient: exportRecipient,
 		}
 		exportSvc := services.NewSubmissionExportService(repo, smtpSender, exportCfg)
-		go exportSvc.Run(ctx)
+		if exportRecipient == "" {
+			log.Printf("submission-export: EXPORT_ADMIN_EMAIL/ADMIN_EMAIL unset; exporter loop not started (configure a recipient to enable)")
+		} else {
+			go exportSvc.Run(ctx)
+		}
 		exportCtrl = controllers.NewExportController(repo, exportSvc)
 	} else {
 		log.Printf("email: NoopEmailSender active (%s unset; emails are logged, not sent)", services.EmailSenderAddressEnv)

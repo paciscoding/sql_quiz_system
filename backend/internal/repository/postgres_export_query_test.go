@@ -56,3 +56,52 @@ func TestExportSubmissions_WindowFilter(t *testing.T) {
 		t.Fatalf("in-window rows for user = %d, want 1", count)
 	}
 }
+
+func TestExportSubmissions_BoundaryInclusiveExclusive(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	uid, err := repo.CreateUser(ctx, models.User{
+		Username: uniqueUsername("exp_sub_stu"),
+		Password: "hash",
+		Role:     models.RoleStudent,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	from := time.Now().UTC().Truncate(time.Second)
+	to := from.Add(1 * time.Hour)
+
+	// One row exactly on the "from" boundary (must be excluded, predicate is
+	// exclusive-from), one row exactly on the "to" boundary (must be included,
+	// predicate is inclusive-to).
+	for _, at := range []time.Time{from, to} {
+		if _, err := repo.pool.Exec(ctx,
+			`INSERT INTO app.submissions (student_id, sql_text, is_correct, score, submitted_at)
+			 VALUES ($1, $2, true, 1.0, $3)`,
+			uid, "SELECT 1", at); err != nil {
+			t.Fatalf("insert submission: %v", err)
+		}
+	}
+
+	rows, err := repo.ExportSubmissions(ctx, from, to)
+	if err != nil {
+		t.Fatalf("ExportSubmissions: %v", err)
+	}
+
+	// Filter to our user so a shared test DB with other rows stays deterministic.
+	var matched []models.SubmissionExportRow
+	for _, r := range rows {
+		if r.StudentID != nil && *r.StudentID == uid {
+			matched = append(matched, r)
+		}
+	}
+
+	if len(matched) != 1 {
+		t.Fatalf("boundary rows for user = %d, want 1", len(matched))
+	}
+	if !matched[0].SubmittedAt.Equal(to) {
+		t.Fatalf("SubmittedAt = %v, want %v (to-boundary row, from-boundary row must be excluded)", matched[0].SubmittedAt, to)
+	}
+}

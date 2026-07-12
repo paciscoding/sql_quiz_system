@@ -209,7 +209,7 @@ Controls for the background exporter that emails an admin a delta gzip-CSV of ex
 - `POST /export/run-now`
 - **Behaviour:** triggers an immediate export cycle synchronously on the request context (verification aid; the scheduled path runs on the long-lived server context).
 - **200:** `{"enabled": bool, "window_start", "window_end", "submission_count": int, "practice_count": int, "sent": bool}`.
-- **500:** same body shape plus `"error"` on failure (e.g. send failure); the watermark only advances on `sent: true`.
+- **500:** `{"error": string, "result": {ExportResult}}` — `result` nests the same object shape as the 200 body (fields may be partially populated depending on where in the cycle the failure occurred, e.g. `sent` will be `false`); the watermark only advances on `sent: true`.
 
 ---
 

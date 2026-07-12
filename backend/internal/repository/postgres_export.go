@@ -65,12 +65,12 @@ func (r *PostgresRepository) ExportSubmissions(ctx context.Context, from, to tim
 
 	var out []models.SubmissionExportRow
 	for rows.Next() {
-		var r models.SubmissionExportRow
-		if err := rows.Scan(&r.ID, &r.ExamID, &r.StudentID, &r.Username, &r.QuestionID,
-			&r.IsCorrect, &r.Score, &r.SubmittedAt, &r.SQLText, &r.ValidationDetails); err != nil {
+		var row models.SubmissionExportRow
+		if err := rows.Scan(&row.ID, &row.ExamID, &row.StudentID, &row.Username, &row.QuestionID,
+			&row.IsCorrect, &row.Score, &row.SubmittedAt, &row.SQLText, &row.ValidationDetails); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		out = append(out, row)
 	}
 	return out, rows.Err()
 }
@@ -94,12 +94,12 @@ func (r *PostgresRepository) ExportPracticeAttempts(ctx context.Context, from, t
 
 	var out []models.PracticeAttemptExportRow
 	for rows.Next() {
-		var r models.PracticeAttemptExportRow
-		if err := rows.Scan(&r.ID, &r.StudentID, &r.Username, &r.PracticeQuestionID,
-			&r.IsCorrect, &r.SubmittedAt, &r.SQLText, &r.ValidationDetails); err != nil {
+		var row models.PracticeAttemptExportRow
+		if err := rows.Scan(&row.ID, &row.StudentID, &row.Username, &row.PracticeQuestionID,
+			&row.IsCorrect, &row.SubmittedAt, &row.SQLText, &row.ValidationDetails); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		out = append(out, row)
 	}
 	return out, rows.Err()
 }

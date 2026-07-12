@@ -114,6 +114,27 @@ func TestExportNow_DisabledIsNoOp(t *testing.T) {
 	}
 }
 
+func TestExportNow_EmptyRecipientHoldsWatermark(t *testing.T) {
+	sid := 5
+	repo := &fakeExportRepo{
+		state: models.ExportState{Enabled: true},
+		subs:  []models.SubmissionExportRow{{ID: 1, StudentID: &sid, SubmittedAt: time.Unix(1, 0).UTC()}},
+	}
+	sender := &fakeExportSender{}
+	s := NewSubmissionExportService(repo, sender, ExportConfig{Interval: time.Hour, Recipient: ""})
+	s.now = func() time.Time { return time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC) }
+	_, err := s.ExportNow(context.Background())
+	if err == nil {
+		t.Fatal("expected error for empty recipient")
+	}
+	if sender.calls != 0 {
+		t.Fatalf("sender.calls = %d, want 0", sender.calls)
+	}
+	if len(repo.advanced) != 0 {
+		t.Fatal("watermark must NOT advance when recipient is unconfigured")
+	}
+}
+
 func TestExportNow_SendFailureHoldsWatermark(t *testing.T) {
 	sid := 5
 	repo := &fakeExportRepo{
