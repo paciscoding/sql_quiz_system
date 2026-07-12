@@ -278,7 +278,72 @@ const { inFlight: saveUserLoading, run: saveUser } = useSingleFlight(async () =>
   }
 })
 
-onMounted(fetchUsers)
+// --- Submission-log export controls ---
+const exportSettings = ref<{
+  enabled: boolean
+  last_export_at: string
+  interval: string
+  recipient: string
+} | null>(null)
+const exportBusy = ref(false)
+
+const authHeader = () => ({ Authorization: `Bearer ${localStorage.getItem('sql_quiz_token')}` })
+
+const fetchExportSettings = async () => {
+  try {
+    const res = await fetch('/api/v1/export/settings', { headers: authHeader() })
+    if (res.status === 503) { exportSettings.value = null; return } // email/export not configured
+    if (!res.ok) throw new Error('Failed to load export settings')
+    exportSettings.value = await res.json()
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load export settings' })
+  }
+}
+
+const toggleExport = async () => {
+  if (!exportSettings.value) return
+  const next = !exportSettings.value.enabled
+  exportBusy.value = true
+  try {
+    const res = await fetch('/api/v1/export/settings', {
+      method: 'PUT',
+      headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    })
+    if (!res.ok) throw new Error('Failed to update export toggle')
+    exportSettings.value.enabled = next
+    notify(`Submission export ${next ? 'enabled' : 'disabled'}.`, 'success')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to update export toggle' })
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+const runExportNow = async () => {
+  exportBusy.value = true
+  try {
+    const res = await fetch('/api/v1/export/run-now', { method: 'POST', headers: authHeader() })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.error || 'Export run failed')
+    notify(
+      data.sent
+        ? `Export sent: ${data.submission_count} submissions, ${data.practice_count} practice attempts.`
+        : 'Export ran — nothing new to send.',
+      'success'
+    )
+    await fetchExportSettings()
+  } catch (err) {
+    handleApiError(err, { fallback: 'Export run failed' })
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+onMounted(() => {
+  fetchUsers()
+  fetchExportSettings()
+})
 </script>
 
 <template>
@@ -287,6 +352,34 @@ onMounted(fetchUsers)
       <h1>Account Administration</h1>
       <p class="page-subtitle">Create, edit, and bulk-import student/lecturer accounts for the grader system.</p>
     </div>
+
+    <section v-if="exportSettings" class="card export-card">
+      <h2 class="section-title">Submission-log export</h2>
+      <p class="page-subtitle">
+        Emails a compressed CSV of new exam + practice submissions to the admin address on a fixed interval.
+      </p>
+      <div class="export-row">
+        <label class="switch">
+          <input
+            type="checkbox"
+            :checked="exportSettings.enabled"
+            :disabled="exportBusy"
+            @change="toggleExport"
+            data-testid="export-toggle"
+          />
+          <span>{{ exportSettings.enabled ? 'Enabled' : 'Disabled' }}</span>
+        </label>
+        <button type="button" class="btn btn-sm" :disabled="exportBusy" @click="runExportNow" data-testid="export-run-now">
+          Run now
+        </button>
+      </div>
+      <dl class="export-meta">
+        <div><dt>Interval</dt><dd>{{ exportSettings.interval }}</dd></div>
+        <div><dt>Recipient</dt><dd>{{ exportSettings.recipient || '— (ADMIN_EMAIL unset)' }}</dd></div>
+        <div><dt>Last export</dt><dd>{{ exportSettings.last_export_at }}</dd></div>
+      </dl>
+    </section>
+
   <div class="admin-grid">
     <!-- Create User -->
     <div>
@@ -560,6 +653,48 @@ onMounted(fetchUsers)
 </template>
 
 <style scoped>
+.export-card {
+  margin-bottom: var(--space-6);
+}
+.section-title {
+  margin: 0 0 var(--space-1) 0;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.export-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-top: var(--space-3);
+}
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.export-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin: var(--space-3) 0 0 0;
+}
+.export-meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.export-meta dt {
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+.export-meta dd {
+  margin: 0;
+  font-size: 0.9rem;
+}
 .admin-grid {
   display: grid;
   grid-template-columns: 1fr 1.4fr;

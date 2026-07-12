@@ -998,6 +998,12 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_password_events_user ON app.password_events(user_id, created_at DESC);`,
+		`CREATE TABLE IF NOT EXISTS app.export_state (
+			id             INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+			enabled        BOOLEAN NOT NULL,
+			last_export_at TIMESTAMPTZ NOT NULL,
+			updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+		);`,
 	}
 
 	for _, q := range queries {

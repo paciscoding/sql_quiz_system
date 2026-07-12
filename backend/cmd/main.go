@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,10 +75,37 @@ func main() {
 
 	// Email delivery: real Gmail SMTP when EMAIL_SENDER_ADDRESS is configured,
 	// otherwise the no-op stub. The app password is never logged.
+	var exportCtrl *controllers.ExportController
 	if senderAddr := os.Getenv(services.EmailSenderAddressEnv); senderAddr != "" {
 		smtpSender := services.NewSMTPEmailSender()
 		authService.SetEmailSender(smtpSender)
 		log.Printf("email: SMTP sender active (from=%s host=%s)", smtpSender.From(), smtpSender.Host())
+
+		// Submission-log exporter: seed state, then run the interval loop.
+		exportRecipient := os.Getenv(services.ExportRecipientEnv)
+		if exportRecipient == "" {
+			exportRecipient = os.Getenv("ADMIN_EMAIL")
+		}
+		exportEnabledDefault := true
+		if v := os.Getenv(services.ExportEnabledEnv); v != "" {
+			if parsed, perr := strconv.ParseBool(v); perr == nil {
+				exportEnabledDefault = parsed
+			}
+		}
+		if err := repo.EnsureExportState(ctx, exportEnabledDefault); err != nil {
+			log.Printf("submission-export: seed state failed: %v", err)
+		}
+		exportCfg := services.ExportConfig{
+			Interval:  services.ParseExportInterval(os.Getenv(services.ExportIntervalEnv)),
+			Recipient: exportRecipient,
+		}
+		exportSvc := services.NewSubmissionExportService(repo, smtpSender, exportCfg)
+		if exportRecipient == "" {
+			log.Printf("submission-export: EXPORT_ADMIN_EMAIL/ADMIN_EMAIL unset; exporter loop not started (configure a recipient to enable)")
+		} else {
+			go exportSvc.Run(ctx)
+		}
+		exportCtrl = controllers.NewExportController(repo, exportSvc)
 	} else {
 		log.Printf("email: NoopEmailSender active (%s unset; emails are logged, not sent)", services.EmailSenderAddressEnv)
 	}
@@ -218,6 +247,30 @@ func main() {
 			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccount)
 			// Single-student create/upsert — shares the importer's parity path.
 			staff.POST("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateStudent)
+
+			// Submission-log export admin controls. exportCtrl is nil when SMTP is
+			// not configured; the routes stay registered but report 503 in that case.
+			staff.GET("/export/settings", controllers.RoleMiddleware(models.RoleAdmin), func(c *gin.Context) {
+				if exportCtrl == nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "email/export not configured"})
+					return
+				}
+				exportCtrl.GetSettings(c)
+			})
+			staff.PUT("/export/settings", controllers.RoleMiddleware(models.RoleAdmin), func(c *gin.Context) {
+				if exportCtrl == nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "email/export not configured"})
+					return
+				}
+				exportCtrl.UpdateSettings(c)
+			})
+			staff.POST("/export/run-now", controllers.RoleMiddleware(models.RoleAdmin), func(c *gin.Context) {
+				if exportCtrl == nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "email/export not configured"})
+					return
+				}
+				exportCtrl.RunNow(c)
+			})
 		}
 
 		// Practice student routes. Live during exams unless an active exam has the

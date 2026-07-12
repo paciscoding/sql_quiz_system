@@ -1,52 +1,113 @@
 {
-  "project": "exam-feedback-batch-2026-06-29",
+  "project": "submission-export-emailer-final-fixes",
   "arch_decisions": [
     {
       "id": "ARCH-001",
-      "title": "Student exam layout: stack by default, two-column only for narrow result tables",
-      "detail": "StudentView.vue .pane-grid is hard-coded grid-template-columns: 1fr 1fr, forcing brief+answer side-by-side and overflowing the answer form. Change default to single-column (answer panel below brief). Add a computed that switches to two-column ONLY when the brief's expected-result table has <= 4 columns (narrow, >0). DML questions (no expected table) stay stacked. Use scoped styles in StudentView.vue; do NOT touch global style.css."
-    },
-    {
-      "id": "ARCH-002",
-      "title": "Lecturer inline preview of exam description + images",
-      "detail": "ExamQuestionsPanel.vue only has a plain textarea for the introduction and a separate IntroImagesEditor (props: scope:'exam', ownerId:number). Add an inline 'Preview' toggle button revealing a panel that renders the current introduction text (white-space: pre-wrap, plain text, NEVER v-html) plus the uploaded intro images the way the student sees them. Read images via listExamIntroImages(props.exam.id) from services/schemaImages.ts."
-    },
-    {
-      "id": "ARCH-003",
-      "title": "Specific, truthful image-upload error messages",
-      "detail": "Backend UploadExamIntroImage (lecturer_controller.go ~709) returns 413 for BOTH per-file (>5MB) and aggregate (>25MB), and a generic 415 for bad magic bytes. Frontend schemaImages.ts hardcodes status 413 -> Error('too large') and 415 -> Error('unsupported format'); IntroImagesEditor.mapUploadError turns 'too large' into 'Aggregate intro-image size exceeds 25 MB' which is WRONG for a single oversized file. Backend: emit distinct, specific messages (per-file too large with the 5MB limit; aggregate too large with 25MB; unsupported/corrupted naming what was detected; empty/truncated). Frontend: stop overriding 413/415 with hardcoded strings; surface the backend body.error verbatim (keep 401->forceLogout). Keep magic-byte validation (PNG 0x89504E47, JPEG 0xFFD8FF)."
-    },
-    {
-      "id": "ARCH-004",
-      "title": "Exam Test Run shows row preview only; SQL errors only, no correctness",
-      "detail": "PreviewAnswer (quiz_controller.go ~277) returns status correct/incorrect + feedback via ValidatePreview->decideStatus. ValidatePreview is SHARED with practice mode (practice_controller.go:150) so do NOT change it globally. In PreviewAnswer ONLY: if status is 'correct' or 'incorrect', replace status with neutral 'preview' and blank the feedback, and do not send score, so correctness can't be read in devtools. Keep status 'syntax_error' + its feedback. Frontend StudentView.vue test-run panel: render the ResultTable + truncation note always; show the SQL error text ONLY when status==='syntax_error'; never show a pass/fail badge or correctness feedback for the test run."
-    },
-    {
-      "id": "ARCH-005",
-      "title": "Lecturer per-question Avg Score = best-per-student",
-      "detail": "LecturerResults.vue drillQuestionStats computes avgScore = sum(all attempts)/attempt_count over ALL submissions (skews toward students with many attempts). Recompute: best (max) score per distinct student_id, then average those per-student bests. Reads raw submissions from ListSubmissions, so it is independent of ARCH-006."
-    },
-    {
-      "id": "ARCH-006",
-      "title": "Exam question score = best attempt (not latest) across the backend",
-      "detail": "When a student submits wrong then correct, the scored value must be the BEST attempt, not the latest (which can be lower/zero). postgres_results.go uses latest-per-question in three places; change each to best-by-score (ORDER BY ... score DESC, submitted_at DESC tie-break): GetStudentExamResults (DISTINCT ON (s.question_id), pick max-score row's sql_text/validation_details), GetStudentResultsSummary (latest_submissions CTE), GetConsolidatedScores (LatestSubmissions CTE; may rename to BestSubmissions). Makes student detail, student summary, and lecturer gradebook all show best score."
+      "title": "Close watermark-advance-on-silent-drop hole + carry-over review nits",
+      "detail": "Whole-branch review of feat/submission-export-emailer found one Critical: (*SMTPEmailSender).SendExport returns nil when the recipient is unset, so SubmissionExportService.ExportNow (backend/internal/services/submission_export.go) treats that as a successful send, advances the watermark, and permanently skips the window's submissions. Fix in two places: (1) ExportNow must refuse to advance the watermark and must return an error when there is data to send but s.cfg.Recipient == \"\"; (2) backend/cmd/main.go must not start the exporter goroutine at all when the resolved recipient is empty (still build exportCtrl so settings/run-now endpoints respond). Plus a regression test for the new guard, a documentation comment on the wall-clock window assumption, a DB-boundary test for the (from,to] predicate, an API_SPEC.md doc fix to match the actual nested run-now error body, more tolerant enabled-default env parsing via strconv.ParseBool in main.go, and a pure rename of a shadowing loop variable in postgres_export.go. All changes land as one commit on the existing feature branch."
     }
   ],
   "todos": [
-    {"id": "TODO-1", "title": "Student exam UX: stacked/2-col layout + test-run table-only", "arch_ref": "ARCH-001,ARCH-004", "assigned_to": "claude-implementor", "parallel_group": "G-student-ux", "complexity": "medium", "file_scope": ["frontend/src/components/StudentView.vue"], "depends_on": [], "done_when": ".pane-grid is single-column by default with the answer panel below the brief; a computed switches to two-column only when expected_columns.length>0 && <=4; the test-run/preview panel shows only the ResultTable (+ truncation note), shows error text only when status==='syntax_error', and never shows a correctness badge or correctness feedback; vue-tsc passes."},
-    {"id": "TODO-2", "title": "Lecturer description+image preview toggle + real upload errors (frontend)", "arch_ref": "ARCH-002,ARCH-003", "assigned_to": "claude-implementor", "parallel_group": "G-lecturer-authoring", "complexity": "medium", "file_scope": ["frontend/src/components/lecturer/ExamQuestionsPanel.vue", "frontend/src/components/IntroImagesEditor.vue", "frontend/src/services/schemaImages.ts"], "depends_on": [], "done_when": "ExamQuestionsPanel has a Preview toggle showing intro text (pre-wrap, not v-html) + intro images as the student sees them; schemaImages.ts no longer overrides 413/415 with hardcoded strings and surfaces backend body.error verbatim (401 still forceLogout); IntroImagesEditor.mapUploadError passes the server message through; vue-tsc passes."},
-    {"id": "TODO-3", "title": "Lecturer per-question Avg Score = best-per-student", "arch_ref": "ARCH-005", "assigned_to": "claude-implementor", "parallel_group": "G-lecturer-results", "complexity": "low", "file_scope": ["frontend/src/components/lecturer/LecturerResults.vue"], "depends_on": [], "done_when": "drillQuestionStats avgScore = average over distinct students of each student's MAX score; attempts count unchanged; vue-tsc passes."},
-    {"id": "TODO-4", "title": "Backend: neutralize test-run correctness, precise upload errors, best-by-score scoring", "arch_ref": "ARCH-003,ARCH-004,ARCH-006", "assigned_to": "claude-implementor", "parallel_group": "G-backend", "complexity": "high", "file_scope": ["backend/internal/controllers/quiz_controller.go", "backend/internal/controllers/lecturer_controller.go", "backend/internal/repository/postgres_results.go"], "depends_on": [], "done_when": "PreviewAnswer maps correct/incorrect -> status 'preview' with blank feedback and no score, keeps syntax_error+feedback; UploadExamIntroImage returns distinct specific messages for per-file too large vs aggregate vs unsupported/corrupted vs empty; postgres_results.go GetStudentExamResults, GetStudentResultsSummary, GetConsolidatedScores all order best-by-score (score DESC, submitted_at DESC); go build ./... and existing go tests pass."}
+    {
+      "id": "TODO-1",
+      "title": "ExportNow: hold watermark + refuse send when recipient unset; document window assumption",
+      "arch_ref": "ARCH-001",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "G-service",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/services/submission_export.go"
+      ],
+      "depends_on": [],
+      "done_when": "In ExportNow, after the empty-window branch (unchanged) and BEFORE building CSV attachments / sending, add: if len(subs)>0 || len(pracs)>0 (i.e. we fell through the empty-window branch) and s.cfg.Recipient == \"\", return res, fmt.Errorf(\"submission-export: recipient not configured (set EXPORT_ADMIN_EMAIL or ADMIN_EMAIL); holding watermark\") WITHOUT calling AdvanceExportWatermark. Also add a short comment at `end := s.now()` documenting that windowEnd is app wall-clock and the delta assumes submission INSERTs are short single-statement commits (no behavior change, comment only). go build ./... succeeds; fmt import already present, no new imports needed."
+    },
+    {
+      "id": "TODO-2",
+      "title": "Gate exporter goroutine on non-empty recipient; robust enabled-default parsing",
+      "arch_ref": "ARCH-001",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "G-main",
+      "complexity": "low",
+      "file_scope": [
+        "backend/cmd/main.go"
+      ],
+      "depends_on": [],
+      "done_when": "Replace the unconditional `go exportSvc.Run(ctx)` with a branch: if exportRecipient == \"\" log a warning in the existing log style (e.g. 'submission-export: EXPORT_ADMIN_EMAIL/ADMIN_EMAIL unset; exporter loop not started (configure a recipient to enable)') and do NOT start the goroutine; else `go exportSvc.Run(ctx)`. exportCtrl is still built either way. Separately, replace `exportEnabledDefault := os.Getenv(services.ExportEnabledEnv) != \"false\"` with tolerant parsing: default exportEnabledDefault=true; if the env var is set, parse with strconv.ParseBool and only override the default on a successful parse (parse error keeps default true). Add \"strconv\" to the import block if not already present. go build ./... succeeds; go vet ./cmd/... clean."
+    },
+    {
+      "id": "TODO-3",
+      "title": "Regression test: empty recipient holds watermark and does not send",
+      "arch_ref": "ARCH-001",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "G-service",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/services/submission_export_test.go"
+      ],
+      "depends_on": [
+        "TODO-1"
+      ],
+      "done_when": "Add TestExportNow_EmptyRecipientHoldsWatermark following the file's existing fake/newSvc patterns: a fakeExportRepo with state.Enabled=true and at least one submission row, and a SubmissionExportService built with an ExportConfig{Interval: time.Hour, Recipient: \"\"} (either add a small local helper or construct via NewSubmissionExportService directly and override s.now, since the existing newSvc hardcodes Recipient:\"admin@x.test\"). Assert ExportNow returns a non-nil error, sender.calls == 0, and len(repo.advanced) == 0 (watermark not advanced). Must run after TODO-1 lands the guard it exercises. go test ./internal/services/ -run TestExportNow_ -v passes, including this new test."
+    },
+    {
+      "id": "TODO-4",
+      "title": "Boundary test for ExportSubmissions (from,to] predicate",
+      "arch_ref": "ARCH-001",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "G-repo-boundary-test",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/repository/postgres_export_query_test.go"
+      ],
+      "depends_on": [],
+      "done_when": "Add a test (new func, or extend TestExportSubmissions_WindowFilter) that plants a row with submitted_at exactly == from (must be excluded: predicate is submitted_at > from) and a row with submitted_at exactly == to (must be included: predicate is submitted_at <= to), using openTestRepo/uniqueUsername and the same per-user filtering the existing test uses (filter returned rows by StudentID==uid) for determinism against a shared DB. File compiles; go test ./internal/repository/ -run TestExportSubmissions -v SKIPs cleanly without TEST_DATABASE_URL (does not fail)."
+    },
+    {
+      "id": "TODO-5",
+      "title": "API_SPEC.md: correct run-now error body shape",
+      "arch_ref": "ARCH-001",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "G-doc",
+      "complexity": "low",
+      "file_scope": [
+        "API_SPEC.md"
+      ],
+      "depends_on": [],
+      "done_when": "The `POST /export/run-now` section's 500 line is updated to state the actual nested shape returned by the controller: `{ \"error\": string, \"result\": {ExportResult} }` (result is the same object as the 200 body, just with zero/partial fields depending on where the cycle failed), replacing the current 'same body shape plus error' phrasing that implies a flattened body. Controller code (export_controller.go) is NOT touched \u2014 doc-only edit."
+    },
+    {
+      "id": "TODO-6",
+      "title": "Rename shadowing loop variable in postgres_export.go",
+      "arch_ref": "ARCH-001",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "G-repo-rename",
+      "complexity": "low",
+      "file_scope": [
+        "backend/internal/repository/postgres_export.go"
+      ],
+      "depends_on": [],
+      "done_when": "In both ExportSubmissions and ExportPracticeAttempts, the loop-local `var r models.SubmissionExportRow` / `var r models.PracticeAttemptExportRow` (which shadows the `r *PostgresRepository` receiver) is renamed to `row`, along with its rows.Scan(&row....) and append(out, row) usages. Pure rename, no behavior change. go build ./... succeeds."
+    }
   ],
   "in_progress": [],
-  "completed": ["TODO-1", "TODO-2", "TODO-3", "TODO-4"],
+  "completed": [
+    "TODO-1",
+    "TODO-2",
+    "TODO-3",
+    "TODO-4",
+    "TODO-5",
+    "TODO-6"
+  ],
   "failed": [],
   "agent_notes": {
     "claude": {
-      "TODO-1": "StudentView.vue: added briefTwoCol computed (1..4 expected_columns -> .pane-grid--cols2 = 1fr 1fr; base now 1fr; media query forces 1fr). Test-run panel: added 'preview' to PreviewResult.status union; removed correctness badge + unconditional feedback; error <p> only when status==='syntax_error'; kept ResultTable + truncation note. badgeClassFor/statusLabel retained (still used by final-submission panel). vue-tsc clean.",
-      "TODO-2": "ExamQuestionsPanel.vue: Preview toggle (showIntroPreview) renders intro text pre-wrap (no v-html) + image stack via examImageBlobUrl(exam.id,img.id) (same mechanism as IntroImagesEditor.loadThumbs); onUnmounted revokes blob URLs. schemaImages.ts: removed hardcoded 413/415 branches in BOTH uploadExamIntroImage and uploadCategoryIntroImage; non-2xx (except 401) now surfaces body.error. IntroImagesEditor.mapUploadError simplified to return raw || 'Upload failed.'. vue-tsc clean.",
-      "TODO-3": "LecturerResults.vue: drillQuestionStats avgScore now = avg over distinct students of each student's MAX score (Map<student_id,max>); attempts and return shape unchanged. vue-tsc clean.",
-      "TODO-4": "quiz_controller.go PreviewAnswer: correct/incorrect -> status 'preview' + blank feedback (syntax_error untouched, no score field). lecturer_controller.go UploadExamIntroImage: read-fail -> 'the image file is empty or truncated'; bad magic -> diagnostic 415 message; per-file/aggregate messages already distinct. postgres_results.go: GetStudentExamResults / GetStudentResultsSummary / GetConsolidatedScores (CTE renamed BestSubmissions) all ORDER BY score DESC, submitted_at DESC. go build + go test ./... pass."
-    }
+      "TODO-1": "submission_export.go: added guard after the empty-window early-return \u2014 if Recipient==\"\" and there is data, return res + fmt.Errorf(...) without calling AdvanceExportWatermark. Added trade-off comment above `end := s.now()`. go build/vet clean.",
+      "TODO-2": "main.go: goroutine now gated \u2014 `if exportRecipient == \"\" { log.Printf(warn) } else { go exportSvc.Run(ctx) }`; exportCtrl still built unconditionally. exportEnabledDefault now defaults true and only overridden via strconv.ParseBool on a successful parse; added \"strconv\" import. go build/vet clean.",
+      "TODO-3": "submission_export_test.go: added TestExportNow_EmptyRecipientHoldsWatermark, service built directly (not via newSvc) with Recipient:\"\". All 5 TestExportNow_* PASS.",
+      "TODO-4": "postgres_export_query_test.go: added TestExportSubmissions_BoundaryInclusiveExclusive planting rows at exactly from (excluded) and exactly to (included), filtered by uid. Compiles; SKIPs cleanly without TEST_DATABASE_URL.",
+      "TODO-5": "API_SPEC.md: run-now 500 doc corrected to nested `{\"error\": string, \"result\": {ExportResult}}` shape matching export_controller.go RunNow. Doc-only, controller untouched.",
+      "TODO-6": "postgres_export.go: renamed loop-local `r` -> `row` in ExportSubmissions and ExportPracticeAttempts (Scan/append usages updated); receiver `r *PostgresRepository` and its r.pool.* references untouched. go build/vet clean."
+    },
+    "merge": "clean \u2014 reviewed 6 files across 5 parallel groups (main.go, submission_export.go, submission_export_test.go, postgres_export.go, postgres_export_query_test.go, API_SPEC.md). No file touched by more than one group, no duplicate/conflicting logic, no drive-by edits outside file_scope. main.go's exportRecipient gating (skip starting the Run() goroutine when empty, but still build exportCtrl) is consistent with submission_export.go's new ExportNow guard (returns error + holds watermark when Recipient==\"\" and there is data), so run-now with an empty recipient now surfaces the error via exportCtrl instead of silently succeeding. postgres_export.go's r->row rename touches only the two loop-locals; the `r *PostgresRepository` receiver and its r.pool.* call sites elsewhere in the file are untouched, so it compiles cleanly with no other file referencing those loop-locals. go build ./..., go vet ./..., and go test ./internal/services/ -run TestExportNow_ -v (5/5 pass) all clean; go test ./internal/repository/ -run TestExportSubmissions (2/2 SKIP without TEST_DATABASE_URL, as required). Note: TODO.md and docs/superpowers/specs/2026-07-01-auth-password-management-design.md also show uncommitted diffs in the working tree, but neither is in any of TODO-1..6's file_scope and their content (submission_queue.go race fix dated 2026-07-11, OTP forgot-password amendment dated 2026-07-02) is unrelated to this ARCH-001 batch \u2014 pre-existing uncommitted work from a prior session, not a drive-by edit by these 5 implementor instances. No action needed from merge-check."
   }
 }
