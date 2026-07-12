@@ -386,17 +386,18 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 	// SECURITY: derive authorship from JWT — never trust client-supplied created_by.
 	q.CreatedBy = lecturer.ID
 
-	if err := ctrl.repo.CreateQuestion(c.Request.Context(), q); err != nil {
+	newID, err := ctrl.repo.CreateQuestion(c.Request.Context(), q)
+	if err != nil {
 		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
 		return
 	}
 
 	// Re-read to surface the Phase 0 capture outcome (status + any capture_error)
 	// so the frontend can render a green/red badge per `MANUAL.md § Step 2`.
-	saved, err := ctrl.repo.GetQuestion(c.Request.Context(), q.ID)
+	saved, err := ctrl.repo.GetQuestion(c.Request.Context(), newID)
 	if err != nil {
 		// The upsert succeeded; treat read-back failure as best-effort.
-		c.JSON(http.StatusOK, gin.H{"message": "Question saved successfully"})
+		c.JSON(http.StatusOK, gin.H{"message": "Question saved successfully", "id": newID})
 		return
 	}
 
