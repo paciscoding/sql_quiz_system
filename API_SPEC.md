@@ -43,6 +43,9 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Admin | POST | `/admin/users/:id/reset-password` | Admin |
 | Admin | POST | `/admin/users/:id/resend-credential` | Admin |
 | Admin | GET | `/admin/users/:id/password-events` | Admin |
+| Admin | GET | `/export/settings` | Admin |
+| Admin | PUT | `/export/settings` | Admin |
+| Admin | POST | `/export/run-now` | Admin |
 | Quiz | GET | `/quiz/exams/:id/stream` | any auth (query token) |
 | Quiz | POST | `/quiz/submit` | Student |
 | Quiz | POST | `/quiz/preview` | Student |
@@ -186,6 +189,27 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 ### Password Events (audit)
 - `GET /admin/users/:id/password-events`
 - **200:** `{"key_configured": bool, "events": [{"source", "changed_by_username", "created_at", "new_password?"}]}` — newest first; `new_password` present only when the key is configured and decrypt succeeds. The admin's view access is itself logged (metadata only).
+
+---
+
+## Admin-only Submission-log Export
+Controls for the background exporter that emails an admin a delta gzip-CSV of exam + practice submissions on an interval; see `MANUAL.md § Submission-log Export`. These three routes are always registered, but return **503** (`{"error": "email/export not configured"}`) when SMTP (`EMAIL_SENDER_ADDRESS`) is not configured, since the exporter never starts in that case.
+
+### Get Export Settings
+- `GET /export/settings`
+- **200:** `{"enabled": bool, "last_export_at": "<RFC3339 UTC>", "interval": "24h", "recipient": "..."}`.
+
+### Update Export Settings
+- `PUT /export/settings`
+- **Payload:** `{"enabled": bool}` (required).
+- **200:** `{"enabled": bool}`.
+- **400:** `{"error": "body must be {\"enabled\": bool}"}`.
+
+### Run Export Now
+- `POST /export/run-now`
+- **Behaviour:** triggers an immediate export cycle synchronously on the request context (verification aid; the scheduled path runs on the long-lived server context).
+- **200:** `{"enabled": bool, "window_start", "window_end", "submission_count": int, "practice_count": int, "sent": bool}`.
+- **500:** same body shape plus `"error"` on failure (e.g. send failure); the watermark only advances on `sent: true`.
 
 ---
 

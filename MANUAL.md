@@ -33,6 +33,15 @@ The Administrator is responsible for system infrastructure and the initial creat
 3. Select the role: **LECTURER**.
 4. Click **"Generate Account"**.
 
+### Submission-log Export
+A background job emails an admin a **delta gzip CSV** of exam and practice submissions on an interval — two attachments, one per submission type, covering only the rows recorded since the last successful export.
+
+- **On by default**, sending every **24 hours**. Change the interval with `SUBMISSION_EXPORT_INTERVAL` (a Go duration string, e.g. `12h`, `30m`).
+- Toggle it on or off any time from the admin panel; the toggle is persisted, so it survives restarts and takes precedence over the `SUBMISSION_EXPORT_ENABLED` env var after the first boot (that var only seeds the initial value). The admin panel also has a **"Run now"** button to trigger an out-of-band export for verification.
+- **Requires SMTP** — the exporter does not start unless `EMAIL_SENDER_ADDRESS` is configured.
+- The recipient is `EXPORT_ADMIN_EMAIL`, falling back to `ADMIN_EMAIL` when unset.
+- **No historical back-fill:** the first export after a fresh deployment only captures submissions made *after* the backend started — anything submitted before first boot is not included in any export.
+
 ---
 
 ## 2. Lecturer Workflow (Exam Preparation)
