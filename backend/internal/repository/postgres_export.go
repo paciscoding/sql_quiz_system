@@ -44,3 +44,62 @@ func (r *PostgresRepository) AdvanceExportWatermark(ctx context.Context, t time.
 		t)
 	return err
 }
+
+// ExportSubmissions returns exam submissions with submitted_at in (from, to],
+// joined to the student's username. FK columns are nullable, so they scan into
+// pointers; validation_details is emitted as its raw JSON text.
+func (r *PostgresRepository) ExportSubmissions(ctx context.Context, from, to time.Time) ([]models.SubmissionExportRow, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT s.id, s.exam_id, s.student_id, COALESCE(u.username, ''), s.question_id,
+		        s.is_correct, s.score, s.submitted_at, s.sql_text,
+		        COALESCE(s.validation_details::text, '')
+		 FROM app.submissions s
+		 LEFT JOIN app.system_users u ON u.id = s.student_id
+		 WHERE s.submitted_at > $1 AND s.submitted_at <= $2
+		 ORDER BY s.submitted_at ASC, s.id ASC`,
+		from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.SubmissionExportRow
+	for rows.Next() {
+		var r models.SubmissionExportRow
+		if err := rows.Scan(&r.ID, &r.ExamID, &r.StudentID, &r.Username, &r.QuestionID,
+			&r.IsCorrect, &r.Score, &r.SubmittedAt, &r.SQLText, &r.ValidationDetails); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ExportPracticeAttempts returns practice attempts with submitted_at in
+// (from, to], joined to the student's username.
+func (r *PostgresRepository) ExportPracticeAttempts(ctx context.Context, from, to time.Time) ([]models.PracticeAttemptExportRow, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT a.id, a.student_id, COALESCE(u.username, ''), a.practice_question_id,
+		        a.is_correct, a.submitted_at, a.sql_text,
+		        COALESCE(a.validation_details::text, '')
+		 FROM app.practice_attempts a
+		 LEFT JOIN app.system_users u ON u.id = a.student_id
+		 WHERE a.submitted_at > $1 AND a.submitted_at <= $2
+		 ORDER BY a.submitted_at ASC, a.id ASC`,
+		from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.PracticeAttemptExportRow
+	for rows.Next() {
+		var r models.PracticeAttemptExportRow
+		if err := rows.Scan(&r.ID, &r.StudentID, &r.Username, &r.PracticeQuestionID,
+			&r.IsCorrect, &r.SubmittedAt, &r.SQLText, &r.ValidationDetails); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
