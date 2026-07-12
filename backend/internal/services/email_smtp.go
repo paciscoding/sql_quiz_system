@@ -2,8 +2,11 @@ package services
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
+	"mime/multipart"
 	"net/smtp"
+	"net/textproto"
 	"os"
 	"strings"
 	"time"
@@ -158,4 +161,88 @@ func splitLines(s string) []string {
 		out[i] = string(bytes.TrimSuffix(r, []byte("\r")))
 	}
 	return out
+}
+
+// ExportAttachment is a single file attached to a multipart export email.
+type ExportAttachment struct {
+	Filename    string
+	Data        []byte
+	ContentType string
+}
+
+// SendExport emails a body plus one or more binary attachments (used by the
+// submission-log exporter). If the recipient is empty the send is skipped and
+// nil is returned, matching the other Send* helpers.
+func (s *SMTPEmailSender) SendExport(to, subject, body string, attachments []ExportAttachment) error {
+	if to == "" {
+		return nil
+	}
+	msg, err := buildMultipartMessage(s.from, to, subject, body, attachments, time.Now())
+	if err != nil {
+		return err
+	}
+	auth := smtp.PlainAuth("", s.from, s.appPassword, s.host)
+	addr := s.host + ":" + s.port
+	return smtpSendMail(addr, auth, s.from, []string{to}, msg)
+}
+
+// buildMultipartMessage assembles a MIME multipart/mixed message: one text/plain
+// part for the body and one base64-encoded part per attachment. Pure (no I/O)
+// so it is unit-tested exhaustively. Header values are sanitized against
+// header-injection, consistent with buildMessage.
+func buildMultipartMessage(from, to, subject, body string, attachments []ExportAttachment, date time.Time) ([]byte, error) {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+
+	var h bytes.Buffer
+	h.WriteString("From: " + sanitizeHeaderValue(from) + "\r\n")
+	h.WriteString("To: " + sanitizeHeaderValue(to) + "\r\n")
+	h.WriteString("Subject: " + sanitizeHeaderValue(subject) + "\r\n")
+	h.WriteString("Date: " + date.Format(time.RFC1123Z) + "\r\n")
+	h.WriteString("MIME-Version: 1.0\r\n")
+	h.WriteString("Content-Type: multipart/mixed; boundary=" + w.Boundary() + "\r\n")
+	h.WriteString("\r\n")
+
+	// Body part.
+	textHdr := make(textproto.MIMEHeader)
+	textHdr.Set("Content-Type", "text/plain; charset=UTF-8")
+	tp, err := w.CreatePart(textHdr)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tp.Write([]byte(body)); err != nil {
+		return nil, err
+	}
+
+	// Attachment parts.
+	for _, att := range attachments {
+		ct := att.ContentType
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		ah := make(textproto.MIMEHeader)
+		ah.Set("Content-Type", ct)
+		ah.Set("Content-Transfer-Encoding", "base64")
+		ah.Set("Content-Disposition", "attachment; filename=\""+sanitizeHeaderValue(att.Filename)+"\"")
+		ap, err := w.CreatePart(ah)
+		if err != nil {
+			return nil, err
+		}
+		enc := base64.StdEncoding.EncodeToString(att.Data)
+		// Wrap base64 at 76 chars per RFC 2045.
+		for i := 0; i < len(enc); i += 76 {
+			end := i + 76
+			if end > len(enc) {
+				end = len(enc)
+			}
+			if _, err := ap.Write([]byte(enc[i:end] + "\r\n")); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+
+	return append(h.Bytes(), b.Bytes()...), nil
 }
