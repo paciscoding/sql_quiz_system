@@ -221,7 +221,7 @@ func buildMultipartMessage(from, to, subject, body string, attachments []ExportA
 			ct = "application/octet-stream"
 		}
 		ah := make(textproto.MIMEHeader)
-		ah.Set("Content-Type", ct)
+		ah.Set("Content-Type", sanitizeHeaderValue(ct))
 		ah.Set("Content-Transfer-Encoding", "base64")
 		ah.Set("Content-Disposition", "attachment; filename=\""+sanitizeHeaderValue(att.Filename)+"\"")
 		ap, err := w.CreatePart(ah)

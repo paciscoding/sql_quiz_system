@@ -43,6 +43,27 @@ func TestBuildMultipartMessage_HasBodyAndAttachment(t *testing.T) {
 	}
 }
 
+func TestBuildMultipartMessage_SanitizesHeaderInjection(t *testing.T) {
+	att := ExportAttachment{
+		Filename:    "ok.csv.gz\r\nX-Injected-Filename: pwned",
+		Data:        []byte("data"),
+		ContentType: "application/gzip\r\nX-Injected-CT: pwned",
+	}
+	raw, err := buildMultipartMessage("from@x.test", "to@y.test", "Subj", "body", []ExportAttachment{att}, time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatalf("buildMultipartMessage: %v", err)
+	}
+	msg := string(raw)
+
+	// CR/LF must be stripped so the payload cannot start its own header line.
+	if strings.Contains(msg, "\r\nX-Injected-Filename:") {
+		t.Fatal("filename CR/LF injection not sanitized")
+	}
+	if strings.Contains(msg, "\r\nX-Injected-CT:") {
+		t.Fatal("content-type CR/LF injection not sanitized")
+	}
+}
+
 func TestSendExport_DispatchesThroughSMTP(t *testing.T) {
 	orig := smtpSendMail
 	t.Cleanup(func() { smtpSendMail = orig })
