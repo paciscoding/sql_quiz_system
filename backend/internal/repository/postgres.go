@@ -118,7 +118,7 @@ func NewPostgresRepository(connString string) (*PostgresRepository, error) {
 	}
 
 	// Pool Tuning for high-concurrency exams
-	config.MaxConns = 50
+	config.MaxConns = 20
 	config.MinConns = 10
 	config.MaxConnIdleTime = 30 * 60 // 30 mins
 
