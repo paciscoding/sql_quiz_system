@@ -14,6 +14,12 @@ import (
 // returning its id. A question with ID==0 is created with a fresh auto-assigned
 // id; a question with ID>0 upserts (updates) that existing row.
 func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Question) (int, error) {
+	// Repair typographic quotes pasted from documents (e.g. ‘…’ → '…') BEFORE the
+	// Phase-0 capture runs and before the row is persisted, so the teacher's
+	// correct SQL captures instead of failing with "column ... does not exist"
+	// (SQLSTATE 42703). Mirrors the preview and student-evaluation paths.
+	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
+
 	// Pre-flight: Check if exam is active
 	if q.ExamID != nil {
 		exam, err := r.GetExamByID(ctx, *q.ExamID)

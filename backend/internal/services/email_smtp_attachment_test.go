@@ -14,7 +14,7 @@ func TestBuildMultipartMessage_HasBodyAndAttachment(t *testing.T) {
 		Data:        []byte{0x1f, 0x8b, 0x00, 0x01, 0x02},
 		ContentType: "application/gzip",
 	}
-	raw, err := buildMultipartMessage("from@x.test", "to@y.test", "Subj", "hello body", []ExportAttachment{att}, time.Unix(0, 0).UTC())
+	raw, err := buildMultipartMessage("from@x.test", "to@y.test", "Subj", "hello body", "HIDDEN-MARKER-XYZ", []ExportAttachment{att}, time.Unix(0, 0).UTC())
 	if err != nil {
 		t.Fatalf("buildMultipartMessage: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestBuildMultipartMessage_SanitizesHeaderInjection(t *testing.T) {
 		Data:        []byte("data"),
 		ContentType: "application/gzip\r\nX-Injected-CT: pwned",
 	}
-	raw, err := buildMultipartMessage("from@x.test", "to@y.test", "Subj", "body", []ExportAttachment{att}, time.Unix(0, 0).UTC())
+	raw, err := buildMultipartMessage("from@x.test", "to@y.test", "Subj", "body", "", []ExportAttachment{att}, time.Unix(0, 0).UTC())
 	if err != nil {
 		t.Fatalf("buildMultipartMessage: %v", err)
 	}

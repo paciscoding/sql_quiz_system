@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"html"
 	"mime/multipart"
 	"net/smtp"
 	"net/textproto"
@@ -21,8 +22,22 @@ const (
 	EmailSMTPHostEnv       = "EMAIL_SMTP_HOST"
 	EmailSMTPPortEnv       = "EMAIL_SMTP_PORT"
 
+	// EmailHiddenTextEnv overrides the static, fully-hidden block embedded in the
+	// HTML part of every outgoing email. When the variable is UNSET the built-in
+	// default below is used; when it is SET (even to ""), that value wins — so
+	// setting it to an empty string disables the hidden block entirely.
+	EmailHiddenTextEnv = "EMAIL_HIDDEN_TEXT"
+
 	defaultSMTPHost = "smtp.gmail.com"
 	defaultSMTPPort = "587"
+
+	// defaultHiddenEmailText is the hidden block used when EMAIL_HIDDEN_TEXT is
+	// unset. Kept short and benign; hidden bulk text is a spam-filter signal.
+	defaultHiddenEmailText = "SQL Quiz System — confidential automated message. Do not forward."
+
+	// hiddenSpanStyle is the inline CSS that hides the block across major clients
+	// (incl. all Outlook platforms via mso-hide:all). Applied to the HTML part.
+	hiddenSpanStyle = "display:none !important; mso-hide:all; visibility:hidden; font-size:0; max-height:0; overflow:hidden;"
 )
 
 // smtpSendMail is indirected so tests never touch the network. Production uses
@@ -38,6 +53,16 @@ type SMTPEmailSender struct {
 	appPassword string
 	host        string
 	port        string
+	hiddenText  string
+}
+
+// hiddenTextFromEnv resolves the static hidden-block text. LookupEnv (not Getenv)
+// distinguishes "unset" (use the default) from "set to empty" (disable the block).
+func hiddenTextFromEnv() string {
+	if v, ok := os.LookupEnv(EmailHiddenTextEnv); ok {
+		return v
+	}
+	return defaultHiddenEmailText
 }
 
 // NewSMTPEmailSender builds a sender from the environment. Host/port fall back
@@ -55,6 +80,7 @@ func NewSMTPEmailSender() *SMTPEmailSender {
 	return &SMTPEmailSender{
 		from:        os.Getenv(EmailSenderAddressEnv),
 		appPassword: os.Getenv(EmailSenderAppPassword),
+		hiddenText:  hiddenTextFromEnv(),
 		host:        host,
 		port:        port,
 	}
@@ -110,7 +136,7 @@ func (s *SMTPEmailSender) SendChangeNotice(adminEmail string, ev models.Password
 // call. Kept intentionally thin so the logic worth testing lives in
 // buildMessage.
 func (s *SMTPEmailSender) send(to, subject, body string) error {
-	msg := buildMessage(s.from, to, subject, body, time.Now())
+	msg := buildHTMLMessage(s.from, to, subject, body, s.hiddenText, time.Now())
 	auth := smtp.PlainAuth("", s.from, s.appPassword, s.host)
 	addr := s.host + ":" + s.port
 	return smtpSendMail(addr, auth, s.from, []string{to}, msg)
@@ -163,6 +189,83 @@ func splitLines(s string) []string {
 	return out
 }
 
+// crlfBody normalises a plain-text body to CRLF line endings for a MIME part.
+func crlfBody(body string) string {
+	return strings.Join(splitLines(body), "\r\n")
+}
+
+// renderHTMLBody wraps a plain-text body as a minimal HTML document. The text is
+// HTML-escaped and newline-preserved; when hiddenText is non-empty a fully-hidden
+// <span> carrying it is emitted first (also HTML-escaped). This is the part that
+// carries the client-hidden block requested for outgoing mail.
+func renderHTMLBody(body, hiddenText string) string {
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\r\n<html>\r\n<body>\r\n")
+	if hiddenText != "" {
+		b.WriteString(`<span style="` + hiddenSpanStyle + `">`)
+		b.WriteString(html.EscapeString(hiddenText))
+		b.WriteString("</span>\r\n")
+	}
+	b.WriteString(`<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#111111;">` + "\r\n")
+	for i, line := range splitLines(body) {
+		if i > 0 {
+			b.WriteString("<br>\r\n")
+		}
+		b.WriteString(html.EscapeString(line))
+	}
+	b.WriteString("\r\n</div>\r\n</body>\r\n</html>\r\n")
+	return b.String()
+}
+
+// writeAlternativeParts writes a text/plain part followed by a text/html part
+// (with the hidden block) into w. Clients pick the last format they support, so
+// HTML-capable clients render the hidden span while plain-text clients still get
+// a readable message. Shared by buildHTMLMessage and buildMultipartMessage.
+func writeAlternativeParts(w *multipart.Writer, body, hiddenText string) error {
+	textHdr := make(textproto.MIMEHeader)
+	textHdr.Set("Content-Type", "text/plain; charset=UTF-8")
+	tp, err := w.CreatePart(textHdr)
+	if err != nil {
+		return err
+	}
+	if _, err := tp.Write([]byte(crlfBody(body))); err != nil {
+		return err
+	}
+
+	htmlHdr := make(textproto.MIMEHeader)
+	htmlHdr.Set("Content-Type", "text/html; charset=UTF-8")
+	hp, err := w.CreatePart(htmlHdr)
+	if err != nil {
+		return err
+	}
+	_, err = hp.Write([]byte(renderHTMLBody(body, hiddenText)))
+	return err
+}
+
+// buildHTMLMessage assembles a multipart/alternative message (plain + HTML). The
+// HTML part carries the fully-hidden static block. Header values are sanitized
+// against header injection, consistent with buildMessage.
+func buildHTMLMessage(from, to, subject, body, hiddenText string, date time.Time) []byte {
+	var payload bytes.Buffer
+	w := multipart.NewWriter(&payload)
+
+	var h bytes.Buffer
+	h.WriteString("From: " + sanitizeHeaderValue(from) + "\r\n")
+	h.WriteString("To: " + sanitizeHeaderValue(to) + "\r\n")
+	h.WriteString("Subject: " + sanitizeHeaderValue(subject) + "\r\n")
+	h.WriteString("Date: " + date.Format(time.RFC1123Z) + "\r\n")
+	h.WriteString("MIME-Version: 1.0\r\n")
+	h.WriteString("Content-Type: multipart/alternative; boundary=" + w.Boundary() + "\r\n")
+	h.WriteString("\r\n")
+
+	// CreatePart on a bytes.Buffer-backed writer cannot fail; ignore the error to
+	// keep this constructor total (matching buildMessage's signature).
+	_ = writeAlternativeParts(w, body, hiddenText)
+	_ = w.Close()
+
+	return append(h.Bytes(), payload.Bytes()...)
+}
+
 // ExportAttachment is a single file attached to a multipart export email.
 type ExportAttachment struct {
 	Filename    string
@@ -177,7 +280,7 @@ func (s *SMTPEmailSender) SendExport(to, subject, body string, attachments []Exp
 	if to == "" {
 		return nil
 	}
-	msg, err := buildMultipartMessage(s.from, to, subject, body, attachments, time.Now())
+	msg, err := buildMultipartMessage(s.from, to, subject, body, s.hiddenText, attachments, time.Now())
 	if err != nil {
 		return err
 	}
@@ -186,11 +289,12 @@ func (s *SMTPEmailSender) SendExport(to, subject, body string, attachments []Exp
 	return smtpSendMail(addr, auth, s.from, []string{to}, msg)
 }
 
-// buildMultipartMessage assembles a MIME multipart/mixed message: one text/plain
-// part for the body and one base64-encoded part per attachment. Pure (no I/O)
-// so it is unit-tested exhaustively. Header values are sanitized against
-// header-injection, consistent with buildMessage.
-func buildMultipartMessage(from, to, subject, body string, attachments []ExportAttachment, date time.Time) ([]byte, error) {
+// buildMultipartMessage assembles a MIME multipart/mixed message: a nested
+// multipart/alternative body (text/plain + text/html with the hidden block) and
+// one base64-encoded part per attachment. Pure (no I/O) so it is unit-tested
+// exhaustively. Header values are sanitized against header-injection, consistent
+// with buildMessage.
+func buildMultipartMessage(from, to, subject, body, hiddenText string, attachments []ExportAttachment, date time.Time) ([]byte, error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
 
@@ -203,14 +307,24 @@ func buildMultipartMessage(from, to, subject, body string, attachments []ExportA
 	h.WriteString("Content-Type: multipart/mixed; boundary=" + w.Boundary() + "\r\n")
 	h.WriteString("\r\n")
 
-	// Body part.
-	textHdr := make(textproto.MIMEHeader)
-	textHdr.Set("Content-Type", "text/plain; charset=UTF-8")
-	tp, err := w.CreatePart(textHdr)
+	// Body part: a nested multipart/alternative (plain + HTML with the hidden
+	// block) so the export mail carries the same hidden static text as the
+	// credential / reset / change-notice mail.
+	altBuf := &bytes.Buffer{}
+	altW := multipart.NewWriter(altBuf)
+	if err := writeAlternativeParts(altW, body, hiddenText); err != nil {
+		return nil, err
+	}
+	if err := altW.Close(); err != nil {
+		return nil, err
+	}
+	bodyHdr := make(textproto.MIMEHeader)
+	bodyHdr.Set("Content-Type", "multipart/alternative; boundary="+altW.Boundary())
+	bp, err := w.CreatePart(bodyHdr)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tp.Write([]byte(body)); err != nil {
+	if _, err := bp.Write(altBuf.Bytes()); err != nil {
 		return nil, err
 	}
 

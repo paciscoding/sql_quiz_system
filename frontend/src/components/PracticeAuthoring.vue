@@ -276,14 +276,40 @@ const doDeleteCategory = async (cat: PracticeCategory) => {
   }
 }
 
+const importFileName = ref('')
+
 const openImport = (cat: PracticeCategory) => {
   importCategoryId.value = cat.id
   importSql.value = ''
+  importFileName.value = ''
 }
 
 const cancelImport = () => {
   importCategoryId.value = null
   importSql.value = ''
+  importFileName.value = ''
+}
+
+// loadSqlFile reads a chosen .sql file's text into importSql so the existing
+// import flow (doImport) can send it. The backend takes SQL text, so this is a
+// pure client-side read — no multipart upload needed.
+const loadSqlFile = (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!/\.sql$/i.test(file.name)) {
+    notify('File must be a .sql file', 'error')
+    input.value = ''
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    importSql.value = typeof reader.result === 'string' ? reader.result : ''
+    importFileName.value = file.name
+  }
+  reader.onerror = () => notify('Failed to read the file', 'error')
+  reader.readAsText(file)
+  input.value = '' // reset so re-selecting the same file re-fires @change
 }
 
 const { inFlight: importLoading, run: doImport } = useSingleFlight(async () => {
@@ -413,7 +439,14 @@ onMounted(() => {
             <span class="cat-subpanel-label">Database schema</span>
             <div v-if="importCategoryId === c.id">
               <h3>Import database into "{{ c.name }}"</h3>
-              <p class="muted">Paste a SQL script using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
+              <p class="muted">Upload a <code>.sql</code> file or paste a SQL script, using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
+              <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
+                <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
+                  Choose .sql file
+                  <input type="file" accept=".sql,text/plain,application/sql" @change="loadSqlFile" style="display: none;" />
+                </label>
+                <span v-if="importFileName" class="muted">Loaded: <code>{{ importFileName }}</code> — review or edit below, then import.</span>
+              </div>
               <SqlEditor v-model="importSql" height="200px" />
               <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
                 <button class="btn btn-primary" :disabled="importLoading || !importSql.trim()" @click="doImport">

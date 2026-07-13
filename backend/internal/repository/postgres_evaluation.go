@@ -54,7 +54,24 @@ func querySchemaFor(question models.Question, sandboxSchema string) string {
 	return sandboxSchema
 }
 
+// acquirePracticeEvalLock takes the practice-reset advisory lock in SHARED mode
+// on the given transaction, but only when the evaluation actually runs against
+// the shared practice sandbox. Exam evaluations (their own per-exam sandbox, or
+// the read-only public curriculum) are never rebuilt by ResetPracticeSandbox,
+// so they skip the lock entirely and pay nothing. The lock releases
+// automatically when the transaction ends (pg_advisory_xact_lock_shared).
+func acquirePracticeEvalLock(ctx context.Context, tx pgx.Tx, schema string) error {
+	if schema != practiceSandboxSchema {
+		return nil
+	}
+	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1)", practiceResetLockKey)
+	return err
+}
+
 func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.Question, studentSQL string, querySchema string) (models.ValidationResult, error) {
+	// Repair typographic quotes so pasted SELECTs run instead of failing with a
+	// spurious "column ... does not exist". Consistent with the preview path.
+	studentSQL = normalizeSmartQuotes(studentSQL)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -74,6 +91,12 @@ func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.
 
 	if querySchema == "" {
 		querySchema = "public"
+	}
+	// Guard against a concurrent practice-sandbox rebuild dropping the schema
+	// out from under this read. Shared advisory lock: many evals run in
+	// parallel; ResetPracticeSandbox's exclusive lock waits for us to finish.
+	if err := acquirePracticeEvalLock(ctx, tx, querySchema); err != nil {
+		return models.ValidationResult{}, err
 	}
 	safeQuerySchema := pgx.Identifier{querySchema}.Sanitize()
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safeQuerySchema)); err != nil {
@@ -108,6 +131,10 @@ func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.
 }
 
 func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
+	// Repair typographic quotes so pasted INSERT/UPDATE/DELETE run instead of
+	// failing with a spurious "column ... does not exist". Consistent with the
+	// preview path.
+	studentSQL = normalizeSmartQuotes(studentSQL)
 	if question.TargetTable == "" {
 		return models.ValidationResult{}, fmt.Errorf("DML question is missing target_table")
 	}
@@ -124,6 +151,13 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 		return models.ValidationResult{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	// Guard against a concurrent practice-sandbox rebuild dropping the schema
+	// mid-evaluation. No-op for exam sandboxes (sandbox_exam_*), which reset
+	// never touches. Shared: parallel evals fine; reset waits for us.
+	if err := acquirePracticeEvalLock(ctx, tx, schema); err != nil {
+		return models.ValidationResult{}, err
+	}
 
 	if _, err := tx.Exec(ctx, "SAVEPOINT student_eval"); err != nil {
 		return models.ValidationResult{}, err

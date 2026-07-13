@@ -139,7 +139,7 @@ func TestPasswordEvents_AdminOnly_HTTP(t *testing.T) {
 	lecToken := login(t, r, lecturer.Username, "lecpw")
 
 	// Seed an event via a reset.
-	if _, err := auth.ResetPassword(context.Background(), admin, target.ID); err != nil {
+	if _, err := auth.ResetPassword(context.Background(), admin, target.ID, false); err != nil {
 		t.Fatal(err)
 	}
 

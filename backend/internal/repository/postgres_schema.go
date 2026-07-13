@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"regexp"
 	"strings"
@@ -11,6 +12,28 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
+
+// practiceSandboxSchema is the single shared schema that every practice
+// evaluation runs against and that ResetPracticeSandbox rebuilds.
+const practiceSandboxSchema = "sandbox_practice"
+
+// practiceResetLockKey is the Postgres advisory-lock key that serialises a
+// full practice-sandbox rebuild against in-flight practice evaluations.
+// ResetPracticeSandbox takes it EXCLUSIVELY (pg_advisory_lock); each practice
+// evaluation takes it SHARED (pg_advisory_xact_lock_shared) for the life of its
+// transaction. Shared holders run concurrently; the exclusive reset waits for
+// every in-flight eval to finish and blocks new ones until the rebuild is done,
+// so no student SQL can ever execute against a half-dropped / half-cloned
+// schema. The key is derived once, deterministically, from a stable string.
+var practiceResetLockKey = fnv1a64Signed("sql_quiz/practice:reset")
+
+// fnv1a64Signed hashes s with FNV-1a (64-bit) and reinterprets the bits as an
+// int64 so it fits Postgres advisory-lock's bigint key argument.
+func fnv1a64Signed(s string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return int64(h.Sum64())
+}
 
 // CreateRestrictedUser creates users with limited permissions
 func (r *PostgresRepository) CreateRestrictedUser(ctx context.Context) error {
@@ -808,7 +831,27 @@ func (r *PostgresRepository) InitializePracticeSandbox(ctx context.Context) erro
 // last_reset_at in app.practice_sandbox_state and returns that timestamp so
 // the caller can include it in API responses.
 func (r *PostgresRepository) ResetPracticeSandbox(ctx context.Context) (time.Time, error) {
-	const schema = "sandbox_practice"
+	const schema = practiceSandboxSchema
+
+	// Serialise the whole rebuild against in-flight practice evaluations. We
+	// hold a dedicated connection and take the advisory lock EXCLUSIVELY at the
+	// SESSION level: pg_advisory_lock blocks until every shared holder (each an
+	// in-flight eval, see evaluate*) has released, then keeps new evals waiting
+	// until we unlock. Advisory locks are cooperative and cross-connection, so
+	// the DDL below may keep using the pool — only the lock discipline matters.
+	lockConn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to acquire lock connection for practice reset: %w", err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", practiceResetLockKey); err != nil {
+		return time.Time{}, fmt.Errorf("failed to acquire practice reset lock: %w", err)
+	}
+	// Best-effort explicit unlock. Releasing the connection would also drop the
+	// session lock, but unlocking eagerly frees waiting evals a moment sooner.
+	defer func() {
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", practiceResetLockKey)
+	}()
 
 	// Drop and recreate for a clean slate.
 	if _, err := r.pool.Exec(ctx, "DROP SCHEMA IF EXISTS sandbox_practice CASCADE"); err != nil {
@@ -1071,7 +1114,24 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS first_name TEXT",
 		"ALTER TABLE app.system_users ADD COLUMN IF NOT EXISTS last_name TEXT",
 		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'General'",
-		"CREATE UNIQUE INDEX IF NOT EXISTS idx_system_users_student_number ON app.system_users(student_number) WHERE student_number IS NOT NULL",
+		// student_number is duplicate-able by design (several students may share
+		// one). Drop the legacy UNIQUE index if present and replace it with a
+		// plain (non-unique) index used only for lookups. Idempotent: the DO block
+		// only drops when the existing index is still unique, so re-runs no-op.
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM pg_index i
+				JOIN pg_class c     ON c.oid = i.indexrelid
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE n.nspname = 'app'
+				  AND c.relname = 'idx_system_users_student_number'
+				  AND i.indisunique
+			) THEN
+				DROP INDEX app.idx_system_users_student_number;
+			END IF;
+		END $$;`,
+		"CREATE INDEX IF NOT EXISTS idx_system_users_student_number ON app.system_users(student_number) WHERE student_number IS NOT NULL",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_system_users_student_id_ext ON app.system_users(student_id_ext) WHERE student_id_ext IS NOT NULL",
 		"ALTER TABLE app.practice_categories ADD COLUMN IF NOT EXISTS introduction TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE app.examinations ADD COLUMN IF NOT EXISTS introduction TEXT NOT NULL DEFAULT ''",

@@ -407,10 +407,13 @@ func (s *AuthService) performForgotReset(ctx context.Context, user models.User) 
 }
 
 // ResetPassword (admin-only) generates a new password for targetID, updates the
-// login hash, bumps token_version (evicting existing sessions), records an
-// `admin_reset` event, and emails the new credential. Returns the new password
-// once.
-func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targetID int) (string, error) {
+// login hash, bumps token_version (evicting existing sessions), and records an
+// `admin_reset` event. The new password is emailed to the target ONLY when
+// emailPassword is true and the target has an address on file; otherwise the
+// password is returned to the admin (shown once in the UI) and is never
+// emailed. Emailing a plaintext password is a deliberate opt-in tradeoff, so
+// it defaults off at the caller. Returns the new password once.
+func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targetID int, emailPassword bool) (string, error) {
 	target, err := s.repo.GetUserByID(ctx, targetID)
 	if err != nil {
 		return "", err
@@ -430,7 +433,11 @@ func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targ
 
 	actorID := actor.ID
 	s.logPasswordEvent(ctx, targetID, &actorID, models.PasswordEventAdminReset, password)
-	if err := s.email.SendCredential("", target.Username, password); err != nil {
+	recipient := ""
+	if emailPassword && target.Email != nil && *target.Email != "" {
+		recipient = *target.Email
+	}
+	if err := s.email.SendCredential(recipient, target.Username, password); err != nil {
 		log.Printf("auth: SendCredential failed for reset of %q: %v", target.Username, err)
 	}
 	return password, nil

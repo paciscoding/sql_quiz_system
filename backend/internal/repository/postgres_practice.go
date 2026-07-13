@@ -312,6 +312,9 @@ func (r *PostgresRepository) GetPracticeCategory(ctx context.Context, id int) (*
 }
 
 func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error {
+	// Repair typographic quotes (e.g. ‘…’ → '…') before capture and persistence,
+	// so pasted correct SQL doesn't fail with "column ... does not exist".
+	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
 	// Resolve the category's owned schema; the correct-result capture and all
 	// student submissions for this question run against it (not public).
 	schema, err := r.GetPracticeCategorySchema(ctx, q.CategoryID)
@@ -392,6 +395,8 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 }
 
 func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error {
+	// Repair typographic quotes before capture and persistence (see Create).
+	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
 	schema, err := r.GetPracticeCategorySchema(ctx, q.CategoryID)
 	if err != nil {
 		return err

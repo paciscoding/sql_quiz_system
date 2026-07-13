@@ -526,7 +526,7 @@ func TestResetPassword_WritesEventAndReturnsPassword(t *testing.T) {
 	admin := mkUser(t, repo, models.RoleAdmin, "adminpw")
 	target := mkUser(t, repo, models.RoleLecturer, "oldpw")
 
-	newPass, err := auth.ResetPassword(ctx, admin, target.ID)
+	newPass, err := auth.ResetPassword(ctx, admin, target.ID, false)
 	if err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
@@ -557,6 +557,51 @@ func TestResetPassword_WritesEventAndReturnsPassword(t *testing.T) {
 	}
 	if events[0].ChangedByUsername != admin.Username {
 		t.Fatalf("expected actor %q, got %q", admin.Username, events[0].ChangedByUsername)
+	}
+}
+
+// TestResetPassword_EmailsPasswordWhenToggled verifies the admin-reset email
+// toggle: with emailPassword=true and a stored address, the new password is
+// emailed exactly once to that address; with emailPassword=false, no email is
+// sent even though the target still has an address on file.
+func TestResetPassword_EmailsPasswordWhenToggled(t *testing.T) {
+	repo := integrationRepo(t)
+	ctx := context.Background()
+	auth := newIntegrationAuth(t, repo)
+	spy := &spyEmailSender{}
+	auth.SetEmailSender(spy)
+
+	admin := mkUser(t, repo, models.RoleAdmin, "adminpw")
+	username := fmt.Sprintf("resettoggle_%d", time.Now().UnixNano())
+	email := username + "@example.com"
+
+	// Create staff with an email → one credential email at create time.
+	targetID, _, err := auth.CreateStaff(ctx, admin, models.CreateUserRequest{Username: username, Role: models.RoleLecturer, Email: email})
+	if err != nil {
+		t.Fatalf("CreateStaff: %v", err)
+	}
+	if len(spy.credentialCalls) != 1 {
+		t.Fatalf("expected 1 email on create, got %d", len(spy.credentialCalls))
+	}
+
+	// emailPassword=true → the new password is emailed to the stored address.
+	newPass, err := auth.ResetPassword(ctx, admin, targetID, true)
+	if err != nil {
+		t.Fatalf("ResetPassword(emailPassword=true): %v", err)
+	}
+	if len(spy.credentialCalls) != 2 {
+		t.Fatalf("expected 2 emails after toggled reset, got %d", len(spy.credentialCalls))
+	}
+	if c := spy.credentialCalls[1]; c.to != email || c.password != newPass {
+		t.Fatalf("toggled reset email mismatch: %+v (want to=%q pw=%q)", c, email, newPass)
+	}
+
+	// emailPassword=false (default) → no additional email, despite the stored address.
+	if _, err := auth.ResetPassword(ctx, admin, targetID, false); err != nil {
+		t.Fatalf("ResetPassword(emailPassword=false): %v", err)
+	}
+	if len(spy.credentialCalls) != 2 {
+		t.Fatalf("expected no additional email when toggle is off, got %d calls", len(spy.credentialCalls))
 	}
 }
 
@@ -603,7 +648,7 @@ func TestChangelog_KeyNotConfigured_OmitsValues(t *testing.T) {
 	authWithKey := newIntegrationAuth(t, repo)
 	admin := mkUser(t, repo, models.RoleAdmin, "adminpw")
 	target := mkUser(t, repo, models.RoleLecturer, "oldpw")
-	if _, err := authWithKey.ResetPassword(ctx, admin, target.ID); err != nil {
+	if _, err := authWithKey.ResetPassword(ctx, admin, target.ID, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -644,7 +689,7 @@ func TestTokenInvalidation_ResetEvictsOldToken(t *testing.T) {
 	}
 
 	// Admin reset bumps token_version.
-	if _, err := auth.ResetPassword(ctx, admin, user.ID); err != nil {
+	if _, err := auth.ResetPassword(ctx, admin, user.ID, false); err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
 

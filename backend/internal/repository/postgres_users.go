@@ -272,8 +272,10 @@ func (r *PostgresRepository) GetTokenVersion(ctx context.Context, userID int) (i
 }
 
 // UpsertStudentByNumber inserts or updates a student profile keyed by
-// student_number. The login username is the student_id_ext (external student
-// ID). The password hash is only used for the insert path.
+// student_id_ext (the login username / external student ID). student_number
+// is NOT unique — several students may share one — so it is only ever a
+// mutable attribute refreshed on re-import, never the conflict target. The
+// password hash is only used for the insert path.
 func (r *PostgresRepository) UpsertStudentByNumber(ctx context.Context, tx pgx.Tx, in models.StudentImportRow, creatorID int) (outcome string, userID int, err error) {
 	query := `
 		INSERT INTO app.system_users (
@@ -281,9 +283,9 @@ func (r *PostgresRepository) UpsertStudentByNumber(ctx context.Context, tx pgx.T
 			student_number, student_id_ext, sec_lec, sec_lab, first_name, last_name, email
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT (student_number) WHERE student_number IS NOT NULL DO UPDATE SET
+		ON CONFLICT (student_id_ext) WHERE student_id_ext IS NOT NULL DO UPDATE SET
 			username = EXCLUDED.username,
-			student_id_ext = EXCLUDED.student_id_ext,
+			student_number = EXCLUDED.student_number,
 			sec_lec = EXCLUDED.sec_lec,
 			sec_lab = EXCLUDED.sec_lab,
 			first_name = EXCLUDED.first_name,
@@ -298,10 +300,12 @@ func (r *PostgresRepository) UpsertStudentByNumber(ctx context.Context, tx pgx.T
 	}
 
 	var inserted bool
-	// Login username = the external student_id (student_id_ext), NOT the
-	// student_number. The student_number remains the stable upsert conflict key
-	// and the default password source. username is refreshed on conflict so a
-	// re-import migrates an existing student's login to a changed student_id.
+	// Login username = the external student_id (student_id_ext), which is also
+	// the stable upsert conflict key (it has its own UNIQUE partial index).
+	// student_number is duplicate-able by design and is refreshed on conflict
+	// like any other attribute, so two students sharing a student_number no
+	// longer collapse into one row. username is likewise refreshed on conflict
+	// so a re-import migrates an existing student's login to a changed value.
 	err = tx.QueryRow(ctx, query,
 		in.StudentIDExt,
 		in.PasswordHash,

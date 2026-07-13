@@ -253,13 +253,18 @@ func (ctrl *UserController) ResetPassword(c *gin.Context) {
 		return
 	}
 
-	password, err := ctrl.authService.ResetPassword(c.Request.Context(), actor, id)
+	var body struct {
+		EmailPassword bool `json:"email_password"`
+	}
+	_ = c.ShouldBindJSON(&body) // optional body; empty/absent => EmailPassword defaults to false
+
+	password, err := ctrl.authService.ResetPassword(c.Request.Context(), actor, id, body.EmailPassword)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"generated_password": password})
+	c.JSON(http.StatusOK, gin.H{"generated_password": password, "email_requested": body.EmailPassword})
 }
 
 // ResendCredential handles POST /api/v1/users/:id/resend-credential (Admin only).
