@@ -1,0 +1,71 @@
+name: Build & push images
+
+# Builds the backend and frontend images and pushes them to GHCR, tagged with the
+# commit SHA and `latest`. It does NOT deploy: the on-prem server is behind NAT and
+# GitHub-hosted runners cannot reach it. Deploying is a manual pull on the server —
+# run `scripts/deploy.sh` there. The run summary prints the exact command.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/paciscoding/sql-quiz
+
+jobs:
+  build:
+    name: Build & push ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+  summary:
+    name: Deploy instructions
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print the deploy command
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Images pushed
+
+          \`${IMAGE_PREFIX}-backend:${GITHUB_SHA}\`
+          \`${IMAGE_PREFIX}-frontend:${GITHUB_SHA}\`
+
+          ## Deploy
+
+          On the on-prem server:
+
+          \`\`\`sh
+          ./scripts/deploy.sh ${GITHUB_SHA}
+          \`\`\`
+          EOF

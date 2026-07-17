@@ -17,6 +17,9 @@ services:
       - ./company_elmasri_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   backend:
+    # `image` + `build` together: CI pushes this tag to GHCR and the VPS pulls it,
+    # while local `docker compose up --build` still builds from ./backend as before.
+    image: ghcr.io/paciscoding/sql-quiz-backend:${IMAGE_TAG:-latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -41,6 +44,7 @@ services:
     restart: always
 
   frontend:
+    image: ghcr.io/paciscoding/sql-quiz-frontend:${IMAGE_TAG:-latest}
     build:
       context: ./frontend
       dockerfile: Dockerfile
