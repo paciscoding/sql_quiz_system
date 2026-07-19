@@ -12,7 +12,7 @@ describe('useAuth', () => {
       const auth = useAuth()
       const token = 'test-token'
       const user: AuthUser = {
-        id: 1,
+        id: '1',
         username: 'alice',
         role: 'LECTURER',
       }

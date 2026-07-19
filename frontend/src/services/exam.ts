@@ -18,7 +18,7 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
 
 // ExamIntroduction is the shape returned by GET /api/v1/quiz/exams/:id/introduction
 export interface ExamIntroduction {
-  exam_id: number
+  exam_id: string
   title: string
   introduction: string
   tables: TableIntrospection[]
@@ -26,11 +26,11 @@ export interface ExamIntroduction {
 
 // getExamIntroduction fetches the curriculum schema + description for an exam.
 // Accessible to any enrolled student regardless of whether the exam is active.
-export const getExamIntroduction = (examId: number): Promise<ExamIntroduction> =>
+export const getExamIntroduction = (examId: string): Promise<ExamIntroduction> =>
   apiFetch(`/api/v1/quiz/exams/${examId}/introduction`)
 
 // setExamIntroduction PUTs a lecturer-authored description to the exam.
-export const setExamIntroduction = (examId: number, text: string): Promise<void> =>
+export const setExamIntroduction = (examId: string, text: string): Promise<void> =>
   apiFetch(`/api/v1/lecturer/exams/${examId}/introduction`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -42,7 +42,7 @@ export const setExamIntroduction = (examId: number, text: string): Promise<void>
 // Auth: ADMIN | LECTURER.
 // 409 if the exam is currently active, or if the schema already has tables and
 // confirmReplace is false. 404 if the exam does not exist.
-export const importExamCurriculum = (examId: number, sql: string, confirmReplace = false): Promise<{ message: string }> =>
+export const importExamCurriculum = (examId: string, sql: string, confirmReplace = false): Promise<{ message: string }> =>
   apiFetch(`/api/v1/lecturer/exams/${examId}/curriculum/import${confirmReplace ? '?confirm_replace=true' : ''}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -83,7 +83,7 @@ func TestPracticeQuestion_AsQuestion(t *testing.T) {
 			}
 
 			// Every other relevant field must round-trip exactly
-			if got.ID != tc.pq.ID {
+			if got.ID != int(tc.pq.ID) {
 				t.Errorf("ID: want %d, got %d", tc.pq.ID, got.ID)
 			}
 			if got.Type != tc.pq.Type {

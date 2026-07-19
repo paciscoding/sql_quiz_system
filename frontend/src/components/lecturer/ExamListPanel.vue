@@ -11,7 +11,7 @@ import { handleApiError, toApiError } from '../../services/error_handler'
 defineProps<{ exams: Examination[] }>()
 
 const emit = defineEmits<{
-  open: [id: number]
+  open: [id: string]
   changed: []
 }>()
 

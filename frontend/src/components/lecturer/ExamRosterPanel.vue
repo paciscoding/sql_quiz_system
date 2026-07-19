@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
 import BulkImportStudents from '../BulkImportStudents.vue'
+import AddStudentForm from '../AddStudentForm.vue'
 import StudentMultiSelect from '../StudentMultiSelect.vue'
 import Spinner from '../Spinner.vue'
 import EmptyState from '../EmptyState.vue'
@@ -22,7 +23,7 @@ const { notify } = useNotifications()
 const { confirm } = useConfirm()
 
 const studentsList = ref<Student[]>([])
-const selectedStudentIds = ref<number[]>([])
+const selectedStudentIds = ref<string[]>([])
 const rosterStudents = ref<RosterStudent[]>([])
 
 const fetchStudents = async () => {
@@ -89,7 +90,7 @@ const { inFlight: assignStudentsLoading, run: assignStudents } = useSingleFlight
   }
 })
 
-async function removeStudentFromRoster(studentId: number, studentName: string) {
+async function removeStudentFromRoster(studentId: string, studentName: string) {
   const ok = await confirm({
     title: 'Remove from roster?',
     body: studentName,
@@ -134,6 +135,11 @@ async function removeStudentFromRoster(studentId: number, studentName: string) {
     >
       <Spinner v-if="assignStudentsLoading" size="sm" inline :invert="true" />{{ assignStudentsLoading ? 'Enrolling' : `Enroll ${selectedStudentIds.length} Students` }}
     </button>
+
+    <details class="add-student-panel">
+      <summary>Add Student</summary>
+      <AddStudentForm @created="fetchStudents" />
+    </details>
 
     <details class="import-roster-panel">
       <summary>Import Roster</summary>
@@ -241,14 +247,16 @@ label {
   cursor: not-allowed;
 }
 
-.import-roster-panel {
+.import-roster-panel,
+.add-student-panel {
   border: 1px solid var(--color-border-soft);
   border-radius: var(--radius);
   padding: var(--space-4);
   background: var(--color-surface-muted);
 }
 
-.import-roster-panel summary {
+.import-roster-panel summary,
+.add-student-panel summary {
   cursor: pointer;
   font-weight: 800;
   color: var(--color-text);

@@ -23,7 +23,7 @@ const fetchExams = async () => {
   }
 }
 
-const selectedExamId = ref<number | null>(null)
+const selectedExamId = ref<string | null>(null)
 
 onMounted(fetchExams)
 

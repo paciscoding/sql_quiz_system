@@ -1,5 +1,5 @@
 export interface Examination {
-  id: number
+  id: string
   title: string
   is_active: boolean
   effective_state: string
@@ -11,15 +11,16 @@ export interface Examination {
   question_count?: number
   total_points?: number
   uncaptured_count?: number
+  block_practice_during_exam: boolean
 }
 
 export interface Student {
-  id: number
+  id: string
   username: string
 }
 
 export interface RosterStudent {
-  student_id: number
+  student_id: string
   username: string
   student_number: string
   first_name: string

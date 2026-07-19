@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/middleware"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
@@ -35,21 +36,22 @@ func statusForRepoErr(err error) int {
 // LecturerExaminationResponse extends ExaminationResponse with per-exam readiness
 // aggregates that are only meaningful to the lecturer/admin view.
 type LecturerExaminationResponse struct {
-	ID               int        `json:"id"`
-	Title            string     `json:"title"`
-	IsActive         bool       `json:"is_active"`
-	CreatedBy        int        `json:"created_by"`
-	CreatedAt        time.Time  `json:"created_at"`
-	ActivatedAt      *time.Time `json:"activated_at,omitempty"`
-	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
-	ScheduledStartAt *time.Time `json:"scheduled_start_at,omitempty"`
-	ScheduledEndAt   *time.Time `json:"scheduled_end_at,omitempty"`
-	EffectiveState   string     `json:"effective_state"`
-	Introduction     string     `json:"introduction"`
-	CurriculumSchema string     `json:"curriculum_schema"`
-	QuestionCount    int        `json:"question_count"`
-	TotalPoints      float64    `json:"total_points"`
-	UncapturedCount  int        `json:"uncaptured_count"`
+	ID                      models.ExamID `json:"id"`
+	Title                   string        `json:"title"`
+	IsActive                bool          `json:"is_active"`
+	CreatedBy               models.UserID `json:"created_by"`
+	CreatedAt               time.Time     `json:"created_at"`
+	ActivatedAt             *time.Time    `json:"activated_at,omitempty"`
+	ArchivedAt              *time.Time    `json:"archived_at,omitempty"`
+	ScheduledStartAt        *time.Time    `json:"scheduled_start_at,omitempty"`
+	ScheduledEndAt          *time.Time    `json:"scheduled_end_at,omitempty"`
+	BlockPracticeDuringExam bool          `json:"block_practice_during_exam"`
+	EffectiveState          string        `json:"effective_state"`
+	Introduction            string        `json:"introduction"`
+	CurriculumSchema        string        `json:"curriculum_schema"`
+	QuestionCount           int           `json:"question_count"`
+	TotalPoints             float64       `json:"total_points"`
+	UncapturedCount         int           `json:"uncaptured_count"`
 }
 
 type LecturerController struct {
@@ -65,8 +67,8 @@ func NewLecturerController(repo *repository.PostgresRepository, hub *services.Hu
 
 // buildExamStatusEvent formats an SSE data payload string for a given exam and state.
 func buildExamStatusEvent(examID int, phase string) string {
-	return fmt.Sprintf("event: exam-status\nid: %d\ndata: {\"exam_id\":%d,\"effective_state\":\"%s\",\"server_time\":\"%s\"}\n\n",
-		time.Now().UnixMilli(), examID, phase, time.Now().UTC().Format(time.RFC3339))
+	return fmt.Sprintf("event: exam-status\nid: %d\ndata: {\"exam_id\":%q,\"effective_state\":\"%s\",\"server_time\":\"%s\"}\n\n",
+		time.Now().UnixMilli(), publicid.Encode(publicid.TypeExam, examID), phase, time.Now().UTC().Format(time.RFC3339))
 }
 
 func (ctrl *LecturerController) SetStudentImportService(importService *services.StudentImportService) {
@@ -88,21 +90,22 @@ func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
 	resp := make([]LecturerExaminationResponse, 0, len(exams))
 	for _, e := range exams {
 		resp = append(resp, LecturerExaminationResponse{
-			ID:               e.ID,
-			Title:            e.Title,
-			IsActive:         e.IsActive,
-			CreatedBy:        e.CreatedBy,
-			CreatedAt:        e.CreatedAt,
-			ActivatedAt:      e.ActivatedAt,
-			ArchivedAt:       e.ArchivedAt,
-			ScheduledStartAt: e.ScheduledStartAt,
-			ScheduledEndAt:   e.ScheduledEndAt,
-			EffectiveState:   repository.ExaminationEffectiveState(e).Phase,
-			Introduction:     e.Introduction,
-			CurriculumSchema: e.CurriculumSchema,
-			QuestionCount:    e.QuestionCount,
-			TotalPoints:      e.TotalPoints,
-			UncapturedCount:  e.UncapturedCount,
+			ID:                      e.ID,
+			Title:                   e.Title,
+			IsActive:                e.IsActive,
+			CreatedBy:               e.CreatedBy,
+			CreatedAt:               e.CreatedAt,
+			ActivatedAt:             e.ActivatedAt,
+			ArchivedAt:              e.ArchivedAt,
+			ScheduledStartAt:        e.ScheduledStartAt,
+			ScheduledEndAt:          e.ScheduledEndAt,
+			BlockPracticeDuringExam: e.BlockPracticeDuringExam,
+			EffectiveState:          repository.ExaminationEffectiveState(e).Phase,
+			Introduction:            e.Introduction,
+			CurriculumSchema:        e.CurriculumSchema,
+			QuestionCount:           e.QuestionCount,
+			TotalPoints:             e.TotalPoints,
+			UncapturedCount:         e.UncapturedCount,
 		})
 	}
 	c.JSON(http.StatusOK, resp)
@@ -127,14 +130,12 @@ func (ctrl *LecturerController) CreateExamination(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"message": "Examination created successfully", "id": id})
+	c.JSON(http.StatusCreated, gin.H{"message": "Examination created successfully", "id": publicid.Encode(publicid.TypeExam, id)})
 }
 
 func (ctrl *LecturerController) ActivateExamination(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -182,10 +183,8 @@ func (ctrl *LecturerController) ActivateExamination(c *gin.Context) {
 }
 
 func (ctrl *LecturerController) DeactivateExamination(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -217,10 +216,8 @@ func (ctrl *LecturerController) DeactivateExamination(c *gin.Context) {
 // RenameExamination handles PUT /api/v1/lecturer/exams/:id
 // Renames an examination. Allowed regardless of active state.
 func (ctrl *LecturerController) RenameExamination(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -254,10 +251,8 @@ func (ctrl *LecturerController) RenameExamination(c *gin.Context) {
 // Permanently deletes an examination and all dependents (submissions, enrollments,
 // intro images, questions, sandbox schema). Requires the exam to be inactive first.
 func (ctrl *LecturerController) DeleteExamination(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -293,10 +288,8 @@ func (ctrl *LecturerController) DeleteExamination(c *gin.Context) {
 // on, student practice is blocked while this exam is active (the optional focus
 // rule); when off (default), practice stays live during the exam.
 func (ctrl *LecturerController) SetPracticeFreeze(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -318,10 +311,8 @@ func (ctrl *LecturerController) SetPracticeFreeze(c *gin.Context) {
 }
 
 func (ctrl *LecturerController) GetExamRoster(c *gin.Context) {
-	idStr := c.Param("id")
-	examID, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 	students, err := ctrl.repo.GetExamRoster(c.Request.Context(), examID)
@@ -333,16 +324,12 @@ func (ctrl *LecturerController) GetExamRoster(c *gin.Context) {
 }
 
 func (ctrl *LecturerController) RemoveStudentFromExam(c *gin.Context) {
-	idStr := c.Param("id")
-	examID, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
-	studentIdStr := c.Param("studentId")
-	studentID, err := strconv.Atoi(studentIdStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid student id"})
+	studentID, ok := idParam(c, "studentId", publicid.TypeUser)
+	if !ok {
 		return
 	}
 	if err := ctrl.repo.RemoveStudentFromExam(c.Request.Context(), examID, studentID); err != nil {
@@ -353,10 +340,8 @@ func (ctrl *LecturerController) RemoveStudentFromExam(c *gin.Context) {
 }
 
 func (ctrl *LecturerController) AssignStudents(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -366,7 +351,12 @@ func (ctrl *LecturerController) AssignStudents(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.repo.AddStudentsToExam(c.Request.Context(), id, req.StudentIDs); err != nil {
+	studentIDs := make([]int, len(req.StudentIDs))
+	for i, sid := range req.StudentIDs {
+		studentIDs[i] = int(sid)
+	}
+
+	if err := ctrl.repo.AddStudentsToExam(c.Request.Context(), id, studentIDs); err != nil {
 		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
 		return
 	}
@@ -411,10 +401,8 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 }
 
 func (ctrl *LecturerController) ListSubmissions(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -428,10 +416,8 @@ func (ctrl *LecturerController) ListSubmissions(c *gin.Context) {
 }
 
 func (ctrl *LecturerController) GetExamQuestions(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -469,10 +455,10 @@ func (ctrl *LecturerController) DeleteQuestion(c *gin.Context) {
 // existing 'public' behaviour byte-for-byte.
 func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	var req struct {
-		Type        string `json:"type"`
-		TargetTable string `json:"target_table"`
-		CorrectSQL  string `json:"correct_sql"`
-		ExamID      int    `json:"exam_id"` // optional; 0 = use public schema
+		Type        string        `json:"type"`
+		TargetTable string        `json:"target_table"`
+		CorrectSQL  string        `json:"correct_sql"`
+		ExamID      models.ExamID `json:"exam_id"` // optional; 0 = use public schema
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -483,7 +469,7 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		return
 	}
 
-	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, req.ExamID)
+	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID))
 	if err != nil {
 		// Surface engine errors with status='error' so the frontend can render
 		// the message inline (this is expected during authoring).
@@ -512,9 +498,8 @@ func (ctrl *LecturerController) ImportExamCurriculum(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	lecturer := userVal.(models.User)
 
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -531,7 +516,7 @@ func (ctrl *LecturerController) ImportExamCurriculum(c *gin.Context) {
 	confirmReplace := c.Query("confirm_replace") == "true"
 
 	if err := ctrl.repo.ImportSchemaIntoExamCurriculum(
-		c.Request.Context(), id, req.SQL, lecturer.ID, confirmReplace,
+		c.Request.Context(), id, req.SQL, int(lecturer.ID), confirmReplace,
 	); err != nil {
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
@@ -563,7 +548,7 @@ func (ctrl *LecturerController) ImportSchema(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	lecturer := userVal.(models.User)
 
-	if err := ctrl.repo.ExecuteSchemaScript(c.Request.Context(), req.SQL, lecturer.ID); err != nil {
+	if err := ctrl.repo.ExecuteSchemaScript(c.Request.Context(), req.SQL, int(lecturer.ID)); err != nil {
 		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
 		return
 	}
@@ -599,7 +584,7 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 		return
 	}
 
-	report, err := ctrl.importService.Import(c.Request.Context(), lecturer.ID, rows)
+	report, err := ctrl.importService.Import(c.Request.Context(), int(lecturer.ID), rows)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -621,10 +606,8 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 // SetExamIntroduction handles PUT /api/v1/lecturer/exams/:id/introduction
 // Persists a lecturer-authored description for the exam's curriculum page.
 func (ctrl *LecturerController) SetExamIntroduction(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -668,6 +651,18 @@ func (ctrl *LecturerController) GetConsolidatedScores(c *gin.Context) {
 	c.JSON(http.StatusOK, scores)
 }
 
+// GetPracticeResults handles GET /api/v1/lecturer/practice/results, returning
+// one row per student/question pair with at least one practice attempt
+// (ARCH-006). No pagination, no request params.
+func (ctrl *LecturerController) GetPracticeResults(c *gin.Context) {
+	rows, err := ctrl.repo.GetLecturerPracticeResults(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
 // ─── Exam Intro Images (staff mutations) ─────────────────────────────────────
 
 // UploadExamIntroImage handles POST /api/v1/lecturer/exams/:id/intro-images
@@ -675,9 +670,8 @@ func (ctrl *LecturerController) GetConsolidatedScores(c *gin.Context) {
 // magic bytes, enforces per-file (5 MB) and aggregate (25 MB) size limits, and
 // inserts the image. Returns the inserted metadata row (201).
 func (ctrl *LecturerController) UploadExamIntroImage(c *gin.Context) {
-	examID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -743,14 +737,12 @@ func (ctrl *LecturerController) UploadExamIntroImage(c *gin.Context) {
 // DeleteExamIntroImage handles DELETE /api/v1/lecturer/exams/:id/intro-images/:imageId
 // Removes a single intro image from an examination. Returns 204 on success.
 func (ctrl *LecturerController) DeleteExamIntroImage(c *gin.Context) {
-	examID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
-	imgID, err := strconv.Atoi(c.Param("imageId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image id"})
+	imgID, ok := idParam(c, "imageId", publicid.TypeImage)
+	if !ok {
 		return
 	}
 
@@ -769,16 +761,15 @@ func (ctrl *LecturerController) DeleteExamIntroImage(c *gin.Context) {
 // ReorderExamIntroImages handles PUT /api/v1/lecturer/exams/:id/intro-images/order
 // Accepts {"order":[{"id":1,"sort_order":0},…]} and applies the new ordering.
 func (ctrl *LecturerController) ReorderExamIntroImages(c *gin.Context) {
-	examID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
 	var req struct {
 		Order []struct {
-			ID        int `json:"id"`
-			SortOrder int `json:"sort_order"`
+			ID        models.ImageID `json:"id"`
+			SortOrder int            `json:"sort_order"`
 		} `json:"order"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -788,7 +779,7 @@ func (ctrl *LecturerController) ReorderExamIntroImages(c *gin.Context) {
 
 	order := make([]struct{ ID, SortOrder int }, len(req.Order))
 	for i, item := range req.Order {
-		order[i] = struct{ ID, SortOrder int }{item.ID, item.SortOrder}
+		order[i] = struct{ ID, SortOrder int }{int(item.ID), item.SortOrder}
 	}
 
 	if err := ctrl.repo.ReorderExamIntroImages(c.Request.Context(), examID, order); err != nil {
@@ -798,4 +789,3 @@ func (ctrl *LecturerController) ReorderExamIntroImages(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Order updated"})
 }
-

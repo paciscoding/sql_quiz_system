@@ -44,7 +44,7 @@ interface PreviewResult {
 }
 
 interface Examination {
-  id: number
+  id: string
   title: string
   is_active: boolean
   effective_state: string
@@ -81,7 +81,7 @@ const examIntro = ref<ExamIntroduction | null>(null)
 const examIntroLoading = ref(false)
 const examIntroImages = ref<IntroImageMetadata[]>([])
 
-async function fetchExamIntro(examId: number) {
+async function fetchExamIntro(examId: string) {
   examIntroLoading.value = true
   try {
     const [intro, imgs] = await Promise.all([

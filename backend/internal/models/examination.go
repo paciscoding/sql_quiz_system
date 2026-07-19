@@ -3,10 +3,10 @@ package models
 import "time"
 
 type Examination struct {
-	ID               int        `json:"id"`
+	ID               ExamID     `json:"id"`
 	Title            string     `json:"title"`
 	IsActive         bool       `json:"is_active"`
-	CreatedBy        int        `json:"created_by"`
+	CreatedBy        UserID     `json:"created_by"`
 	CreatedAt        time.Time  `json:"created_at"`
 	ActivatedAt      *time.Time `json:"activated_at,omitempty"`
 	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
@@ -31,12 +31,12 @@ type Examination struct {
 }
 
 type ExamStudentRequest struct {
-	StudentIDs []int `json:"student_ids"`
+	StudentIDs []UserID `json:"student_ids"`
 }
 
 // RosterStudent represents a student enrolled in an exam, as returned by GetExamRoster.
 type RosterStudent struct {
-	StudentID     int       `json:"student_id"`
+	StudentID     UserID    `json:"student_id"`
 	Username      string    `json:"username"`
 	StudentNumber string    `json:"student_number"`
 	FirstName     string    `json:"first_name"`

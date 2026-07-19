@@ -17,7 +17,7 @@ type EffectiveState = 'inactive' | 'scheduled' | 'active' | 'ended'
  * student poll crossing scheduled_start_at fires the server-side lazy trigger
  * which broadcasts to all open SSE connections).
  */
-export function useExamStream(examId: Ref<number | null>) {
+export function useExamStream(examId: Ref<string | null>) {
   const effectiveState = ref<EffectiveState>('inactive')
   const connected = ref(false)
 
@@ -40,7 +40,7 @@ export function useExamStream(examId: Ref<number | null>) {
     clearPoll()
   }
 
-  async function pollExamStatus(id: number) {
+  async function pollExamStatus(id: string) {
     if (effectiveState.value === 'active' || effectiveState.value === 'ended') {
       clearPoll()
       return
@@ -52,7 +52,7 @@ export function useExamStream(examId: Ref<number | null>) {
       })
       if (!resp.ok) return
       const exams = await resp.json()
-      const exam = Array.isArray(exams) ? exams.find((e: { id: number }) => e.id === id) : null
+      const exam = Array.isArray(exams) ? exams.find((e: { id: string }) => e.id === id) : null
       if (exam && (exam.effective_state === 'active' || exam.effective_state === 'ended')) {
         effectiveState.value = exam.effective_state as EffectiveState
         clearPoll()
@@ -62,7 +62,7 @@ export function useExamStream(examId: Ref<number | null>) {
     }
   }
 
-  function startPoll(id: number) {
+  function startPoll(id: string) {
     clearPoll()
     // Only poll while in a waiting state
     if (effectiveState.value === 'inactive' || effectiveState.value === 'scheduled') {
@@ -72,7 +72,7 @@ export function useExamStream(examId: Ref<number | null>) {
     }
   }
 
-  function openStream(id: number) {
+  function openStream(id: string) {
     closeStream()
     const token = localStorage.getItem('sql_quiz_token') ?? ''
     const url = `/api/v1/quiz/exams/${id}/stream?access_token=${encodeURIComponent(token)}`

@@ -147,10 +147,46 @@ const groupedQuestions = computed(() => {
   return groups
 })
 
+// Same grouping as groupedQuestions but uncapped, so every question can be
+// assigned a stable category-relative ordinal (ARCH-009). Iteration order
+// matches groupedQuestions, so the first 5 entries of each group are
+// identical between the two — the visible list's ordinals never change.
+const questionsByCategoryFull = computed(() => {
+  const groups: Record<string, PracticeQuestion[]> = {}
+  questions.value.forEach(q => {
+    const key = categoryNameFor(q)
+    if (!groups[key]) {
+      groups[key] = []
+    }
+    groups[key].push(q)
+  })
+  return groups
+})
+
+// questionLabel returns the title when set, else a '#N' ordinal that is
+// relative to the question's position within its category group — never the
+// raw opaque id/token.
+const questionLabel = (q: PracticeQuestion): string => {
+  if (q.title) return q.title
+  const group = questionsByCategoryFull.value[categoryNameFor(q)] || []
+  const idx = group.findIndex(item => item.id === q.id)
+  return '#' + (idx >= 0 ? idx + 1 : 1)
+}
+
+// Client-side id -> label map, used to give Attempt History rows a question
+// identity (attempts only carry practice_question_id, an opaque token).
+const questionLabelMap = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {}
+  Object.values(questionsByCategoryFull.value).forEach(group => {
+    group.forEach(q => { map[q.id] = questionLabel(q) })
+  })
+  return map
+})
+
 // --- Per-category Introduction panel ---
 // categoryIntroCache maps category_id -> fetched intro (avoids re-fetching)
-const categoryIntroCache = ref<Record<number, CategoryIntroduction>>({})
-const activeCategoryIntroId = ref<number | null>(null)
+const categoryIntroCache = ref<Record<string, CategoryIntroduction>>({})
+const activeCategoryIntroId = ref<string | null>(null)
 const catIntroImages = ref<IntroImageMetadata[]>([])
 
 const activeIntro = computed<CategoryIntroduction | null>(() =>
@@ -243,7 +279,7 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
               @click="selectQuestion(q)"
             >
               <div class="question-item-header">
-                <span class="q-id">#{{ q.id }}</span>
+                <span class="q-id">{{ questionLabel(q) }}</span>
                 <span class="badge" :class="q.question_type === 'QUERY' ? 'badge-info' : 'badge-warning'">
                   {{ q.question_type }}
                 </span>
@@ -371,6 +407,7 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
       <div v-if="!attemptsCollapsed" class="attempts-list">
         <div v-for="a in attempts" :key="a.id" class="attempt-item">
           <div class="attempt-main">
+            <span class="attempt-question">{{ questionLabelMap[a.practice_question_id] || 'Unknown question' }}</span>
             <code class="attempt-sql">{{ truncate(a.sql_text, 80) }}</code>
             <span class="badge" :class="a.is_correct ? 'badge-success' : 'badge-warning'">
               {{ a.is_correct ? 'Correct' : 'Incorrect' }}
@@ -628,6 +665,12 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
   justify-content: space-between;
   gap: var(--space-3);
   margin-bottom: 4px;
+}
+
+.attempt-question {
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: var(--color-text);
 }
 
 .attempt-sql {

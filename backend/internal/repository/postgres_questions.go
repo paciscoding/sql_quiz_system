@@ -22,7 +22,7 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 
 	// Pre-flight: Check if exam is active
 	if q.ExamID != nil {
-		exam, err := r.GetExamByID(ctx, *q.ExamID)
+		exam, err := r.GetExamByID(ctx, int(*q.ExamID))
 		if err == nil && exam.IsActive {
 			return 0, fmt.Errorf("%w: cannot modify questions of an active examination", ErrExamActive)
 		}

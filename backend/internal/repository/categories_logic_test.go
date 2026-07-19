@@ -17,10 +17,10 @@ func TestPracticeCategorySchemaName(t *testing.T) {
 // always read public (byte-for-byte historic behavior), while practice questions
 // (ExamID == nil) read their category schema, with public as the empty fallback.
 func TestQuerySchemaFor(t *testing.T) {
-	examID := 7
+	examID := models.ExamID(7)
 	cases := []struct {
 		name    string
-		examID  *int
+		examID  *models.ExamID
 		sandbox string
 		want    string
 	}{

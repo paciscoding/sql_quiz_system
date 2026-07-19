@@ -61,12 +61,12 @@ const toggleCategoryPanel = async () => {
     categoryPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 }
-const importCategoryId = ref<number | null>(null)
+const importCategoryId = ref<string | null>(null)
 const importSql = ref('')
 
 // Per-category introduction editor state (keyed by category id)
-const categoryIntroEdits = ref<Record<number, string>>({})
-const categoryIntroSaving = ref<Record<number, boolean>>({})
+const categoryIntroEdits = ref<Record<string, string>>({})
+const categoryIntroSaving = ref<Record<string, boolean>>({})
 
 // Pre-populate introduction edits from the loaded category list
 watch(categories, (cats) => {
@@ -89,8 +89,8 @@ const saveCategoryIntro = async (cat: PracticeCategory) => {
   }
 }
 
-const categoryNameById = computed<Record<number, string>>(() => {
-  const map: Record<number, string> = {}
+const categoryNameById = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {}
   categories.value.forEach(c => { map[c.id] = c.name })
   return map
 })
@@ -185,7 +185,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
   }
 })
 
-const { inFlight: deleteQuestionLoading, run: handleDelete } = useSingleFlight(async (id: number) => {
+const { inFlight: deleteQuestionLoading, run: handleDelete } = useSingleFlight(async (id: string) => {
   const ok = await confirm({ title: 'Delete this practice question?', body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
   if (!ok) return
   try {
@@ -360,6 +360,7 @@ onMounted(() => {
         <thead>
           <tr>
             <th>ID</th>
+            <th>Title</th>
             <th>Category</th>
             <th>Requirement</th>
             <th>Type</th>
@@ -371,6 +372,7 @@ onMounted(() => {
         <tbody>
           <tr v-for="q in questions" :key="q.id">
             <td>{{ q.id }}</td>
+            <td>{{ q.title || '—' }}</td>
             <td style="font-weight: 700; font-size: 0.8rem;">{{ q.category_name || categoryNameById[q.category_id] || q.category }}</td>
             <td>{{ q.requirement }}</td>
             <td>
@@ -509,7 +511,7 @@ onMounted(() => {
         <div class="field">
           <label>Category</label>
           <div style="display: flex; gap: var(--space-2); align-items: center;">
-            <select v-model.number="form.category_id" class="input" style="flex: 1;">
+            <select v-model="form.category_id" class="input" style="flex: 1;">
               <option v-if="categories.length === 0" :value="undefined" disabled>No categories — create one</option>
               <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
             </select>
@@ -524,6 +526,10 @@ onMounted(() => {
             <option value="QUERY">QUERY</option>
             <option value="DML">DML</option>
           </select>
+        </div>
+        <div class="field">
+          <label>Title <span class="muted">(optional — shown to students instead of a category ordinal)</span></label>
+          <input v-model="form.title" class="input" placeholder="e.g. Employees hired after 2020" />
         </div>
         <div class="field">
           <label>Target Table (DML only)</label>

@@ -93,7 +93,7 @@ func mkUserWithEmail(t *testing.T, repo *repository.PostgresRepository, role mod
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	return models.User{ID: id, Username: username, Role: role, Email: emailPtr}
+	return models.User{ID: models.UserID(id), Username: username, Role: role, Email: emailPtr}
 }
 
 // TestPerformForgotReset_HappyPath proves the ASYNC worker (invoked directly, so
@@ -109,9 +109,9 @@ func TestPerformForgotReset_HappyPath(t *testing.T) {
 
 	user := mkUserWithEmail(t, repo, models.RoleLecturer, "oldpw", "student@example.com")
 	// Carry the email through, as the verify step would.
-	full, _ := repo.GetUserByID(ctx, user.ID)
+	full, _ := repo.GetUserByID(ctx, int(user.ID))
 
-	beforeVersion, _ := repo.GetTokenVersion(ctx, user.ID)
+	beforeVersion, _ := repo.GetTokenVersion(ctx, int(user.ID))
 
 	auth.performForgotReset(ctx, full)
 
@@ -123,7 +123,7 @@ func TestPerformForgotReset_HappyPath(t *testing.T) {
 		t.Fatalf("expected email to the user's address, got %q", sent.to)
 	}
 	// New password must actually be the one emailed and must log in.
-	updated, err := repo.GetUserByID(ctx, user.ID)
+	updated, err := repo.GetUserByID(ctx, int(user.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,12 +134,12 @@ func TestPerformForgotReset_HappyPath(t *testing.T) {
 		t.Fatalf("old password should no longer validate")
 	}
 	// token_version bumped → old sessions evicted.
-	afterVersion, _ := repo.GetTokenVersion(ctx, user.ID)
+	afterVersion, _ := repo.GetTokenVersion(ctx, int(user.ID))
 	if afterVersion != beforeVersion+1 {
 		t.Fatalf("expected token_version %d, got %d", beforeVersion+1, afterVersion)
 	}
 	// forgot_reset event written and decryptable (key IS configured here).
-	_, events, err := auth.GetPasswordEventsView(ctx, user, user.ID)
+	_, events, err := auth.GetPasswordEventsView(ctx, user, int(user.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestPerformForgotReset_NoEmail_NoSend(t *testing.T) {
 	auth.SetEmailSender(sender)
 
 	user := mkUserWithEmail(t, repo, models.RoleLecturer, "oldpw", "")
-	full, _ := repo.GetUserByID(ctx, user.ID)
+	full, _ := repo.GetUserByID(ctx, int(user.ID))
 
 	auth.performForgotReset(ctx, full)
 	if sender.count() != 0 {
@@ -189,7 +189,7 @@ func TestForgotPassword_StoresHashedOTP(t *testing.T) {
 		t.Fatalf("expected a %d-digit code, got %q", ResetOTPLength, otp)
 	}
 
-	hash, expiresAt, attempts, err := repo.GetResetOTP(ctx, user.ID)
+	hash, expiresAt, attempts, err := repo.GetResetOTP(ctx, int(user.ID))
 	if err != nil {
 		t.Fatalf("GetResetOTP: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestForgotPassword_EmailsCodeNotPassword(t *testing.T) {
 		t.Fatalf("expected the code emailed to the user's address, got %q", sent.to)
 	}
 	// The emailed code matches the stored hash.
-	hash, _, _, err := repo.GetResetOTP(ctx, user.ID)
+	hash, _, _, err := repo.GetResetOTP(ctx, int(user.ID))
 	if err != nil || hash == nil {
 		t.Fatalf("GetResetOTP: hash=%v err=%v", hash, err)
 	}
@@ -242,7 +242,7 @@ func TestForgotPassword_EmailsCodeNotPassword(t *testing.T) {
 	if sender.count() != 0 {
 		t.Fatalf("step 1 must not send a credential email, got %d", sender.count())
 	}
-	updated, _ := repo.GetUserByID(ctx, user.ID)
+	updated, _ := repo.GetUserByID(ctx, int(user.ID))
 	if err := bcrypt.CompareHashAndPassword([]byte(updated.Password), []byte("oldpw")); err != nil {
 		t.Fatalf("password must be unchanged at step 1")
 	}
@@ -261,7 +261,7 @@ func TestVerifyForgotPassword_HappyPath(t *testing.T) {
 	auth.SetEmailSender(sender)
 
 	user := mkUserWithEmail(t, repo, models.RoleLecturer, "oldpw", "student@example.com")
-	beforeVersion, _ := repo.GetTokenVersion(ctx, user.ID)
+	beforeVersion, _ := repo.GetTokenVersion(ctx, int(user.ID))
 
 	_, otp, ok := auth.beginForgotReset(ctx, user.Username)
 	if !ok {
@@ -273,7 +273,7 @@ func TestVerifyForgotPassword_HappyPath(t *testing.T) {
 		t.Fatalf("verifyResetOTP with the correct code: %v", err)
 	}
 	// The code is cleared synchronously → replay fails.
-	if hash, _, _, err := repo.GetResetOTP(ctx, user.ID); err != nil || hash != nil {
+	if hash, _, _, err := repo.GetResetOTP(ctx, int(user.ID)); err != nil || hash != nil {
 		t.Fatalf("expected the code cleared after success, hash=%v err=%v", hash, err)
 	}
 	if _, err := auth.verifyResetOTP(ctx, user.Username, otp); !errors.Is(err, ErrInvalidResetCode) {
@@ -287,14 +287,14 @@ func TestVerifyForgotPassword_HappyPath(t *testing.T) {
 		t.Fatalf("expected exactly one credential email, got %d", sender.count())
 	}
 	sent := sender.calls[0]
-	updated, _ := repo.GetUserByID(ctx, user.ID)
+	updated, _ := repo.GetUserByID(ctx, int(user.ID))
 	if err := bcrypt.CompareHashAndPassword([]byte(updated.Password), []byte(sent.password)); err != nil {
 		t.Fatalf("emailed password does not validate against stored hash: %v", err)
 	}
-	if afterVersion, _ := repo.GetTokenVersion(ctx, user.ID); afterVersion != beforeVersion+1 {
+	if afterVersion, _ := repo.GetTokenVersion(ctx, int(user.ID)); afterVersion != beforeVersion+1 {
 		t.Fatalf("expected token_version bumped to %d, got %d", beforeVersion+1, afterVersion)
 	}
-	_, events, err := auth.GetPasswordEventsView(ctx, user, user.ID)
+	_, events, err := auth.GetPasswordEventsView(ctx, user, int(user.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,14 +325,14 @@ func TestVerifyForgotPassword_WrongCode(t *testing.T) {
 	if err := auth.VerifyForgotPassword(ctx, user.Username, wrong); !errors.Is(err, ErrInvalidResetCode) {
 		t.Fatalf("expected ErrInvalidResetCode for a wrong code, got %v", err)
 	}
-	if _, _, attempts, _ := repo.GetResetOTP(ctx, user.ID); attempts != 1 {
+	if _, _, attempts, _ := repo.GetResetOTP(ctx, int(user.ID)); attempts != 1 {
 		t.Fatalf("expected attempts=1 after one wrong guess, got %d", attempts)
 	}
 	// Password untouched, nothing sent.
 	if sender.count() != 0 {
 		t.Fatalf("wrong code must not trigger a credential email")
 	}
-	updated, _ := repo.GetUserByID(ctx, user.ID)
+	updated, _ := repo.GetUserByID(ctx, int(user.ID))
 	if err := bcrypt.CompareHashAndPassword([]byte(updated.Password), []byte("oldpw")); err != nil {
 		t.Fatalf("password must be unchanged after a wrong code")
 	}
@@ -377,7 +377,7 @@ func TestVerifyForgotPassword_ExpiredCode(t *testing.T) {
 
 	// Store a known code with an expiry in the past.
 	otp := "246813"
-	if err := repo.SetResetOTP(ctx, user.ID, hashResetOTP(otp), time.Now().Add(-time.Minute)); err != nil {
+	if err := repo.SetResetOTP(ctx, int(user.ID), hashResetOTP(otp), time.Now().Add(-time.Minute)); err != nil {
 		t.Fatalf("SetResetOTP: %v", err)
 	}
 	if err := auth.VerifyForgotPassword(ctx, user.Username, otp); !errors.Is(err, ErrInvalidResetCode) {
@@ -473,7 +473,7 @@ func TestForgotPassword_ThrottleWithoutKey(t *testing.T) {
 	if sender.count() != 1 {
 		t.Fatalf("expected exactly one send for the single authorized request, got %d", sender.count())
 	}
-	rows, err := repo.GetPasswordEvents(ctx, user.ID)
+	rows, err := repo.GetPasswordEvents(ctx, int(user.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,10 +501,10 @@ func TestForgotPassword_NoEmailOnFile_NoSend(t *testing.T) {
 			sender.codeCount(), sender.count())
 	}
 	// No code stored, password unchanged.
-	if hash, _, _, _ := repo.GetResetOTP(ctx, user.ID); hash != nil {
+	if hash, _, _, _ := repo.GetResetOTP(ctx, int(user.ID)); hash != nil {
 		t.Fatalf("expected no stored code for a no-email user")
 	}
-	updated, _ := repo.GetUserByID(ctx, user.ID)
+	updated, _ := repo.GetUserByID(ctx, int(user.ID))
 	if err := bcrypt.CompareHashAndPassword([]byte(updated.Password), []byte("oldpw")); err != nil {
 		t.Fatalf("password should be unchanged for no-email user")
 	}

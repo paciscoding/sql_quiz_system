@@ -194,7 +194,7 @@ func captureAttemptHandler(out chan<- models.PracticeAttempt) gin.HandlerFunc {
 		// Mirrors PracticeController.Submit: student.ID (from JWT), not req.StudentID
 		attempt := models.PracticeAttempt{
 			StudentID:          student.ID,
-			PracticeQuestionID: req.PracticeQuestionID,
+			PracticeQuestionID: models.PracticeQuestionID(req.PracticeQuestionID),
 			SQLText:            req.SQLText,
 		}
 		out <- attempt

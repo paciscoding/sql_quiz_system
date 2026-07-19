@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 	"github.com/paciscoding/sql-quiz-system/internal/testsupport"
@@ -36,7 +37,7 @@ func mkCtrlUser(t *testing.T, repo *repository.PostgresRepository, role models.R
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	return models.User{ID: id, Username: username, Role: role}
+	return models.User{ID: models.UserID(id), Username: username, Role: role}
 }
 
 func buildAuthRouter(auth *services.AuthService, userCtrl *UserController) *gin.Engine {
@@ -104,12 +105,12 @@ func TestResetPassword_AdminOnly_HTTP(t *testing.T) {
 	lecToken := login(t, r, lecturer.Username, "lecpw")
 
 	// Non-admin → 403.
-	w := do(r, http.MethodPost, fmt.Sprintf("/api/v1/users/%d/reset-password", target.ID), lecToken)
+	w := do(r, http.MethodPost, fmt.Sprintf("/api/v1/users/%s/reset-password", publicid.Encode(publicid.TypeUser, int(target.ID))), lecToken)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for lecturer reset, got %d %s", w.Code, w.Body.String())
 	}
 	// Admin → 200 with generated_password.
-	w = do(r, http.MethodPost, fmt.Sprintf("/api/v1/users/%d/reset-password", target.ID), adminToken)
+	w = do(r, http.MethodPost, fmt.Sprintf("/api/v1/users/%s/reset-password", publicid.Encode(publicid.TypeUser, int(target.ID))), adminToken)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for admin reset, got %d %s", w.Code, w.Body.String())
 	}
@@ -139,17 +140,17 @@ func TestPasswordEvents_AdminOnly_HTTP(t *testing.T) {
 	lecToken := login(t, r, lecturer.Username, "lecpw")
 
 	// Seed an event via a reset.
-	if _, err := auth.ResetPassword(context.Background(), admin, target.ID, false); err != nil {
+	if _, err := auth.ResetPassword(context.Background(), admin, int(target.ID), false); err != nil {
 		t.Fatal(err)
 	}
 
 	// Non-admin → 403.
-	w := do(r, http.MethodGet, fmt.Sprintf("/api/v1/users/%d/password-events", target.ID), lecToken)
+	w := do(r, http.MethodGet, fmt.Sprintf("/api/v1/users/%s/password-events", publicid.Encode(publicid.TypeUser, int(target.ID))), lecToken)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for lecturer changelog, got %d", w.Code)
 	}
 	// Admin → 200, key_configured true, decrypted value present.
-	w = do(r, http.MethodGet, fmt.Sprintf("/api/v1/users/%d/password-events", target.ID), adminToken)
+	w = do(r, http.MethodGet, fmt.Sprintf("/api/v1/users/%s/password-events", publicid.Encode(publicid.TypeUser, int(target.ID))), adminToken)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for admin changelog, got %d %s", w.Code, w.Body.String())
 	}
@@ -192,7 +193,7 @@ func TestTokenInvalidation_HTTP(t *testing.T) {
 	}
 
 	// Admin resets the victim → bumps token_version.
-	w := do(r, http.MethodPost, fmt.Sprintf("/api/v1/users/%d/reset-password", victim.ID), adminToken)
+	w := do(r, http.MethodPost, fmt.Sprintf("/api/v1/users/%s/reset-password", publicid.Encode(publicid.TypeUser, int(victim.ID))), adminToken)
 	if w.Code != http.StatusOK {
 		t.Fatalf("reset failed: %d %s", w.Code, w.Body.String())
 	}

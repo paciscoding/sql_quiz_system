@@ -2,12 +2,12 @@ package controllers
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
 
@@ -76,10 +76,8 @@ func (ctrl *UserController) GetAllUsers(c *gin.Context) {
 }
 
 func (ctrl *UserController) UpdateUser(c *gin.Context) {
-	idStr := c.Param("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+	id, ok := idParam(c, "id", publicid.TypeUser)
+	if !ok {
 		return
 	}
 
@@ -88,7 +86,7 @@ func (ctrl *UserController) UpdateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	u.ID = id
+	u.ID = models.UserID(id)
 
 	if err := ctrl.authService.UpdateUser(c.Request.Context(), u); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -98,10 +96,8 @@ func (ctrl *UserController) UpdateUser(c *gin.Context) {
 }
 
 func (ctrl *UserController) DeleteUser(c *gin.Context) {
-	idStr := c.Param("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+	id, ok := idParam(c, "id", publicid.TypeUser)
+	if !ok {
 		return
 	}
 
@@ -140,7 +136,7 @@ func (ctrl *UserController) CreateAccount(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"id": id, "generated_password": password})
+	c.JSON(http.StatusCreated, gin.H{"id": publicid.Encode(publicid.TypeUser, id), "generated_password": password})
 }
 
 // CreateStudent handles POST /api/v1/students (Admin, Lecturer). It creates or
@@ -166,7 +162,7 @@ func (ctrl *UserController) CreateStudent(c *gin.Context) {
 		return
 	}
 
-	outcome, id, password, err := ctrl.studentService.CreateSingle(c.Request.Context(), creator.ID, services.StudentUpsertInput{
+	outcome, id, password, err := ctrl.studentService.CreateSingle(c.Request.Context(), int(creator.ID), services.StudentUpsertInput{
 		StudentNumber: req.StudentNumber,
 		StudentIDExt:  req.StudentIDExt,
 		SecLec:        req.SecLec,
@@ -184,7 +180,7 @@ func (ctrl *UserController) CreateStudent(c *gin.Context) {
 		return
 	}
 
-	resp := gin.H{"id": id, "created": outcome == "created"}
+	resp := gin.H{"id": publicid.Encode(publicid.TypeUser, id), "created": outcome == "created"}
 	// Only a newly-inserted row has a fresh password (the upsert preserves an
 	// existing student's password on conflict). Log the event + email + reveal it
 	// only in that case.
@@ -246,10 +242,8 @@ func (ctrl *UserController) ResetPassword(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	actor := userVal.(models.User)
 
-	idStr := c.Param("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+	id, ok := idParam(c, "id", publicid.TypeUser)
+	if !ok {
 		return
 	}
 
@@ -273,10 +267,8 @@ func (ctrl *UserController) ResendCredential(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	actor := userVal.(models.User)
 
-	idStr := c.Param("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+	id, ok := idParam(c, "id", publicid.TypeUser)
+	if !ok {
 		return
 	}
 
@@ -296,10 +288,8 @@ func (ctrl *UserController) GetPasswordEvents(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	actor := userVal.(models.User)
 
-	idStr := c.Param("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+	id, ok := idParam(c, "id", publicid.TypeUser)
+	if !ok {
 		return
 	}
 

@@ -80,10 +80,13 @@ func (r *PostgresRepository) ExportSubmissions(ctx context.Context, from, to tim
 func (r *PostgresRepository) ExportPracticeAttempts(ctx context.Context, from, to time.Time) ([]models.PracticeAttemptExportRow, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT a.id, a.student_id, COALESCE(u.username, ''), a.practice_question_id,
+		        COALESCE(pc.name, ''), COALESCE(pq.requirement, ''),
 		        a.is_correct, a.submitted_at, a.sql_text,
 		        COALESCE(a.validation_details::text, '')
 		 FROM app.practice_attempts a
 		 LEFT JOIN app.system_users u ON u.id = a.student_id
+		 LEFT JOIN app.practice_questions pq ON pq.id = a.practice_question_id
+		 LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		 WHERE a.submitted_at > $1 AND a.submitted_at <= $2
 		 ORDER BY a.submitted_at ASC, a.id ASC`,
 		from, to)
@@ -96,6 +99,7 @@ func (r *PostgresRepository) ExportPracticeAttempts(ctx context.Context, from, t
 	for rows.Next() {
 		var row models.PracticeAttemptExportRow
 		if err := rows.Scan(&row.ID, &row.StudentID, &row.Username, &row.PracticeQuestionID,
+			&row.CategoryName, &row.QuestionRequirement,
 			&row.IsCorrect, &row.SubmittedAt, &row.SQLText, &row.ValidationDetails); err != nil {
 			return nil, err
 		}

@@ -80,7 +80,7 @@ func mkCtrlUserWithEmail(t *testing.T, repo *repository.PostgresRepository, role
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	return models.User{ID: id, Username: username, Role: role}
+	return models.User{ID: models.UserID(id), Username: username, Role: role}
 }
 
 // TestVerifyForgotPassword_HTTP proves the public verify endpoint: every
@@ -103,7 +103,7 @@ func TestVerifyForgotPassword_HTTP(t *testing.T) {
 	// Seed a known code directly (the SHA-256 hex hash, as the service stores it).
 	const otp = "135791"
 	sum := sha256.Sum256([]byte(otp))
-	if err := repo.SetResetOTP(context.Background(), user.ID, hex.EncodeToString(sum[:]), time.Now().Add(10*time.Minute)); err != nil {
+	if err := repo.SetResetOTP(context.Background(), int(user.ID), hex.EncodeToString(sum[:]), time.Now().Add(10*time.Minute)); err != nil {
 		t.Fatalf("SetResetOTP: %v", err)
 	}
 

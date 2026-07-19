@@ -73,10 +73,10 @@ import { importExamCurriculum } from '../../services/exam'
 // Shared fixture helpers
 // ---------------------------------------------------------------------------
 
-const EXAM_ID = 42
+const EXAM_ID = 'exam-42'
 
 function makeExam(overrides: Partial<{
-  id: number
+  id: string
   title: string
   is_active: boolean
   effective_state: string
@@ -84,6 +84,7 @@ function makeExam(overrides: Partial<{
   question_count: number
   total_points: number
   introduction: string
+  block_practice_during_exam: boolean
 }> = {}) {
   return {
     id: EXAM_ID,
@@ -98,6 +99,7 @@ function makeExam(overrides: Partial<{
     question_count: 3,
     total_points: 30,
     uncaptured_count: 0,
+    block_practice_during_exam: false,
     ...overrides,
   }
 }
@@ -362,7 +364,7 @@ describe('Router guard — /lecturer/results access control (TODO-LEX-012)', () 
   })
 
   it('redirects STUDENT to /403 when navigating to /lecturer/results', async () => {
-    useAuth().login('student-token', { id: 2, username: 'student1', role: 'STUDENT' })
+    useAuth().login('student-token', { id: '2', username: 'student1', role: 'STUDENT' })
 
     await router.push('/lecturer/results')
 
@@ -371,7 +373,7 @@ describe('Router guard — /lecturer/results access control (TODO-LEX-012)', () 
   })
 
   it('allows LECTURER to reach /lecturer/results (route meta allowedRoles includes LECTURER)', async () => {
-    useAuth().login('lecturer-token', { id: 3, username: 'lecturer1', role: 'LECTURER' })
+    useAuth().login('lecturer-token', { id: '3', username: 'lecturer1', role: 'LECTURER' })
 
     await router.push('/lecturer/results')
 
@@ -380,7 +382,7 @@ describe('Router guard — /lecturer/results access control (TODO-LEX-012)', () 
   })
 
   it('allows ADMIN to reach /lecturer/results (ADMIN wildcard, adminBlocked not set)', async () => {
-    useAuth().login('admin-token', { id: 1, username: 'admin1', role: 'ADMIN' })
+    useAuth().login('admin-token', { id: '1', username: 'admin1', role: 'ADMIN' })
 
     await router.push('/lecturer/results')
 

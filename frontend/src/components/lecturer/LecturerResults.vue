@@ -8,7 +8,7 @@ import Spinner from '../Spinner.vue'
 import { toCsv, downloadCsv } from '../../utils/csv'
 
 interface ConsolidatedScore {
-  student_id: number
+  student_id: string
   username: string
   student_number: string
   first_name: string
@@ -21,10 +21,32 @@ interface ConsolidatedScore {
 }
 
 interface DrillSubmission {
-  student_id: number
+  student_id: string
   question_id: number
   is_correct: boolean
   score: number
+}
+
+// Mirrors backend models.LecturerPracticeResultRow (ARCH-006 frozen DTO).
+// Typed-id fields (student_id, question_id, category_id) are opaque string
+// tokens on the wire — never parsed as numbers.
+interface LecturerPracticeResultRow {
+  student_id: string
+  student_number: string
+  username: string
+  first_name: string
+  last_name: string
+  sec_lec: string
+  sec_lab: string
+  question_id: string
+  category_id: string
+  category_name: string
+  question_title: string
+  requirement: string
+  points: number
+  is_solved: boolean
+  attempt_count: number
+  earned_points: number
 }
 
 // Independent exams list for the drill-down <select>
@@ -123,8 +145,58 @@ const allExamTitles = computed(() => {
   return Array.from(titles).sort()
 })
 
+// --- Practice Breakdown (ARCH-006 / ARCH-007) ---
+const practiceResults = ref<LecturerPracticeResultRow[]>([])
+const loadingPracticeResults = ref(false)
+
+const fetchPracticeResults = async () => {
+  loadingPracticeResults.value = true
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const response = await fetch('/api/v1/lecturer/practice/results', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (response.ok) {
+      practiceResults.value = await response.json()
+    } else {
+      throw await toApiError(response, 'Failed to fetch practice breakdown')
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to fetch practice breakdown' })
+  } finally {
+    loadingPracticeResults.value = false
+  }
+}
+
+// Sorted by student (number, then username), then category, matching the
+// backend's deterministic ORDER BY (ARCH-006).
+const sortedPracticeResults = computed(() => {
+  return [...practiceResults.value].sort((a, b) => {
+    return (a.student_number || '').localeCompare(b.student_number || '')
+      || a.username.localeCompare(b.username)
+      || a.category_name.localeCompare(b.category_name)
+      || a.question_title.localeCompare(b.question_title)
+  })
+})
+
+const PRACTICE_BREAKDOWN_HEADER = [
+  'StudentNumber', 'Username', 'FirstName', 'LastName', 'SecLec', 'SecLab',
+  'Category', 'Question', 'Points', 'Solved', 'Attempts', 'Earned'
+]
+
+const practiceQuestionLabel = (r: LecturerPracticeResultRow) => r.question_title || r.requirement
+
+const exportPracticeBreakdownCSV = () => {
+  const rows = sortedPracticeResults.value.map(r => [
+    r.student_number, r.username, r.first_name, r.last_name, r.sec_lec, r.sec_lab,
+    r.category_name, practiceQuestionLabel(r), r.points.toFixed(2),
+    r.is_solved ? 'Yes' : 'No', r.attempt_count, r.earned_points.toFixed(2)
+  ])
+  downloadCsv('practice_breakdown.csv', toCsv(PRACTICE_BREAKDOWN_HEADER, rows))
+}
+
 // --- Results drill-down ---
-const resultsExamId = ref<number | null>(null)
+const resultsExamId = ref<string | null>(null)
 const drillLoading = ref(false)
 const drillQuestions = ref<any[]>([])
 const drillSubmissions = ref<DrillSubmission[]>([])
@@ -136,7 +208,7 @@ const drillQuestionStats = computed(() => {
     const attempts = subs.length
     const correctStudents = new Set(subs.filter(s => s.is_correct).map(s => s.student_id)).size
     // Average of each distinct student's BEST score (not all attempts)
-    const bestByStudent = new Map<number, number>()
+    const bestByStudent = new Map<string, number>()
     subs.forEach(s => {
       const prev = bestByStudent.get(s.student_id) ?? 0
       bestByStudent.set(s.student_id, Math.max(prev, s.score || 0))
@@ -154,7 +226,7 @@ const drillNotSubmitted = computed(() => {
   return drillRoster.value.filter(s => !submittedIds.has(s.student_id))
 })
 
-async function fetchDrillData(examId: number) {
+async function fetchDrillData(examId: string) {
   drillLoading.value = true
   drillQuestions.value = []
   drillSubmissions.value = []
@@ -196,6 +268,7 @@ watch(resultsExamId, (id) => {
 onMounted(() => {
   fetchExams()
   fetchScores()
+  fetchPracticeResults()
 })
 </script>
 
@@ -206,13 +279,14 @@ onMounted(() => {
       <div class="export-actions">
         <button @click="exportExamCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Exam Scores (CSV)</button>
         <button @click="exportPracticeCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Practice Scores (CSV)</button>
+        <button @click="exportPracticeBreakdownCSV" class="secondary-btn" style="margin: 0;" :disabled="practiceResults.length === 0">Export Practice Breakdown (CSV)</button>
       </div>
     </div>
 
     <!-- Exam filter for drill-down -->
     <div class="input-group" style="max-width: 400px;">
       <label>View:</label>
-      <select v-model.number="resultsExamId">
+      <select v-model="resultsExamId">
         <option :value="null">All exams (consolidated)</option>
         <option v-for="e in exams" :key="e.id" :value="e.id">{{ e.title }} (ID: {{ e.id }})</option>
       </select>
@@ -316,6 +390,45 @@ onMounted(() => {
         </div>
       </template>
     </template>
+
+    <!-- Practice Breakdown: per-student/per-question practice results (ARCH-007) -->
+    <div style="margin-top: var(--space-4);">
+      <h3 style="margin-bottom: var(--space-2);">Practice Breakdown</h3>
+      <Skeleton v-if="loadingPracticeResults" variant="table-row" :rows="5" :cols="6" />
+      <EmptyState v-else-if="!loadingPracticeResults && practiceResults.length === 0" title="No practice attempts yet" body="Once students attempt practice questions, their per-question breakdown appears here." />
+      <div v-else class="preview-table-wrap sticky-table-head">
+        <table class="preview-table">
+          <thead>
+            <tr>
+              <th>Std #</th>
+              <th>Username</th>
+              <th>Name</th>
+              <th>Sec (Lec/Lab)</th>
+              <th>Category</th>
+              <th>Question</th>
+              <th>Points</th>
+              <th>Solved</th>
+              <th>Attempts</th>
+              <th>Earned</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in sortedPracticeResults" :key="`${r.student_id}-${r.question_id}`">
+              <td>{{ r.student_number || '—' }}</td>
+              <td>{{ r.username }}</td>
+              <td>{{ r.first_name }} {{ r.last_name }}</td>
+              <td>{{ r.sec_lec }} / {{ r.sec_lab }}</td>
+              <td>{{ r.category_name }}</td>
+              <td>{{ practiceQuestionLabel(r) }}</td>
+              <td>{{ r.points.toFixed(2) }}</td>
+              <td>{{ r.is_solved ? 'Yes' : 'No' }}</td>
+              <td>{{ r.attempt_count }}</td>
+              <td style="font-weight: 800;">{{ r.earned_points.toFixed(2) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </template>
 

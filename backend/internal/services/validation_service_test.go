@@ -168,7 +168,7 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 
 	teacherData := []map[string]interface{}{{"id": float64(1)}}
 	teacherJSON, _ := json.Marshal(teacherData)
-	examID := 1
+	examID := models.ExamID(1)
 	question := models.Question{
 		ID:             1,
 		Type:           "QUERY",

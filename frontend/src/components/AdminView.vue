@@ -8,7 +8,6 @@ import { useNotifications } from '../services/notification_service'
 import { handleApiError } from '../services/error_handler'
 import {
   createStaff,
-  addStudent,
   resetPassword,
   resendCredential,
   getPasswordEvents,
@@ -19,6 +18,7 @@ import Spinner from './Spinner.vue'
 import EmptyState from './EmptyState.vue'
 import Skeleton from './Skeleton.vue'
 import BulkImportStudents from './BulkImportStudents.vue'
+import AddStudentForm from './AddStudentForm.vue'
 import EmailReveal from './EmailReveal.vue'
 
 const { notify } = useNotifications()
@@ -30,7 +30,7 @@ const newStaff = ref<{ username: string; role: StaffRole; email: string }>({
   role: 'LECTURER',
   email: '',
 })
-const staffReveal = ref<{ id: number; username: string; email: string; password: string } | null>(null)
+const staffReveal = ref<{ id: string; username: string; email: string; password: string } | null>(null)
 // Inline email preview + real re-send state for the staff credential reveal.
 const showEmailPreview = ref(false)
 const resendNotice = ref('')
@@ -50,24 +50,12 @@ const emailPreview = computed(() => {
   }
 })
 
-// --- Add student (roster fields) — default password = student number ---
-const newStudent = ref({
-  student_number: '',
-  student_id_ext: '',
-  sec_lec: '',
-  sec_lab: '',
-  first_name: '',
-  last_name: '',
-  email: '',
-})
-const studentReveal = ref<{ student_number: string; username: string; email: string; password: string } | null>(null)
-
 // --- Per-user reset-password reveal ---
 const resetReveal = ref<{ username: string; password: string } | null>(null)
 
 // --- Per-user password history ---
 const history = ref<{
-  userId: number
+  userId: string
   username: string
   key_configured: boolean
   events: PasswordEvent[]
@@ -83,14 +71,6 @@ const newStaffForm = useFormValidation({
   username: { rules: [required('Username is required')], initial: '' },
 })
 watch(() => newStaff.value.username, (v) => { newStaffForm.values.username = v })
-
-// Form validation for add student
-const newStudentForm = useFormValidation({
-  student_number: { rules: [required('Student number is required')], initial: '' },
-  student_id_ext: { rules: [required('Student ID is required')], initial: '' },
-})
-watch(() => newStudent.value.student_number, (v) => { newStudentForm.values.student_number = v })
-watch(() => newStudent.value.student_id_ext, (v) => { newStudentForm.values.student_id_ext = v })
 
 async function copyToClipboard(text: string) {
   try {
@@ -157,44 +137,6 @@ const { inFlight: createStaffLoading, run: createStaffAction } = useSingleFlight
   }
 })
 
-const { inFlight: addStudentLoading, run: addStudentAction } = useSingleFlight(async () => {
-  if (!newStudentForm.validateAll()) return
-  try {
-    const { email, ...rosterFields } = newStudent.value
-    const trimmedEmail = email.trim()
-    const res = await addStudent({
-      ...rosterFields,
-      ...(trimmedEmail ? { email: trimmedEmail } : {}),
-    })
-    // Only a newly-created student has a generated password to reveal; an update
-    // preserves the existing password, so there is nothing to show.
-    if (res.created && res.generated_password) {
-      studentReveal.value = {
-        student_number: newStudent.value.student_number,
-        username: newStudent.value.student_id_ext,
-        email: trimmedEmail,
-        password: res.generated_password,
-      }
-    } else {
-      studentReveal.value = null
-    }
-    notify(`Student ${newStudent.value.student_number} ${res.created ? 'created' : 'updated'}.`, 'success')
-    newStudent.value = {
-      student_number: '',
-      student_id_ext: '',
-      sec_lec: '',
-      sec_lab: '',
-      first_name: '',
-      last_name: '',
-      email: '',
-    }
-    newStudentForm.reset()
-    fetchUsers()
-  } catch (err) {
-    handleApiError(err, { fallback: 'Failed to add student' })
-  }
-})
-
 const { inFlight: resetPasswordLoading, run: resetPasswordAction } = useSingleFlight(async (user: any) => {
   const ok = await confirm({
     title: `Reset password for ${user.username}?`,
@@ -230,7 +172,7 @@ function closeHistory() {
   history.value = null
 }
 
-const { inFlight: deleteUserLoading, run: deleteUser } = useSingleFlight(async (id: number) => {
+const { inFlight: deleteUserLoading, run: deleteUser } = useSingleFlight(async (id: string) => {
   const ok = await confirm({ title: 'Delete this user?', body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
   if (!ok) return
   
@@ -457,69 +399,7 @@ onMounted(() => {
           Single student add — identical to a one-row roster import. Login username = Student ID; default password = student number.
         </p>
 
-        <form data-testid="add-student-form" @submit.prevent="addStudentAction" novalidate>
-          <div class="field">
-            <label>Student Number</label>
-            <input class="input" data-testid="student-number" v-model="newStudent.student_number" required
-              :aria-invalid="newStudentForm.touched.student_number && !!newStudentForm.errors.student_number"
-              aria-describedby="err-student-number"
-              @blur="newStudentForm.markTouched('student_number')"
-            />
-            <FieldError :message="newStudentForm.touched.student_number ? newStudentForm.errors.student_number : ''" id="err-student-number" />
-          </div>
-          <div class="field">
-            <label>Student ID <span class="muted">(login username)</span></label>
-            <input class="input" data-testid="student-id-ext" v-model="newStudent.student_id_ext" required
-              :aria-invalid="newStudentForm.touched.student_id_ext && !!newStudentForm.errors.student_id_ext"
-              aria-describedby="err-student-id-ext"
-              @blur="newStudentForm.markTouched('student_id_ext')"
-            />
-            <FieldError :message="newStudentForm.touched.student_id_ext ? newStudentForm.errors.student_id_ext : ''" id="err-student-id-ext" />
-          </div>
-          <div class="field field-row">
-            <div>
-              <label>Lecture Section</label>
-              <input class="input" data-testid="student-sec-lec" v-model="newStudent.sec_lec" />
-            </div>
-            <div>
-              <label>Lab Section</label>
-              <input class="input" data-testid="student-sec-lab" v-model="newStudent.sec_lab" />
-            </div>
-          </div>
-          <div class="field field-row">
-            <div>
-              <label>First Name</label>
-              <input class="input" data-testid="student-first-name" v-model="newStudent.first_name" />
-            </div>
-            <div>
-              <label>Last Name</label>
-              <input class="input" data-testid="student-last-name" v-model="newStudent.last_name" />
-            </div>
-          </div>
-          <div class="field">
-            <label for="student-email-input">Email <span class="muted">(optional)</span></label>
-            <input id="student-email-input" class="input" type="email" data-testid="student-email-input"
-              v-model="newStudent.email" autocomplete="email" placeholder="name@example.com" />
-          </div>
-
-          <button type="submit" class="btn btn-primary" style="width: 100%;" :disabled="addStudentLoading">
-            <Spinner v-if="addStudentLoading" size="sm" inline :invert="true" />{{ addStudentLoading ? 'Adding' : 'Add Student' }}
-          </button>
-        </form>
-
-        <div v-if="studentReveal" data-testid="student-password-reveal" class="reveal-panel">
-          <p class="reveal-title">Login username: <strong>{{ studentReveal.username }}</strong></p>
-          <p class="reveal-title">Generated password (shown once):</p>
-          <code class="reveal-secret">{{ studentReveal.password }}</code>
-          <div class="reveal-actions">
-            <button type="button" class="btn btn-sm" @click="copyToClipboard(studentReveal.password)">Copy</button>
-            <button type="button" class="btn btn-sm" @click="studentReveal = null">Dismiss</button>
-          </div>
-          <p class="reveal-notice">
-            <template v-if="studentReveal.email">✉ Emailed to {{ studentReveal.email }}.</template>
-            <template v-else>No email on file — copy and hand this password to the student.</template>
-          </p>
-        </div>
+        <AddStudentForm @created="fetchUsers" />
       </div>
 
       <!-- Bulk Import -->

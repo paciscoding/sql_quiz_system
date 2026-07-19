@@ -19,10 +19,10 @@ export class ApiError extends Error {
 }
 
 export interface PracticeCategory {
-  id: number
+  id: string
   name: string
   schema_name: string
-  created_by: number
+  created_by: string
   question_count: number
   created_at: string
   updated_at: string
@@ -46,7 +46,7 @@ export interface TableIntrospection {
 }
 
 export interface CategoryIntroduction {
-  category_id: number
+  category_id: string
   category_name: string
   introduction: string
   imported: boolean
@@ -54,11 +54,12 @@ export interface CategoryIntroduction {
 }
 
 export interface PracticeQuestion {
-  id: number
-  created_by: number
-  category_id: number
+  id: string
+  created_by: string
+  category_id: string
   category_name?: string
   category?: string
+  title?: string
   target_table: string
   correct_sql?: string
   question_type: string
@@ -77,9 +78,9 @@ export interface PracticeQuestion {
 }
 
 export interface PracticeAttempt {
-  id: number
-  student_id: number
-  practice_question_id: number
+  id: string
+  student_id: string
+  practice_question_id: string
   sql_text: string
   is_correct: boolean
   validation_details?: any
@@ -87,8 +88,8 @@ export interface PracticeAttempt {
 }
 
 export interface PracticeSummary {
-  question_id: number
-  category_id: number
+  question_id: string
+  category_id: string
   category_name: string
   category: string
   requirement: string
@@ -137,17 +138,17 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
 export const listQuestions = (): Promise<PracticeQuestion[]> =>
   apiFetch('/api/v1/practice/questions')
 
-export const getQuestion = (id: number): Promise<PracticeQuestion> =>
+export const getQuestion = (id: string): Promise<PracticeQuestion> =>
   apiFetch(`/api/v1/practice/questions/${id}`)
 
-export const submit = (practiceQuestionId: number, sqlText: string): Promise<ValidationResult> =>
+export const submit = (practiceQuestionId: string, sqlText: string): Promise<ValidationResult> =>
   apiFetch('/api/v1/practice/submit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ practice_question_id: practiceQuestionId, sql_text: sqlText })
   })
 
-export const preview = (practiceQuestionId: number, sqlText: string): Promise<PreviewResult> =>
+export const preview = (practiceQuestionId: string, sqlText: string): Promise<PreviewResult> =>
   apiFetch('/api/v1/practice/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -170,7 +171,7 @@ export const upsertQuestion = (payload: Partial<PracticeQuestion>): Promise<any>
     body: JSON.stringify(payload)
   })
 
-export const deleteQuestion = (id: number): Promise<void> =>
+export const deleteQuestion = (id: string): Promise<void> =>
   apiFetch(`/api/v1/lecturer/practice/question/${id}`, { method: 'DELETE' })
 
 // --- Practice categories ---
@@ -185,17 +186,17 @@ export const createCategory = (name: string): Promise<PracticeCategory> =>
     body: JSON.stringify({ name })
   })
 
-export const renameCategory = (id: number, name: string): Promise<{ message: string }> =>
+export const renameCategory = (id: string, name: string): Promise<{ message: string }> =>
   apiFetch(`/api/v1/lecturer/practice/categories/${id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name })
   })
 
-export const deleteCategory = (id: number, force = false): Promise<{ message: string }> =>
+export const deleteCategory = (id: string, force = false): Promise<{ message: string }> =>
   apiFetch(`/api/v1/lecturer/practice/categories/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' })
 
-export const importCategorySchema = (id: number, sql: string, confirmReplace = false): Promise<{ message: string }> =>
+export const importCategorySchema = (id: string, sql: string, confirmReplace = false): Promise<{ message: string }> =>
   apiFetch(`/api/v1/lecturer/practice/categories/${id}/import${confirmReplace ? '?confirm_replace=true' : ''}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -211,10 +212,10 @@ export const lecturerPreview = (payload: { type: string; target_table: string; c
 
 // --- Practice category introduction ---
 
-export const getCategoryIntroduction = (id: number): Promise<CategoryIntroduction> =>
+export const getCategoryIntroduction = (id: string): Promise<CategoryIntroduction> =>
   apiFetch(`/api/v1/practice/categories/${id}/introduction`)
 
-export const setCategoryIntroduction = (id: number, text: string): Promise<void> =>
+export const setCategoryIntroduction = (id: string, text: string): Promise<void> =>
   apiFetch(`/api/v1/lecturer/practice/categories/${id}/introduction`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

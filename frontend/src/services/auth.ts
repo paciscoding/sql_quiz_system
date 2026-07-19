@@ -2,7 +2,7 @@ import { reactive, computed } from 'vue'
 import { clearAllSchemaWindowState } from '../utils/schemaWindowState'
 
 export interface AuthUser {
-  id?: number
+  id?: string
   username: string
   role: 'ADMIN' | 'LECTURER' | 'STUDENT'
 }
@@ -31,7 +31,7 @@ export interface CreateStaffRequest {
   email?: string
 }
 export interface CreateStaffResponse {
-  id: number
+  id: string
   generated_password: string
 }
 
@@ -46,7 +46,7 @@ export interface AddStudentRequest {
   email?: string
 }
 export interface AddStudentResponse {
-  id: number
+  id: string
   created: boolean
   /** Server-generated password, present only when a new row was created. */
   generated_password?: string
@@ -152,7 +152,7 @@ export async function verifyForgotPassword(username: string, otp: string): Promi
 }
 
 /** POST /api/v1/users/:id/reset-password — admin-generated new password (shown once). */
-export async function resetPassword(id: number): Promise<ResetPasswordResponse> {
+export async function resetPassword(id: string): Promise<ResetPasswordResponse> {
   const res = await fetch(`/api/v1/users/${id}/reset-password`, {
     method: 'POST',
     headers: authHeaders(),
@@ -165,7 +165,7 @@ export interface ResendCredentialResponse {
 }
 
 /** POST /api/v1/users/:id/resend-credential — re-email the user's current credential. */
-export async function resendCredential(id: number): Promise<ResendCredentialResponse> {
+export async function resendCredential(id: string): Promise<ResendCredentialResponse> {
   const res = await fetch(`/api/v1/users/${id}/resend-credential`, {
     method: 'POST',
     headers: authHeaders(),
@@ -174,7 +174,7 @@ export async function resendCredential(id: number): Promise<ResendCredentialResp
 }
 
 /** GET /api/v1/users/:id/password-events — admin changelog for a user. */
-export async function getPasswordEvents(id: number): Promise<PasswordEventsResponse> {
+export async function getPasswordEvents(id: string): Promise<PasswordEventsResponse> {
   const res = await fetch(`/api/v1/users/${id}/password-events`, {
     headers: authHeaders(),
   })

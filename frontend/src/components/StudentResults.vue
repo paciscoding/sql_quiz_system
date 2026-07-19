@@ -7,7 +7,7 @@ import { handleApiError } from '../services/error_handler'
 import { formatDate, formatRelative } from '../utils/format_date'
 
 interface ExamResult {
-  exam_id: number
+  exam_id: string
   exam_title: string
   is_active: boolean
   question_count: number
@@ -18,7 +18,7 @@ interface ExamResult {
 }
 
 interface PracticeSummary {
-  question_id: number
+  question_id: string
   category: string
   requirement: string
   points: number
@@ -40,7 +40,7 @@ interface QuestionDetail {
 }
 
 interface ExamDetails {
-  exam_id: number
+  exam_id: string
   exam_title: string
   questions: QuestionDetail[]
 }
@@ -89,7 +89,7 @@ const fetchPracticeSummary = async () => {
   }
 }
 
-const fetchExamDetails = async (examId: number) => {
+const fetchExamDetails = async (examId: string) => {
   loadingDetails.value = true
   view.value = 'details'
   const token = localStorage.getItem('sql_quiz_token')

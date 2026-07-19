@@ -180,7 +180,7 @@ func TestSchemaNameHelpers_MutuallyDistinct(t *testing.T) {
 // CurriculumSchema is populated by GetQuestion.
 // ─────────────────────────────────────────────────────────────────────────────
 
-func intPtr(n int) *int { return &n }
+func intPtr(n int) *models.ExamID { id := models.ExamID(n); return &id }
 
 func TestQuerySchemaFor_WithCurriculumSchema(t *testing.T) {
 	cases := []struct {

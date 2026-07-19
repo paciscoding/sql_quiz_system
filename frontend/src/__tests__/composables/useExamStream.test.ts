@@ -111,7 +111,7 @@ describe('useExamStream', () => {
   // (a) Parses SSE 'exam-status' event and exposes effectiveState
   // -------------------------------------------------------------------------
   it('parses exam-status SSE event and updates effectiveState to active', async () => {
-    const examId = ref<number | null>(1)
+    const examId = ref<string | null>('1')
     const { result } = mountWithSetup(() => useExamStream(examId))
 
     // Initial state
@@ -122,28 +122,28 @@ describe('useExamStream', () => {
     es.onopen?.()
     await nextTick()
 
-    es.emit('exam-status', { exam_id: 1, effective_state: 'active', server_time: new Date().toISOString() })
+    es.emit('exam-status', { exam_id: '1', effective_state: 'active', server_time: new Date().toISOString() })
     await nextTick()
 
     expect(result.effectiveState.value).toBe('active')
   })
 
   it('parses exam-status SSE event with scheduled state', async () => {
-    const examId = ref<number | null>(2)
+    const examId = ref<string | null>('2')
     const { result } = mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
     es.onopen?.()
     await nextTick()
 
-    es.emit('exam-status', { exam_id: 2, effective_state: 'scheduled', server_time: new Date().toISOString() })
+    es.emit('exam-status', { exam_id: '2', effective_state: 'scheduled', server_time: new Date().toISOString() })
     await nextTick()
 
     expect(result.effectiveState.value).toBe('scheduled')
   })
 
   it('ignores malformed SSE event data (no throw)', async () => {
-    const examId = ref<number | null>(3)
+    const examId = ref<string | null>('3')
     const { result } = mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
@@ -163,7 +163,7 @@ describe('useExamStream', () => {
   // (b) ~15s fallback poll is set up while waiting and cleared on active
   // -------------------------------------------------------------------------
   it('starts fallback poll after SSE opens and clears it when state becomes active via SSE', async () => {
-    const examId = ref<number | null>(4)
+    const examId = ref<string | null>('4')
     mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
@@ -180,7 +180,7 @@ describe('useExamStream', () => {
     const fetchCallsBefore = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length
 
     // Now SSE fires active — poll should stop
-    es.emit('exam-status', { exam_id: 4, effective_state: 'active', server_time: new Date().toISOString() })
+    es.emit('exam-status', { exam_id: '4', effective_state: 'active', server_time: new Date().toISOString() })
     await nextTick()
 
     // Advance another 15 s — fetch should NOT be called again
@@ -192,10 +192,10 @@ describe('useExamStream', () => {
     // Arrange: fetch will return active exam on first poll
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => [{ id: 5, effective_state: 'active' }],
+      json: async () => [{ id: '5', effective_state: 'active' }],
     })
 
-    const examId = ref<number | null>(5)
+    const examId = ref<string | null>('5')
     const { result } = mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
@@ -217,7 +217,7 @@ describe('useExamStream', () => {
   // (c) close() tears down EventSource and interval
   // -------------------------------------------------------------------------
   it('close() closes the EventSource and stops the fallback poll', async () => {
-    const examId = ref<number | null>(6)
+    const examId = ref<string | null>('6')
     const { result } = mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
@@ -238,7 +238,7 @@ describe('useExamStream', () => {
   })
 
   it('close() on unmount — tears down EventSource', async () => {
-    const examId = ref<number | null>(7)
+    const examId = ref<string | null>('7')
     const { wrapper } = mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
@@ -255,13 +255,13 @@ describe('useExamStream', () => {
   // Changing examId closes old EventSource and opens new one
   // -------------------------------------------------------------------------
   it('changing examId closes old EventSource and opens new one', async () => {
-    const examId = ref<number | null>(8)
+    const examId = ref<string | null>('8')
     mountWithSetup(() => useExamStream(examId))
 
     const firstEs = MockEventSource.last()
     expect(firstEs).toBeDefined()
 
-    examId.value = 9
+    examId.value = '9'
     await nextTick()
 
     const secondEs = MockEventSource.last()
@@ -274,12 +274,12 @@ describe('useExamStream', () => {
   // Setting examId to null closes stream and resets effectiveState
   // -------------------------------------------------------------------------
   it('setting examId to null closes stream and resets state to inactive', async () => {
-    const examId = ref<number | null>(10)
+    const examId = ref<string | null>('10')
     const { result } = mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
     es.onopen?.()
-    es.emit('exam-status', { exam_id: 10, effective_state: 'scheduled' })
+    es.emit('exam-status', { exam_id: '10', effective_state: 'scheduled' })
     await nextTick()
 
     expect(result.effectiveState.value).toBe('scheduled')
@@ -295,7 +295,7 @@ describe('useExamStream', () => {
   // URL contains access_token from localStorage
   // -------------------------------------------------------------------------
   it('opens EventSource with access_token query param from localStorage', async () => {
-    const examId = ref<number | null>(11)
+    const examId = ref<string | null>('11')
     mountWithSetup(() => useExamStream(examId))
 
     const es = MockEventSource.last()
@@ -307,7 +307,7 @@ describe('useExamStream', () => {
   // No interval leak on repeated examId changes
   // -------------------------------------------------------------------------
   it('no interval leak on repeated examId changes — only one poll fires', async () => {
-    const examId = ref<number | null>(12)
+    const examId = ref<string | null>('12')
     mountWithSetup(() => useExamStream(examId))
 
     // Open stream and start poll
@@ -316,7 +316,7 @@ describe('useExamStream', () => {
 
     // Change examId several times rapidly
     for (let id = 13; id <= 16; id++) {
-      examId.value = id
+      examId.value = String(id)
       await nextTick()
       MockEventSource.last().onopen?.()
       await nextTick()

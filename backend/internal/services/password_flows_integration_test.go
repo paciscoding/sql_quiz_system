@@ -43,7 +43,7 @@ func mkUser(t *testing.T, repo *repository.PostgresRepository, role models.Role,
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	return models.User{ID: id, Username: username, Role: role}
+	return models.User{ID: models.UserID(id), Username: username, Role: role}
 }
 
 func findUser(t *testing.T, repo *repository.PostgresRepository, id int) models.User {
@@ -53,7 +53,7 @@ func findUser(t *testing.T, repo *repository.PostgresRepository, id int) models.
 		t.Fatal(err)
 	}
 	for _, u := range users {
-		if u.ID == id {
+		if int(u.ID) == id {
 			return u
 		}
 	}
@@ -90,7 +90,7 @@ func TestParity_SingleVsBulk(t *testing.T) {
 	}
 
 	// Single path.
-	outcome, singleID, singlePw, err := svc.CreateSingle(ctx, admin.ID, in)
+	outcome, singleID, singlePw, err := svc.CreateSingle(ctx, int(admin.ID), in)
 	if err != nil {
 		t.Fatalf("CreateSingle: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestParity_SingleVsBulk(t *testing.T) {
 	}
 
 	// Bulk path — one row, identical fields (including email).
-	report, err := svc.Import(ctx, admin.ID, []ParsedStudentRow{{
+	report, err := svc.Import(ctx, int(admin.ID), []ParsedStudentRow{{
 		RowNumber:     2,
 		StudentNumber: in.StudentNumber,
 		StudentIDExt:  in.StudentIDExt,
@@ -135,7 +135,7 @@ func TestParity_SingleVsBulk(t *testing.T) {
 	for _, u := range users {
 		if u.StudentNumber != nil && *u.StudentNumber == sn {
 			bulkRow = u
-			bulkID = u.ID
+			bulkID = int(u.ID)
 			break
 		}
 	}
@@ -216,7 +216,7 @@ func TestEmailUniqueness_RejectsDuplicateAcrossPaths(t *testing.T) {
 	}
 
 	// A student claiming a staff email → ErrEmailInUse (enforced across paths).
-	if _, _, _, err := svc.CreateSingle(ctx, admin.ID, StudentUpsertInput{
+	if _, _, _, err := svc.CreateSingle(ctx, int(admin.ID), StudentUpsertInput{
 		StudentNumber: fmt.Sprintf("SNU_%d", time.Now().UnixNano()),
 		StudentIDExt:  fmt.Sprintf("SIDU_%d", time.Now().UnixNano()),
 		Email:         email,
@@ -225,7 +225,7 @@ func TestEmailUniqueness_RejectsDuplicateAcrossPaths(t *testing.T) {
 	}
 
 	// Bulk import of a row with that email → skipped as a row error, not created.
-	report, err := svc.Import(ctx, admin.ID, []ParsedStudentRow{{
+	report, err := svc.Import(ctx, int(admin.ID), []ParsedStudentRow{{
 		RowNumber:     1,
 		StudentNumber: fmt.Sprintf("SNB_%d", time.Now().UnixNano()),
 		StudentIDExt:  fmt.Sprintf("SIDB_%d", time.Now().UnixNano()),
@@ -239,13 +239,13 @@ func TestEmailUniqueness_RejectsDuplicateAcrossPaths(t *testing.T) {
 	}
 
 	// A NULL/empty email never collides — many students legitimately have none.
-	if _, _, _, err := svc.CreateSingle(ctx, admin.ID, StudentUpsertInput{
+	if _, _, _, err := svc.CreateSingle(ctx, int(admin.ID), StudentUpsertInput{
 		StudentNumber: fmt.Sprintf("SNN1_%d", time.Now().UnixNano()),
 		StudentIDExt:  fmt.Sprintf("SIDN1_%d", time.Now().UnixNano()),
 	}); err != nil {
 		t.Fatalf("first no-email student: %v", err)
 	}
-	if _, _, _, err := svc.CreateSingle(ctx, admin.ID, StudentUpsertInput{
+	if _, _, _, err := svc.CreateSingle(ctx, int(admin.ID), StudentUpsertInput{
 		StudentNumber: fmt.Sprintf("SNN2_%d", time.Now().UnixNano()),
 		StudentIDExt:  fmt.Sprintf("SIDN2_%d", time.Now().UnixNano()),
 	}); err != nil {
@@ -265,7 +265,7 @@ func TestImport_CreatedAccountsGenerateAndPreserveOnReimport(t *testing.T) {
 		{RowNumber: 2, StudentNumber: base + "_B", StudentIDExt: base + "_BX", FirstName: "B", LastName: "B"},
 	}
 
-	report, err := svc.Import(ctx, admin.ID, rows)
+	report, err := svc.Import(ctx, int(admin.ID), rows)
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestImport_CreatedAccountsGenerateAndPreserveOnReimport(t *testing.T) {
 	}
 
 	// Re-import the SAME roster → all updates, no new passwords, password preserved.
-	report2, err := svc.Import(ctx, admin.ID, rows)
+	report2, err := svc.Import(ctx, int(admin.ID), rows)
 	if err != nil {
 		t.Fatalf("re-Import: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestSeedAdminAccount_GeneratesEmailsAndIsIdempotent(t *testing.T) {
 		t.Fatalf("generated password does not validate: %v", err)
 	}
 	// A create event was written with the generated password.
-	_, events, err := auth.GetPasswordEventsView(ctx, created, created.ID)
+	_, events, err := auth.GetPasswordEventsView(ctx, created, int(created.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestResendCredential_ReSendsCurrentPasswordToStoredEmail(t *testing.T) {
 
 	// A user with no email → clear precondition error, no send.
 	noEmail := mkUser(t, repo, models.RoleLecturer, "x")
-	if _, err := auth.ResendCredential(ctx, admin, noEmail.ID); err == nil {
+	if _, err := auth.ResendCredential(ctx, admin, int(noEmail.ID)); err == nil {
 		t.Fatalf("expected error resending to a user with no email")
 	}
 	if len(spy.credentialCalls) != 2 {
@@ -526,7 +526,7 @@ func TestResetPassword_WritesEventAndReturnsPassword(t *testing.T) {
 	admin := mkUser(t, repo, models.RoleAdmin, "adminpw")
 	target := mkUser(t, repo, models.RoleLecturer, "oldpw")
 
-	newPass, err := auth.ResetPassword(ctx, admin, target.ID, false)
+	newPass, err := auth.ResetPassword(ctx, admin, int(target.ID), false)
 	if err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestResetPassword_WritesEventAndReturnsPassword(t *testing.T) {
 		t.Fatalf("expected generated password, got %q", newPass)
 	}
 	// New password must actually log in.
-	updated, err := repo.GetUserByID(ctx, target.ID)
+	updated, err := repo.GetUserByID(ctx, int(target.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +542,7 @@ func TestResetPassword_WritesEventAndReturnsPassword(t *testing.T) {
 		t.Fatalf("reset password does not validate: %v", err)
 	}
 	// admin_reset event written with the decrypted value == the returned password.
-	keyOK, events, err := auth.GetPasswordEventsView(ctx, admin, target.ID)
+	keyOK, events, err := auth.GetPasswordEventsView(ctx, admin, int(target.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +624,7 @@ func TestSelfChange_WritesEventAndReturnsToken(t *testing.T) {
 		t.Fatalf("fresh token should authenticate: %v", err)
 	}
 	// self_change event recorded with decrypted value.
-	_, events, err := auth.GetPasswordEventsView(ctx, user, user.ID)
+	_, events, err := auth.GetPasswordEventsView(ctx, user, int(user.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -648,14 +648,14 @@ func TestChangelog_KeyNotConfigured_OmitsValues(t *testing.T) {
 	authWithKey := newIntegrationAuth(t, repo)
 	admin := mkUser(t, repo, models.RoleAdmin, "adminpw")
 	target := mkUser(t, repo, models.RoleLecturer, "oldpw")
-	if _, err := authWithKey.ResetPassword(ctx, admin, target.ID, false); err != nil {
+	if _, err := authWithKey.ResetPassword(ctx, admin, int(target.ID), false); err != nil {
 		t.Fatal(err)
 	}
 
 	// AuthService WITHOUT key: changelog omits new_password and reports not configured.
 	os.Unsetenv(PasswordCryptoEnvKey)
 	authNoKey := NewAuthService(repo, "test-jwt-secret-least-32-characters-long")
-	keyOK, events, err := authNoKey.GetPasswordEventsView(ctx, admin, target.ID)
+	keyOK, events, err := authNoKey.GetPasswordEventsView(ctx, admin, int(target.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +689,7 @@ func TestTokenInvalidation_ResetEvictsOldToken(t *testing.T) {
 	}
 
 	// Admin reset bumps token_version.
-	if _, err := auth.ResetPassword(ctx, admin, user.ID, false); err != nil {
+	if _, err := auth.ResetPassword(ctx, admin, int(user.ID), false); err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
 

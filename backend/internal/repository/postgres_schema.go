@@ -984,6 +984,7 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			id SERIAL PRIMARY KEY,
 			created_by INTEGER NOT NULL REFERENCES app.system_users(id),
 			category TEXT NOT NULL DEFAULT 'General',
+			title TEXT,
 			target_table TEXT NOT NULL,
 			correct_sql TEXT NOT NULL,
 			question_type TEXT NOT NULL CHECK (question_type IN ('QUERY','DML')),
@@ -1163,6 +1164,9 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		// not break existing rows (all existing sources remain in the widened set).
 		"ALTER TABLE app.password_events DROP CONSTRAINT IF EXISTS password_events_source_check",
 		"ALTER TABLE app.password_events ADD CONSTRAINT password_events_source_check CHECK (source IN ('create','self_change','admin_reset','forgot_reset'))",
+		// Practice-question display title (2026-07-19). Nullable/optional: existing
+		// rows read back as empty string; the UI falls back to an ordinal when unset.
+		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS title TEXT",
 	}
 
 	for _, q := range extraMigrations {

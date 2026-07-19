@@ -1,7 +1,7 @@
 import { forceLogout } from './session'
 
 export interface IntroImageMetadata {
-  id: number
+  id: string
   owner_id: number
   sort_order: number
   mime_type: 'image/png' | 'image/jpeg'
@@ -11,7 +11,7 @@ export interface IntroImageMetadata {
 }
 
 export interface ReorderEntry {
-  id: number
+  id: string
   sort_order: number
 }
 
@@ -36,18 +36,18 @@ async function schemaFetch(path: string, options: RequestInit = {}): Promise<any
 
 // ─── Category intro-image endpoints ─────────────────────────────────────────
 
-export async function listCategoryIntroImages(catId: number): Promise<IntroImageMetadata[]> {
+export async function listCategoryIntroImages(catId: string): Promise<IntroImageMetadata[]> {
   const data = await schemaFetch(`/api/v1/practice/categories/${catId}/intro-images`)
   return data.images as IntroImageMetadata[]
 }
 
-export async function deleteCategoryIntroImage(catId: number, imgId: number): Promise<void> {
+export async function deleteCategoryIntroImage(catId: string, imgId: string): Promise<void> {
   await schemaFetch(`/api/v1/lecturer/practice/categories/${catId}/intro-images/${imgId}`, {
     method: 'DELETE'
   })
 }
 
-export async function reorderCategoryIntroImages(catId: number, order: ReorderEntry[]): Promise<void> {
+export async function reorderCategoryIntroImages(catId: string, order: ReorderEntry[]): Promise<void> {
   await schemaFetch(`/api/v1/lecturer/practice/categories/${catId}/intro-images/order`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -56,7 +56,7 @@ export async function reorderCategoryIntroImages(catId: number, order: ReorderEn
 }
 
 export function uploadCategoryIntroImage(
-  catId: number,
+  catId: string,
   file: File,
   onProgress?: (pct: number) => void
 ): Promise<IntroImageMetadata> {
@@ -105,18 +105,18 @@ export function uploadCategoryIntroImage(
 
 // ─── Exam intro-image endpoints ──────────────────────────────────────────────
 
-export async function listExamIntroImages(examId: number): Promise<IntroImageMetadata[]> {
+export async function listExamIntroImages(examId: string): Promise<IntroImageMetadata[]> {
   const data = await schemaFetch(`/api/v1/quiz/exams/${examId}/intro-images`)
   return data.images as IntroImageMetadata[]
 }
 
-export async function deleteExamIntroImage(examId: number, imgId: number): Promise<void> {
+export async function deleteExamIntroImage(examId: string, imgId: string): Promise<void> {
   await schemaFetch(`/api/v1/lecturer/exams/${examId}/intro-images/${imgId}`, {
     method: 'DELETE'
   })
 }
 
-export async function reorderExamIntroImages(examId: number, order: ReorderEntry[]): Promise<void> {
+export async function reorderExamIntroImages(examId: string, order: ReorderEntry[]): Promise<void> {
   await schemaFetch(`/api/v1/lecturer/exams/${examId}/intro-images/order`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -125,7 +125,7 @@ export async function reorderExamIntroImages(examId: number, order: ReorderEntry
 }
 
 export function uploadExamIntroImage(
-  examId: number,
+  examId: string,
   file: File,
   onProgress?: (pct: number) => void
 ): Promise<IntroImageMetadata> {
@@ -177,7 +177,7 @@ export function uploadExamIntroImage(
 // bytes then hand an object URL to the img element. The caller is responsible
 // for calling URL.revokeObjectURL when the URL is no longer needed.
 
-export async function categoryImageBlobUrl(catId: number, imgId: number): Promise<string> {
+export async function categoryImageBlobUrl(catId: string, imgId: string): Promise<string> {
   const token = localStorage.getItem('sql_quiz_token')
   const headers: Record<string, string> = {}
   if (token) headers['Authorization'] = `Bearer ${token}`
@@ -189,7 +189,7 @@ export async function categoryImageBlobUrl(catId: number, imgId: number): Promis
   return URL.createObjectURL(blob)
 }
 
-export async function examImageBlobUrl(examId: number, imgId: number): Promise<string> {
+export async function examImageBlobUrl(examId: string, imgId: string): Promise<string> {
   const token = localStorage.getItem('sql_quiz_token')
   const headers: Record<string, string> = {}
   if (token) headers['Authorization'] = `Bearer ${token}`

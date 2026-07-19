@@ -153,8 +153,8 @@ func (r *PostgresRepository) GetConsolidatedScores(ctx context.Context) ([]model
 			return nil, err
 		}
 		s.ExamScores = make(map[string]float64)
-		scoresMap[s.StudentID] = &s
-		studentIDs = append(studentIDs, s.StudentID)
+		scoresMap[int(s.StudentID)] = &s
+		studentIDs = append(studentIDs, int(s.StudentID))
 	}
 
 	if len(studentIDs) == 0 {
@@ -230,6 +230,50 @@ func (r *PostgresRepository) GetConsolidatedScores(ctx context.Context) ([]model
 		result = append(result, *scoresMap[id])
 	}
 	return result, nil
+}
+
+// GetLecturerPracticeResults returns one row per student/question pair that
+// has at least one practice attempt (no pagination, no rows for unattempted
+// pairs), for the lecturer practice-results breakdown (ARCH-006).
+func (r *PostgresRepository) GetLecturerPracticeResults(ctx context.Context) ([]models.LecturerPracticeResultRow, error) {
+	query := `
+		SELECT
+			u.id, COALESCE(u.student_number, ''), u.username, COALESCE(u.first_name, ''),
+			COALESCE(u.last_name, ''), COALESCE(u.sec_lec, ''), COALESCE(u.sec_lab, ''),
+			pq.id, COALESCE(pq.category_id, 0), COALESCE(pc.name, ''),
+			COALESCE(pq.title, ''), pq.requirement, pq.points,
+			bool_or(pa.is_correct) as is_solved,
+			count(pa.id) as attempt_count,
+			CASE WHEN bool_or(pa.is_correct) THEN pq.points ELSE 0 END as earned_points
+		FROM app.practice_attempts pa
+		INNER JOIN app.system_users u ON u.id = pa.student_id
+		INNER JOIN app.practice_questions pq ON pq.id = pa.practice_question_id
+		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
+		GROUP BY u.id, u.student_number, u.username, u.first_name, u.last_name, u.sec_lec, u.sec_lab,
+			pq.id, pq.category_id, pc.name, pq.title, pq.requirement, pq.points
+		ORDER BY u.student_number ASC, u.username ASC, pc.name ASC, pq.id ASC`
+
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []models.LecturerPracticeResultRow
+	for rows.Next() {
+		var row models.LecturerPracticeResultRow
+		err := rows.Scan(
+			&row.StudentID, &row.StudentNumber, &row.Username, &row.FirstName,
+			&row.LastName, &row.SecLec, &row.SecLab,
+			&row.QuestionID, &row.CategoryID, &row.CategoryName,
+			&row.QuestionTitle, &row.Requirement, &row.Points,
+			&row.IsSolved, &row.AttemptCount, &row.EarnedPoints)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
 }
 
 func (r *PostgresRepository) GetPracticeSummary(ctx context.Context, studentID int) ([]models.PracticeSummary, error) {

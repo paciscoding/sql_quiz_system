@@ -85,6 +85,7 @@ func buildPracticeAttemptsCSVGz(rows []models.PracticeAttemptExportRow) ([]byte,
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
 	_ = w.Write([]string{"id", "student_id", "username", "practice_question_id",
+		"category_name", "question_requirement",
 		"is_correct", "submitted_at", "sql_text", "validation_details"})
 	for _, r := range rows {
 		_ = w.Write([]string{
@@ -92,6 +93,8 @@ func buildPracticeAttemptsCSVGz(rows []models.PracticeAttemptExportRow) ([]byte,
 			strconv.Itoa(r.StudentID),
 			r.Username,
 			strconv.Itoa(r.PracticeQuestionID),
+			r.CategoryName,
+			r.QuestionRequirement,
 			strconv.FormatBool(r.IsCorrect),
 			r.SubmittedAt.Format(time.RFC3339),
 			r.SQLText,

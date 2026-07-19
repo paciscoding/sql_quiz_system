@@ -5,29 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
 
 // ExaminationResponse is the outbound exam DTO with the derived effective_state field.
 type ExaminationResponse struct {
-	ID               int        `json:"id"`
-	Title            string     `json:"title"`
-	IsActive         bool       `json:"is_active"`
-	CreatedBy        int        `json:"created_by"`
-	CreatedAt        time.Time  `json:"created_at"`
-	ActivatedAt      *time.Time `json:"activated_at,omitempty"`
-	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
-	ScheduledStartAt *time.Time `json:"scheduled_start_at,omitempty"`
-	ScheduledEndAt   *time.Time `json:"scheduled_end_at,omitempty"`
-	EffectiveState   string     `json:"effective_state"`
-	Introduction     string     `json:"introduction"`
+	ID               models.ExamID `json:"id"`
+	Title            string        `json:"title"`
+	IsActive         bool          `json:"is_active"`
+	CreatedBy        models.UserID `json:"created_by"`
+	CreatedAt        time.Time     `json:"created_at"`
+	ActivatedAt      *time.Time    `json:"activated_at,omitempty"`
+	ArchivedAt       *time.Time    `json:"archived_at,omitempty"`
+	ScheduledStartAt *time.Time    `json:"scheduled_start_at,omitempty"`
+	ScheduledEndAt   *time.Time    `json:"scheduled_end_at,omitempty"`
+	EffectiveState   string        `json:"effective_state"`
+	Introduction     string        `json:"introduction"`
 }
 
 type QuizController struct {
@@ -73,9 +73,9 @@ func (ctrl *QuizController) GetExams(c *gin.Context) {
 	var exams []models.Examination
 	var err error
 	if c.Query("include_inactive") == "true" {
-		exams, err = ctrl.repo.GetStudentEnrolledExams(c.Request.Context(), student.ID)
+		exams, err = ctrl.repo.GetStudentEnrolledExams(c.Request.Context(), int(student.ID))
 	} else {
-		exams, err = ctrl.repo.GetStudentExams(c.Request.Context(), student.ID)
+		exams, err = ctrl.repo.GetStudentExams(c.Request.Context(), int(student.ID))
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -93,15 +93,13 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	idStr := c.Param("id")
-	examID, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
 	// Verify enrollment
-	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(c.Request.Context(), student.ID, examID)
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(c.Request.Context(), int(student.ID), examID)
 	if err != nil || !enrolled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not enrolled in this examination"})
 		return
@@ -153,20 +151,18 @@ func (ctrl *QuizController) GetExamResults(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	idStr := c.Param("id")
-	examID, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
-	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(c.Request.Context(), student.ID, examID)
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(c.Request.Context(), int(student.ID), examID)
 	if err != nil || !enrolled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not enrolled in this examination"})
 		return
 	}
 
-	results, err := ctrl.repo.GetStudentExamResults(c.Request.Context(), student.ID, examID)
+	results, err := ctrl.repo.GetStudentExamResults(c.Request.Context(), int(student.ID), examID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -182,7 +178,7 @@ func (ctrl *QuizController) GetMyResultsSummary(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	results, err := ctrl.repo.GetStudentResultsSummary(c.Request.Context(), student.ID)
+	results, err := ctrl.repo.GetStudentResultsSummary(c.Request.Context(), int(student.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -218,12 +214,12 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "question is not assigned to an examination"})
 		return
 	}
-	exam, err := ctrl.repo.GetExamByID(ctx, *question.ExamID)
+	exam, err := ctrl.repo.GetExamByID(ctx, int(*question.ExamID))
 	if err != nil || !repository.ExaminationEffectiveState(exam).ActiveNow {
 		c.JSON(http.StatusForbidden, gin.H{"error": "this examination is not active"})
 		return
 	}
-	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, student.ID, *question.ExamID)
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, int(student.ID), int(*question.ExamID))
 	if err != nil || !enrolled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "you are not enrolled in this examination"})
 		return
@@ -235,7 +231,7 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 	var result models.ValidationResult
 	evaluate := func() error {
 		var evalErr error
-		result, evalErr = ctrl.valService.Validate(ctx, student.ID, question, req.SQLText, repository.ExamSandboxName(*question.ExamID))
+		result, evalErr = ctrl.valService.Validate(ctx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)))
 		return evalErr
 	}
 
@@ -299,13 +295,13 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 		return
 	}
 
-	exam, err := ctrl.repo.GetExamByID(ctx, *question.ExamID)
+	exam, err := ctrl.repo.GetExamByID(ctx, int(*question.ExamID))
 	if err != nil || !repository.ExaminationEffectiveState(exam).ActiveNow {
 		c.JSON(http.StatusForbidden, gin.H{"error": "this examination is not active"})
 		return
 	}
 
-	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, student.ID, *question.ExamID)
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, int(student.ID), int(*question.ExamID))
 	if err != nil || !enrolled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "you are not enrolled in this examination"})
 		return
@@ -321,7 +317,7 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 
 	preview := func() error {
 		var e error
-		vResult, vRows, vCols, vCount, vTrunc, e = ctrl.valService.ValidatePreview(ctx, student.ID, question, req.SQLText, repository.ExamSandboxName(*question.ExamID))
+		vResult, vRows, vCols, vCount, vTrunc, e = ctrl.valService.ValidatePreview(ctx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)))
 		return e
 	}
 
@@ -377,10 +373,8 @@ func (ctrl *QuizController) GetExamIntroduction(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	idStr := c.Param("id")
-	examID, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -392,7 +386,7 @@ func (ctrl *QuizController) GetExamIntroduction(c *gin.Context) {
 		return
 	}
 
-	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, student.ID, examID)
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, int(student.ID), examID)
 	if err != nil || !enrolled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
 		return
@@ -416,10 +410,8 @@ func (ctrl *QuizController) GetExamIntroduction(c *gin.Context) {
 // It holds an HTTP connection open and pushes Server-Sent Events to enrolled students.
 // Authentication is done via query param because EventSource cannot send Authorization headers.
 func (ctrl *QuizController) StreamExamStatus(c *gin.Context) {
-	idStr := c.Param("id")
-	examID, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
@@ -447,7 +439,7 @@ func (ctrl *QuizController) StreamExamStatus(c *gin.Context) {
 	}
 
 	// Verify enrollment
-	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID)
+	enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, int(user.ID), examID)
 	if err != nil || !enrolled {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
 		return
@@ -502,22 +494,21 @@ func (ctrl *QuizController) ListExamIntroImages(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	user := userVal.(models.User)
 
-	examID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
 
 	ctx := c.Request.Context()
 
-	_, err = ctrl.repo.GetExamByID(ctx, examID)
+	_, err := ctrl.repo.GetExamByID(ctx, examID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
 		return
 	}
 
 	if user.Role == models.RoleStudent {
-		enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID)
+		enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, int(user.ID), examID)
 		if err != nil || !enrolled {
 			c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
 			return
@@ -540,27 +531,25 @@ func (ctrl *QuizController) GetExamIntroImage(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	user := userVal.(models.User)
 
-	examID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid examination id"})
+	examID, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
 		return
 	}
-	imgID, err := strconv.Atoi(c.Param("imageId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image id"})
+	imgID, ok := idParam(c, "imageId", publicid.TypeImage)
+	if !ok {
 		return
 	}
 
 	ctx := c.Request.Context()
 
-	_, err = ctrl.repo.GetExamByID(ctx, examID)
+	_, err := ctrl.repo.GetExamByID(ctx, examID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
 		return
 	}
 
 	if user.Role == models.RoleStudent {
-		enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, user.ID, examID)
+		enrolled, err := ctrl.repo.IsStudentEnrolledInExam(ctx, int(user.ID), examID)
 		if err != nil || !enrolled {
 			c.JSON(http.StatusForbidden, gin.H{"error": "not enrolled in this examination"})
 			return
@@ -577,7 +566,7 @@ func (ctrl *QuizController) GetExamIntroImage(c *gin.Context) {
 		return
 	}
 
-	etag := strconv.FormatInt(updatedAt.Unix(), 10)
+	etag := fmt.Sprintf("%d", updatedAt.Unix())
 	if c.GetHeader("If-None-Match") == etag {
 		c.Status(http.StatusNotModified)
 		return
@@ -585,6 +574,6 @@ func (ctrl *QuizController) GetExamIntroImage(c *gin.Context) {
 
 	c.Header("ETag", etag)
 	c.Header("Cache-Control", "private, max-age=86400, must-revalidate")
-	c.Header("Content-Length", strconv.Itoa(len(data)))
+	c.Header("Content-Length", fmt.Sprintf("%d", len(data)))
 	c.Data(http.StatusOK, mime, data)
 }

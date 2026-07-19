@@ -26,12 +26,14 @@ type SubmissionExportRow struct {
 
 // PracticeAttemptExportRow is one practice attempt rendered into the export CSV.
 type PracticeAttemptExportRow struct {
-	ID                 int
-	StudentID          int
-	Username           string
-	PracticeQuestionID int
-	IsCorrect          bool
-	SubmittedAt        time.Time
-	SQLText            string
-	ValidationDetails  string
+	ID                  int
+	StudentID           int
+	Username            string
+	PracticeQuestionID  int
+	CategoryName        string
+	QuestionRequirement string
+	IsCorrect           bool
+	SubmittedAt         time.Time
+	SQLText             string
+	ValidationDetails   string
 }

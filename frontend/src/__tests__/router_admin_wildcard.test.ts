@@ -15,7 +15,7 @@ const START_PATH = '/__router-admin-wildcard-test__'
 
 function loginAs(role: AuthUser['role']) {
   useAuth().login(`${role.toLowerCase()}-token`, {
-    id: 99,
+    id: '99',
     username: role.toLowerCase(),
     role,
   })

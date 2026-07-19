@@ -209,6 +209,37 @@ async function deactivateExamScheduled() {
     actionLoading.value = false
   }
 }
+
+// ---------------------------------------------------------------------------
+// Practice freeze toggle (active exams only)
+// ---------------------------------------------------------------------------
+const practiceFrozen = ref(props.exam.block_practice_during_exam)
+const freezeSaving = ref(false)
+
+async function togglePracticeFreeze() {
+  const desired = !practiceFrozen.value
+  const token = localStorage.getItem('sql_quiz_token')
+  freezeSaving.value = true
+  try {
+    const resp = await fetch(`/api/v1/lecturer/exams/${props.exam.id}/practice-freeze`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ block_practice: desired })
+    })
+    if (resp.ok) {
+      practiceFrozen.value = desired
+      notify(desired ? 'Student practice frozen during this exam' : 'Student practice unfrozen', 'success')
+      emit('changed')
+    } else {
+      const e = await resp.json().catch(() => ({} as Record<string, string>))
+      handleApiError(new Error(e['error'] || 'Failed to update practice freeze'), { fallback: 'Failed to update practice freeze' })
+    }
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to update practice freeze' })
+  } finally {
+    freezeSaving.value = false
+  }
+}
 </script>
 
 <template>
@@ -337,6 +368,24 @@ async function deactivateExamScheduled() {
             Set End Time
           </button>
         </div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.4rem;">
+        <span
+          class="badge"
+          :class="practiceFrozen ? 'badge-danger' : 'badge-success'"
+          style="font-size: 0.72rem; padding: 2px 8px;"
+        >
+          {{ practiceFrozen ? 'Frozen' : 'Live' }}
+        </span>
+        <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer;">
+          <input
+            type="checkbox"
+            :checked="practiceFrozen"
+            :disabled="freezeSaving"
+            @change="togglePracticeFreeze"
+          />
+          Freeze student practice during this exam
+        </label>
       </div>
     </div>
   </div>

@@ -51,14 +51,15 @@ func TestCreateQuestion_AssignsDistinctIds(t *testing.T) {
 	examID, tbl, uid := mkExamAndTable(t, repo, ctx)
 
 	mk := func(req string) models.Question {
+		eid := models.ExamID(examID)
 		return models.Question{
-			ExamID:      &examID,
+			ExamID:      &eid,
 			TargetTable: tbl,
 			CorrectSQL:  "SELECT id FROM " + tbl + " ORDER BY id",
 			Type:        "QUERY",
 			Points:      5,
 			Requirement: req,
-			CreatedBy:   uid,
+			CreatedBy:   models.UserID(uid),
 		}
 	}
 
@@ -96,14 +97,15 @@ func TestCreateQuestion_UpdateByIdKeepsRow(t *testing.T) {
 	ctx := context.Background()
 	examID, tbl, uid := mkExamAndTable(t, repo, ctx)
 
+	eid := models.ExamID(examID)
 	base := models.Question{
-		ExamID:      &examID,
+		ExamID:      &eid,
 		TargetTable: tbl,
 		CorrectSQL:  "SELECT id FROM " + tbl + " ORDER BY id",
 		Type:        "QUERY",
 		Points:      5,
 		Requirement: "original",
-		CreatedBy:   uid,
+		CreatedBy:   models.UserID(uid),
 	}
 	id, err := repo.CreateQuestion(ctx, base)
 	if err != nil {

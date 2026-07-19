@@ -65,7 +65,7 @@ func (r *PostgresRepository) SetExaminationActive(ctx context.Context, id int, a
 		scheduledStartAt = &now
 	}
 
-	query := `UPDATE app.examinations SET is_active = TRUE, activated_at = NOW(), archived_at = NULL, scheduled_start_at = $2, scheduled_end_at = $3 WHERE id = $1`
+	query := `UPDATE app.examinations SET is_active = TRUE, activated_at = NOW(), archived_at = NULL, scheduled_start_at = $2, scheduled_end_at = $3, block_practice_during_exam = TRUE WHERE id = $1`
 	if _, err := r.pool.Exec(ctx, query, id, scheduledStartAt, scheduledEndAt); err != nil {
 		return err
 	}

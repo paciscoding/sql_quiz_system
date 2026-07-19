@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
@@ -50,10 +50,8 @@ func (ctrl *PracticeController) ListForStudent(c *gin.Context) {
 
 // GetForStudent (GET /practice/questions/:id)
 func (ctrl *PracticeController) GetForStudent(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid question id"})
+	id, ok := idParam(c, "id", publicid.TypePractice)
+	if !ok {
 		return
 	}
 
@@ -77,8 +75,8 @@ func (ctrl *PracticeController) Submit(c *gin.Context) {
 	student := userVal.(models.User)
 
 	var req struct {
-		PracticeQuestionID int    `json:"practice_question_id"`
-		SQLText            string `json:"sql_text"`
+		PracticeQuestionID models.PracticeQuestionID `json:"practice_question_id"`
+		SQLText            string                    `json:"sql_text"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -86,7 +84,7 @@ func (ctrl *PracticeController) Submit(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	question, err := ctrl.repo.GetPracticeQuestion(ctx, req.PracticeQuestionID)
+	question, err := ctrl.repo.GetPracticeQuestion(ctx, int(req.PracticeQuestionID))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "practice question not found"})
 		return
@@ -98,7 +96,7 @@ func (ctrl *PracticeController) Submit(c *gin.Context) {
 	}
 
 	q := question.AsQuestion()
-	result, err := ctrl.validator.Validate(ctx, student.ID, *q, req.SQLText, schema)
+	result, err := ctrl.validator.Validate(ctx, int(student.ID), *q, req.SQLText, schema)
 
 	// Persist attempt regardless of validation outcome
 	attempt := models.PracticeAttempt{
@@ -128,8 +126,8 @@ func (ctrl *PracticeController) Preview(c *gin.Context) {
 	student := userVal.(models.User)
 
 	var req struct {
-		PracticeQuestionID int    `json:"practice_question_id"`
-		SQLText            string `json:"sql_text"`
+		PracticeQuestionID models.PracticeQuestionID `json:"practice_question_id"`
+		SQLText            string                    `json:"sql_text"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -137,7 +135,7 @@ func (ctrl *PracticeController) Preview(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	question, err := ctrl.repo.GetPracticeQuestion(ctx, req.PracticeQuestionID)
+	question, err := ctrl.repo.GetPracticeQuestion(ctx, int(req.PracticeQuestionID))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "practice question not found"})
 		return
@@ -149,7 +147,7 @@ func (ctrl *PracticeController) Preview(c *gin.Context) {
 	}
 
 	q := question.AsQuestion()
-	vResult, rows, columns, rowCount, truncated, err := ctrl.validator.ValidatePreview(ctx, student.ID, *q, req.SQLText, schema)
+	vResult, rows, columns, rowCount, truncated, err := ctrl.validator.ValidatePreview(ctx, int(student.ID), *q, req.SQLText, schema)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -177,7 +175,7 @@ func (ctrl *PracticeController) ListMyAttempts(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	attempts, err := ctrl.repo.ListPracticeAttempts(c.Request.Context(), student.ID)
+	attempts, err := ctrl.repo.ListPracticeAttempts(c.Request.Context(), int(student.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -190,7 +188,7 @@ func (ctrl *PracticeController) GetSummary(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	student := userVal.(models.User)
 
-	summary, err := ctrl.repo.GetPracticeSummary(c.Request.Context(), student.ID)
+	summary, err := ctrl.repo.GetPracticeSummary(c.Request.Context(), int(student.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -220,7 +218,7 @@ func (ctrl *PracticeController) Upsert(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "category_id is required"})
 		return
 	}
-	exists, existsErr := ctrl.repo.CategoryExists(ctx, q.CategoryID)
+	exists, existsErr := ctrl.repo.CategoryExists(ctx, int(q.CategoryID))
 	if existsErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": existsErr.Error()})
 		return
@@ -243,7 +241,7 @@ func (ctrl *PracticeController) Upsert(c *gin.Context) {
 	}
 
 	// Re-read to surface capture outcome
-	saved, err := ctrl.repo.GetPracticeQuestion(ctx, q.ID)
+	saved, err := ctrl.repo.GetPracticeQuestion(ctx, int(q.ID))
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"message": "Practice question saved"})
 		return
@@ -271,10 +269,8 @@ func (ctrl *PracticeController) ListForLecturer(c *gin.Context) {
 
 // Delete (DELETE /lecturer/practice/question/:id)
 func (ctrl *PracticeController) Delete(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid question id"})
+	id, ok := idParam(c, "id", publicid.TypePractice)
+	if !ok {
 		return
 	}
 
@@ -340,7 +336,7 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 func (ctrl *PracticeController) resolveCategorySchema(c *gin.Context, ctx context.Context, q *models.PracticeQuestion) (string, bool) {
 	schema := q.CategorySchema
 	if schema == "" && q.CategoryID > 0 {
-		s, err := ctrl.repo.GetPracticeCategorySchema(ctx, q.CategoryID)
+		s, err := ctrl.repo.GetPracticeCategorySchema(ctx, int(q.CategoryID))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "practice question has no category configured"})
 			return "", false
@@ -367,9 +363,8 @@ func (ctrl *PracticeController) resolveCategorySchema(c *gin.Context, ctx contex
 // Returns the category schema tables + description for enrolled students.
 // Returns imported:false and tables:[] when the category schema has no tables yet.
 func (ctrl *PracticeController) GetCategoryIntroduction(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 
@@ -408,9 +403,8 @@ func (ctrl *PracticeController) GetCategoryIntroduction(c *gin.Context) {
 // SetCategoryIntroduction (PUT /lecturer/practice/categories/:id/introduction)
 // Persists a lecturer-authored description text for a practice category.
 func (ctrl *PracticeController) SetCategoryIntroduction(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 
@@ -468,7 +462,7 @@ func (ctrl *PracticeController) CreateCategory(c *gin.Context) {
 		return
 	}
 
-	cat, err := ctrl.repo.CreatePracticeCategory(c.Request.Context(), name, lecturer.ID)
+	cat, err := ctrl.repo.CreatePracticeCategory(c.Request.Context(), name, int(lecturer.ID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -478,9 +472,8 @@ func (ctrl *PracticeController) CreateCategory(c *gin.Context) {
 
 // RenameCategory (PUT /lecturer/practice/categories/:id)
 func (ctrl *PracticeController) RenameCategory(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -509,9 +502,8 @@ func (ctrl *PracticeController) RenameCategory(c *gin.Context) {
 
 // DeleteCategory (DELETE /lecturer/practice/categories/:id[?force=true])
 func (ctrl *PracticeController) DeleteCategory(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 	force := c.Query("force") == "true"
@@ -535,9 +527,8 @@ func (ctrl *PracticeController) ImportCategorySchema(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	lecturer := userVal.(models.User)
 
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -553,7 +544,7 @@ func (ctrl *PracticeController) ImportCategorySchema(c *gin.Context) {
 	}
 	confirmReplace := c.Query("confirm_replace") == "true"
 
-	if err := ctrl.repo.ImportSchemaIntoCategory(c.Request.Context(), id, req.SQL, lecturer.ID, confirmReplace); err != nil {
+	if err := ctrl.repo.ImportSchemaIntoCategory(c.Request.Context(), id, req.SQL, int(lecturer.ID), confirmReplace); err != nil {
 		switch {
 		case errors.Is(err, repository.ErrCategoryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -574,9 +565,8 @@ func (ctrl *PracticeController) ImportCategorySchema(c *gin.Context) {
 // ListCategoryIntroImages (GET /practice/categories/:id/intro-images)
 // Returns the metadata list of intro images for a practice category.
 func (ctrl *PracticeController) ListCategoryIntroImages(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 
@@ -592,14 +582,12 @@ func (ctrl *PracticeController) ListCategoryIntroImages(c *gin.Context) {
 // GetCategoryIntroImage (GET /practice/categories/:id/intro-images/:imageId)
 // Streams the binary content of a single intro image with ETag-based caching.
 func (ctrl *PracticeController) GetCategoryIntroImage(c *gin.Context) {
-	catID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	catID, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
-	imgID, err := strconv.Atoi(c.Param("imageId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image id"})
+	imgID, ok := idParam(c, "imageId", publicid.TypeImage)
+	if !ok {
 		return
 	}
 
@@ -613,7 +601,7 @@ func (ctrl *PracticeController) GetCategoryIntroImage(c *gin.Context) {
 		return
 	}
 
-	etag := strconv.FormatInt(updatedAt.Unix(), 10)
+	etag := fmt.Sprintf("%d", updatedAt.Unix())
 	if c.GetHeader("If-None-Match") == etag {
 		c.Status(http.StatusNotModified)
 		return
@@ -621,7 +609,7 @@ func (ctrl *PracticeController) GetCategoryIntroImage(c *gin.Context) {
 
 	c.Header("ETag", etag)
 	c.Header("Cache-Control", "private, max-age=86400, must-revalidate")
-	c.Header("Content-Length", strconv.Itoa(len(data)))
+	c.Header("Content-Length", fmt.Sprintf("%d", len(data)))
 	c.Data(http.StatusOK, mime, data)
 }
 
@@ -630,9 +618,8 @@ func (ctrl *PracticeController) GetCategoryIntroImage(c *gin.Context) {
 // magic bytes, enforces per-file (5 MB) and aggregate (25 MB) size limits, and
 // inserts the image. Returns the inserted metadata row (201).
 func (ctrl *PracticeController) UploadCategoryIntroImage(c *gin.Context) {
-	catID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	catID, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 
@@ -693,14 +680,12 @@ func (ctrl *PracticeController) UploadCategoryIntroImage(c *gin.Context) {
 // DeleteCategoryIntroImage (DELETE /lecturer/practice/categories/:id/intro-images/:imageId)
 // Removes a single intro image from a practice category. Returns 204 on success.
 func (ctrl *PracticeController) DeleteCategoryIntroImage(c *gin.Context) {
-	catID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	catID, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
-	imgID, err := strconv.Atoi(c.Param("imageId"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid image id"})
+	imgID, ok := idParam(c, "imageId", publicid.TypeImage)
+	if !ok {
 		return
 	}
 
@@ -719,16 +704,15 @@ func (ctrl *PracticeController) DeleteCategoryIntroImage(c *gin.Context) {
 // ReorderCategoryIntroImages (PUT /lecturer/practice/categories/:id/intro-images/order)
 // Accepts {"order":[{"id":1,"sort_order":0},…]} and applies the new ordering.
 func (ctrl *PracticeController) ReorderCategoryIntroImages(c *gin.Context) {
-	catID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category id"})
+	catID, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
 		return
 	}
 
 	var req struct {
 		Order []struct {
-			ID        int `json:"id"`
-			SortOrder int `json:"sort_order"`
+			ID        models.ImageID `json:"id"`
+			SortOrder int            `json:"sort_order"`
 		} `json:"order"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -738,7 +722,7 @@ func (ctrl *PracticeController) ReorderCategoryIntroImages(c *gin.Context) {
 
 	order := make([]struct{ ID, SortOrder int }, len(req.Order))
 	for i, item := range req.Order {
-		order[i] = struct{ ID, SortOrder int }{item.ID, item.SortOrder}
+		order[i] = struct{ ID, SortOrder int }{int(item.ID), item.SortOrder}
 	}
 
 	if err := ctrl.repo.ReorderCategoryIntroImages(c.Request.Context(), catID, order); err != nil {
@@ -762,4 +746,3 @@ func sniffImageMime(buf []byte) (string, error) {
 		return "", fmt.Errorf("only image/png and image/jpeg are accepted")
 	}
 }
-

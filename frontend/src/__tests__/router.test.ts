@@ -6,7 +6,7 @@ const START_PATH = '/__router-test-start__'
 
 function loginAs(role: AuthUser['role']) {
   useAuth().login(`${role.toLowerCase()}-token`, {
-    id: 1,
+    id: '1',
     username: role.toLowerCase(),
     role,
   })

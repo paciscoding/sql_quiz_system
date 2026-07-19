@@ -80,7 +80,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (mod
 	// Success: clear attempts
 	s.loginAttempts.Delete(username)
 
-	version, err := s.repo.GetTokenVersion(ctx, user.ID)
+	version, err := s.repo.GetTokenVersion(ctx, int(user.ID))
 	if err != nil {
 		return models.LoginResponse{}, err
 	}
@@ -172,7 +172,11 @@ func (s *AuthService) CreateStaff(ctx context.Context, creator models.User, req 
 	}
 
 	// New account starts at token_version 0 (no prior tokens exist).
-	s.logPasswordEvent(ctx, id, &creatorID, models.PasswordEventCreate, password)
+	// logPasswordEvent's changedBy is *int (ARCH-002: repo/service layer stays
+	// int-native), so it needs its own int-typed local distinct from creatorID
+	// (which stays models.UserID for the CreatedBy field above).
+	creatorIDInt := int(creatorID)
+	s.logPasswordEvent(ctx, id, &creatorIDInt, models.PasswordEventCreate, password)
 	// SendCredential skips silently when the address is empty.
 	if err := s.email.SendCredential(req.Email, req.Username, password); err != nil {
 		log.Printf("auth: SendCredential failed for new user %q: %v", req.Username, err)
@@ -185,7 +189,7 @@ func (s *AuthService) CreateStaff(ctx context.Context, creator models.User, req 
 // Used by both the single-student endpoint and the bulk importer (once per newly
 // inserted row). Best-effort: never fails the create.
 func (s *AuthService) LogStudentCreate(ctx context.Context, creator models.User, studentID int, password, username, email string) {
-	creatorID := creator.ID
+	creatorID := int(creator.ID)
 	s.logPasswordEvent(ctx, studentID, &creatorID, models.PasswordEventCreate, password)
 	// SendCredential skips silently when email is empty (some students have none).
 	if err := s.email.SendCredential(email, username, password); err != nil {
@@ -269,7 +273,7 @@ func (s *AuthService) beginForgotReset(ctx context.Context, username string) (mo
 	}
 
 	// Abuse throttle: key-independent, reads last_forgot_reset_at only.
-	if last, err := s.repo.GetLastForgotResetAt(ctx, user.ID); err == nil && last != nil {
+	if last, err := s.repo.GetLastForgotResetAt(ctx, int(user.ID)); err == nil && last != nil {
 		if time.Since(*last) < ForgotResetThrottle {
 			log.Printf("auth: forgot-password throttled for user_id=%d (last reset %s ago)", user.ID, time.Since(*last))
 			return models.User{}, "", false
@@ -278,7 +282,7 @@ func (s *AuthService) beginForgotReset(ctx context.Context, username string) (mo
 
 	// Authorize now: stamp the throttle clock synchronously, before any async
 	// work is spawned, so a rapid second request is throttled immediately.
-	if err := s.repo.SetLastForgotResetAt(ctx, user.ID); err != nil {
+	if err := s.repo.SetLastForgotResetAt(ctx, int(user.ID)); err != nil {
 		log.Printf("auth: forgot-password failed to stamp throttle clock for user_id=%d: %v", user.ID, err)
 		return models.User{}, "", false
 	}
@@ -286,7 +290,7 @@ func (s *AuthService) beginForgotReset(ctx context.Context, username string) (mo
 	// Issue the one-time code: only its SHA-256 hash is persisted, alongside the
 	// expiry, and the attempt counter is reset.
 	otp := GenerateResetOTP()
-	if err := s.repo.SetResetOTP(ctx, user.ID, hashResetOTP(otp), time.Now().Add(ResetOTPTTL)); err != nil {
+	if err := s.repo.SetResetOTP(ctx, int(user.ID), hashResetOTP(otp), time.Now().Add(ResetOTPTTL)); err != nil {
 		log.Printf("auth: forgot-password failed to store reset code for user_id=%d: %v", user.ID, err)
 		return models.User{}, "", false
 	}
@@ -337,7 +341,7 @@ func (s *AuthService) verifyResetOTP(ctx context.Context, username, otp string) 
 		return models.User{}, ErrInvalidResetCode
 	}
 
-	hash, expiresAt, attempts, err := s.repo.GetResetOTP(ctx, user.ID)
+	hash, expiresAt, attempts, err := s.repo.GetResetOTP(ctx, int(user.ID))
 	if err != nil || hash == nil || expiresAt == nil {
 		return models.User{}, ErrInvalidResetCode
 	}
@@ -350,7 +354,7 @@ func (s *AuthService) verifyResetOTP(ctx context.Context, username, otp string) 
 
 	// Count the attempt FIRST (atomically), so a wrong guess below is already
 	// recorded and concurrent guesses cannot slip past the cap.
-	newCount, err := s.repo.IncrementResetOTPAttempts(ctx, user.ID)
+	newCount, err := s.repo.IncrementResetOTPAttempts(ctx, int(user.ID))
 	if err != nil {
 		return models.User{}, ErrInvalidResetCode
 	}
@@ -364,7 +368,7 @@ func (s *AuthService) verifyResetOTP(ctx context.Context, username, otp string) 
 
 	// Clear the code synchronously so it cannot be replayed, even by a request
 	// racing the async reset below.
-	if err := s.repo.ClearResetOTP(ctx, user.ID); err != nil {
+	if err := s.repo.ClearResetOTP(ctx, int(user.ID)); err != nil {
 		log.Printf("auth: forgot-password failed to clear reset code for user_id=%d: %v", user.ID, err)
 		return models.User{}, ErrInvalidResetCode
 	}
@@ -389,18 +393,18 @@ func (s *AuthService) performForgotReset(ctx context.Context, user models.User) 
 		log.Printf("auth: forgot-password hash failed for user_id=%d: %v", user.ID, err)
 		return
 	}
-	if err := s.repo.UpdateUserPassword(ctx, user.ID, string(hash)); err != nil {
+	if err := s.repo.UpdateUserPassword(ctx, int(user.ID), string(hash)); err != nil {
 		log.Printf("auth: forgot-password persist failed for user_id=%d: %v", user.ID, err)
 		return
 	}
-	if err := s.repo.BumpTokenVersion(ctx, user.ID); err != nil {
+	if err := s.repo.BumpTokenVersion(ctx, int(user.ID)); err != nil {
 		log.Printf("auth: forgot-password token bump failed for user_id=%d: %v", user.ID, err)
 	}
 
-	changedBy := user.ID
+	changedBy := int(user.ID)
 	// Audit event: only persisted when a PASSWORD_LOG_KEY is configured. The
 	// throttle above does NOT depend on this write.
-	s.logPasswordEvent(ctx, user.ID, &changedBy, models.PasswordEventForgotReset, password)
+	s.logPasswordEvent(ctx, int(user.ID), &changedBy, models.PasswordEventForgotReset, password)
 	if err := s.email.SendCredential(*user.Email, user.Username, password); err != nil {
 		log.Printf("auth: forgot-password SendCredential failed for %q: %v", user.Username, err)
 	}
@@ -431,7 +435,7 @@ func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targ
 		return "", err
 	}
 
-	actorID := actor.ID
+	actorID := int(actor.ID)
 	s.logPasswordEvent(ctx, targetID, &actorID, models.PasswordEventAdminReset, password)
 	recipient := ""
 	if emailPassword && target.Email != nil && *target.Email != "" {
@@ -591,7 +595,7 @@ func (s *AuthService) SeedAdminAccount(ctx context.Context, username, email stri
 // keep the current device logged in, it returns a freshly minted JWT carrying
 // the new token_version.
 func (s *AuthService) ChangeOwnPassword(ctx context.Context, current models.User, oldPassword, newPassword string) (string, error) {
-	user, err := s.repo.GetUserByID(ctx, current.ID)
+	user, err := s.repo.GetUserByID(ctx, int(current.ID))
 	if err != nil {
 		return "", err
 	}
@@ -604,18 +608,18 @@ func (s *AuthService) ChangeOwnPassword(ctx context.Context, current models.User
 	if err != nil {
 		return "", err
 	}
-	if err := s.repo.UpdateUserPassword(ctx, current.ID, string(hash)); err != nil {
+	if err := s.repo.UpdateUserPassword(ctx, int(current.ID), string(hash)); err != nil {
 		return "", err
 	}
-	if err := s.repo.BumpTokenVersion(ctx, current.ID); err != nil {
+	if err := s.repo.BumpTokenVersion(ctx, int(current.ID)); err != nil {
 		return "", err
 	}
 
-	changedBy := current.ID
-	s.logPasswordEvent(ctx, current.ID, &changedBy, models.PasswordEventSelfChange, newPassword)
+	changedBy := int(current.ID)
+	s.logPasswordEvent(ctx, int(current.ID), &changedBy, models.PasswordEventSelfChange, newPassword)
 
 	// Mint a fresh token so the caller's current device stays logged in.
-	version, err := s.repo.GetTokenVersion(ctx, current.ID)
+	version, err := s.repo.GetTokenVersion(ctx, int(current.ID))
 	if err != nil {
 		return "", err
 	}
@@ -624,7 +628,12 @@ func (s *AuthService) ChangeOwnPassword(ctx context.Context, current models.User
 
 func (s *AuthService) generateToken(user models.User, tokenVersion int) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id":       user.ID,
+		// user_id is deliberately encoded as a plain int, not the models.UserID
+		// value: jwt.MapClaims is json.Marshal'ed internally, and UserID's
+		// MarshalJSON would otherwise silently turn this internal JWT claim
+		// into an opaque public-id STRING instead of the numeric claim
+		// parseToken below expects.
+		"user_id":       int(user.ID),
 		"username":      user.Username,
 		"role":          user.Role,
 		"token_version": tokenVersion,
@@ -668,7 +677,7 @@ func (s *AuthService) parseToken(tokenString string) (models.User, int, error) {
 	}
 
 	return models.User{
-		ID:       int(userID),
+		ID:       models.UserID(int(userID)),
 		Username: username,
 		Role:     models.Role(role),
 	}, version, nil
@@ -688,7 +697,7 @@ func (s *AuthService) AuthenticateRequest(ctx context.Context, tokenString strin
 	if err != nil {
 		return models.User{}, err
 	}
-	current, err := s.repo.GetTokenVersion(ctx, user.ID)
+	current, err := s.repo.GetTokenVersion(ctx, int(user.ID))
 	if err != nil {
 		return models.User{}, errors.New("invalid token")
 	}

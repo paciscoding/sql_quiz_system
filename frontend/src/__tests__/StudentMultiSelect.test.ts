@@ -4,18 +4,18 @@ import { describe, expect, it } from 'vitest'
 import StudentMultiSelect from '../components/StudentMultiSelect.vue'
 
 type Student = {
-  id: number
+  id: string
   username: string
 }
 
 const mkStudents = (n: number): Student[] =>
   Array.from({ length: n }, (_, i) => ({
-    id: i + 1,
+    id: String(i + 1),
     username: `student${i + 1}`,
   }))
 
 function mountStudentMultiSelect(props: {
-  modelValue: number[]
+  modelValue: string[]
   students: Student[]
   loading?: boolean
   placeholder?: string
@@ -39,10 +39,10 @@ describe('StudentMultiSelect', () => {
     it('renders one row per students prop', () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'bob' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'bob' },
         ],
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       expect(wrapper.findAll('[role="option"]')).toHaveLength(2)
@@ -51,7 +51,7 @@ describe('StudentMultiSelect', () => {
     it('renders empty state No students found when students is empty', () => {
       const wrapper = mountStudentMultiSelect({
         students: [],
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       expect(wrapper.text()).toContain('No students found.')
@@ -61,7 +61,7 @@ describe('StudentMultiSelect', () => {
       const wrapper = mountStudentMultiSelect({
         loading: true,
         students: [],
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       expect(wrapper.text()).toContain('Loading students...')
@@ -71,19 +71,19 @@ describe('StudentMultiSelect', () => {
   describe('selection behavior', () => {
     it('checking a row emits update:modelValue with the new ID added', async () => {
       const wrapper = mountStudentMultiSelect({
-        students: [{ id: 1, username: 'alice' }],
-        modelValue: [],
+        students: [{ id: '1', username: 'alice' }],
+        modelValue: [] as string[],
       })
 
       await wrapper.find('input[type="checkbox"]').trigger('change')
 
-      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual([1])
+      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual(['1'])
     })
 
     it('unchecking a row emits update:modelValue with the ID removed', async () => {
       const wrapper = mountStudentMultiSelect({
-        students: [{ id: 1, username: 'alice' }],
-        modelValue: [1],
+        students: [{ id: '1', username: 'alice' }],
+        modelValue: ['1'],
       })
 
       await wrapper.find('input[type="checkbox"]').trigger('change')
@@ -96,28 +96,28 @@ describe('StudentMultiSelect', () => {
     it('Select All adds all currently-filtered IDs to selection (union with existing)', async () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'bob' },
-          { id: 3, username: 'charlie' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'bob' },
+          { id: '3', username: 'charlie' },
         ],
-        modelValue: [3],
+        modelValue: ['3'],
       })
 
       await findButton(wrapper, '[Select All]').trigger('click')
 
       expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual(
-        expect.arrayContaining([1, 2, 3]),
+        expect.arrayContaining(['1', '2', '3']),
       )
     })
 
     it('Select None removes only the currently-filtered IDs from selection', async () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'bob' },
-          { id: 3, username: 'charlie' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'bob' },
+          { id: '3', username: 'charlie' },
         ],
-        modelValue: [1, 2, 3],
+        modelValue: ['1', '2', '3'],
       })
 
       await findButton(wrapper, '[Select None]').trigger('click')
@@ -130,10 +130,10 @@ describe('StudentMultiSelect', () => {
     it('search input filters the visible rows (case-insensitive)', async () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'BOB' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'BOB' },
         ],
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       await wrapper.find('input[aria-label="Search students"]').setValue('alice')
@@ -146,8 +146,8 @@ describe('StudentMultiSelect', () => {
 
     it('search shows No students match when filter finds nothing', async () => {
       const wrapper = mountStudentMultiSelect({
-        students: [{ id: 1, username: 'alice' }],
-        modelValue: [],
+        students: [{ id: '1', username: 'alice' }],
+        modelValue: [] as string[],
       })
 
       await wrapper.find('input[aria-label="Search students"]').setValue('xyz')
@@ -159,33 +159,33 @@ describe('StudentMultiSelect', () => {
     it('Select All with active filter only adds filtered IDs (union)', async () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'bob' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'bob' },
         ],
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       await wrapper.find('input[aria-label="Search students"]').setValue('alice')
       await nextTick()
       await findButton(wrapper, '[Select All]').trigger('click')
 
-      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual([1])
+      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual(['1'])
     })
 
     it('Select None with active filter only removes filtered IDs (preserves others)', async () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'bob' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'bob' },
         ],
-        modelValue: [1, 2],
+        modelValue: ['1', '2'],
       })
 
       await wrapper.find('input[aria-label="Search students"]').setValue('alice')
       await nextTick()
       await findButton(wrapper, '[Select None]').trigger('click')
 
-      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual([2])
+      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual(['2'])
     })
   })
 
@@ -193,7 +193,7 @@ describe('StudentMultiSelect', () => {
     it('container has role=group', () => {
       const wrapper = mountStudentMultiSelect({
         students: [],
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       expect(wrapper.attributes('role')).toBe('group')
@@ -201,8 +201,8 @@ describe('StudentMultiSelect', () => {
 
     it('listbox has role=listbox', () => {
       const wrapper = mountStudentMultiSelect({
-        students: [{ id: 1, username: 'alice' }],
-        modelValue: [],
+        students: [{ id: '1', username: 'alice' }],
+        modelValue: [] as string[],
       })
 
       expect(wrapper.find('[role="listbox"]').exists()).toBe(true)
@@ -211,10 +211,10 @@ describe('StudentMultiSelect', () => {
     it('rows have role=option and aria-selected reflecting modelValue', () => {
       const wrapper = mountStudentMultiSelect({
         students: [
-          { id: 1, username: 'alice' },
-          { id: 2, username: 'bob' },
+          { id: '1', username: 'alice' },
+          { id: '2', username: 'bob' },
         ],
-        modelValue: [1],
+        modelValue: ['1'],
       })
 
       const rows = wrapper.findAll('[role="option"]')
@@ -225,7 +225,7 @@ describe('StudentMultiSelect', () => {
     it('arrow key navigation moves focus through rendered rows', async () => {
       const wrapper = mountStudentMultiSelect({
         students: mkStudents(3),
-        modelValue: [],
+        modelValue: [] as string[],
       })
 
       const searchInput = wrapper.find('input[aria-label="Search students"]')

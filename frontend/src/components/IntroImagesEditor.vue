@@ -17,7 +17,7 @@ import {
 
 const props = defineProps<{
   scope: 'category' | 'exam'
-  ownerId: number
+  ownerId: string
 }>()
 
 const { notify } = useNotifications()
@@ -29,12 +29,12 @@ const loading = ref(false)
 const localError = ref<string | null>(null)
 
 // Thumbnail blob URLs keyed by image id — revoked on unmount
-const thumbUrls = ref<Record<number, string>>({})
+const thumbUrls = ref<Record<string, string>>({})
 
 async function loadThumbs(imgs: IntroImageMetadata[]) {
   // Revoke URLs no longer needed
   const newIds = new Set(imgs.map((i) => i.id))
-  for (const id of Object.keys(thumbUrls.value).map(Number)) {
+  for (const id of Object.keys(thumbUrls.value)) {
     if (!newIds.has(id)) {
       URL.revokeObjectURL(thumbUrls.value[id])
       delete thumbUrls.value[id]

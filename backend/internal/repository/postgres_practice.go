@@ -317,7 +317,7 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
 	// Resolve the category's owned schema; the correct-result capture and all
 	// student submissions for this question run against it (not public).
-	schema, err := r.GetPracticeCategorySchema(ctx, q.CategoryID)
+	schema, err := r.GetPracticeCategorySchema(ctx, int(q.CategoryID))
 	if err != nil {
 		return err
 	}
@@ -337,14 +337,14 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 			created_by, category_id, target_table, correct_sql, question_type, requirement,
 			points, strict_ordering, strict_attrs, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			capture_error, expected_result_captured_at, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW(), NOW())
+			capture_error, title, expected_result_captured_at, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW(), NOW())
 		RETURNING id, created_at, updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CreatedBy, q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr,
+		expectedResult, expectedCols, status, captureErr, q.Title,
 	).Scan(&q.ID, &q.CreatedAt, &q.UpdatedAt)
 }
 
@@ -397,7 +397,7 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error {
 	// Repair typographic quotes before capture and persistence (see Create).
 	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
-	schema, err := r.GetPracticeCategorySchema(ctx, q.CategoryID)
+	schema, err := r.GetPracticeCategorySchema(ctx, int(q.CategoryID))
 	if err != nil {
 		return err
 	}
@@ -417,15 +417,15 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 		SET category_id=$1, target_table=$2, correct_sql=$3, question_type=$4, requirement=$5,
 		    points=$6, strict_ordering=$7, strict_attrs=$8, strict_column_order=$9,
 		    expected_result=$10, expected_columns=$11,
-		    expected_result_status=$12, capture_error=$13,
+		    expected_result_status=$12, capture_error=$13, title=$14,
 		    expected_result_captured_at=NOW(), updated_at=NOW()
-		WHERE id=$14
+		WHERE id=$15
 		RETURNING updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.ID,
+		expectedResult, expectedCols, status, captureErr, q.Title, q.ID,
 	).Scan(&q.UpdatedAt)
 }
 
@@ -435,7 +435,7 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 		       COALESCE(pc.name, ''), COALESCE(pc.schema_name, ''),
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
-		       pq.expected_result_status, pq.capture_error, pq.expected_result_captured_at,
+		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
 		       pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
@@ -454,7 +454,7 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 			&q.ID, &q.CreatedBy, &q.Category, &q.CategoryID, &q.CategoryName, &q.CategorySchema,
 			&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 			&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
-			&q.ExpectedResultStatus, &q.CaptureError, &q.ExpectedResultCapturedAt,
+			&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
 			&q.CreatedAt, &q.UpdatedAt)
 		if err != nil {
 			return nil, err
@@ -470,7 +470,7 @@ func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*
 		       COALESCE(pc.name, ''), COALESCE(pc.schema_name, ''),
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
-		       pq.expected_result_status, pq.capture_error, pq.expected_result_captured_at,
+		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
 		       pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
@@ -481,7 +481,7 @@ func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*
 		&q.ID, &q.CreatedBy, &q.Category, &q.CategoryID, &q.CategoryName, &q.CategorySchema,
 		&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 		&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
-		&q.ExpectedResultStatus, &q.CaptureError, &q.ExpectedResultCapturedAt,
+		&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
 		&q.CreatedAt, &q.UpdatedAt)
 	if err != nil {
 		return nil, err

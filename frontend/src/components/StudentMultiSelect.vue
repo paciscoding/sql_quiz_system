@@ -2,13 +2,13 @@
 import { computed, nextTick, ref, watch } from 'vue'
 
 interface Student {
-  id: number
+  id: string
   username: string
 }
 
 const props = withDefaults(
   defineProps<{
-    modelValue: number[]
+    modelValue: string[]
     students: Student[]
     loading?: boolean
     placeholder?: string
@@ -22,7 +22,7 @@ const props = withDefaults(
 )
 
 const emit = defineEmits<{
-  (event: 'update:modelValue', value: number[]): void
+  (event: 'update:modelValue', value: string[]): void
 }>()
 
 const rootEl = ref<HTMLElement | null>(null)
@@ -56,7 +56,7 @@ watch(filteredList, (list) => {
   }
 })
 
-function toggleStudent(id: number) {
+function toggleStudent(id: string) {
   const nextValue = [...props.modelValue]
   const selectedIndex = nextValue.indexOf(id)
 

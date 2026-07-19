@@ -25,7 +25,7 @@ const { confirm } = useConfirm()
 
 const blankQuestion = () => ({
   id: null as number | null,
-  exam_id: null as number | null,
+  exam_id: null as string | null,
   target_table: '',
   correct_sql: '',
   requirement: '',
@@ -125,11 +125,6 @@ const { inFlight: deleteQuestionLoading, run: deleteQuestion } = useSingleFlight
 
 const isEditMode = ref(false)
 
-const nextFreeId = computed(() => {
-  if (!examQuestions.value || examQuestions.value.length === 0) return 1
-  return Math.max(...examQuestions.value.map((q: any) => q.id)) + 1
-})
-
 const previewResult = ref<PreviewResult>({ status: '', rows: [], columns: [], error: '' })
 const previewLoading = ref(false)
 const questionFormRef = ref<HTMLElement | null>(null)
@@ -162,10 +157,11 @@ const editQuestion = (q: any) => {
 function onQuestionDropdownChange(event: Event) {
   const val = (event.target as HTMLSelectElement).value
   if (val === '') {
-    // Create new question
+    // Create new question — id=0 tells the backend to auto-assign the PK on
+    // insert (repository/postgres_questions.go UpsertQuestion: q.ID==0 => INSERT).
     isEditMode.value = false
     question.value = {
-      id: nextFreeId.value,
+      id: 0,
       exam_id: props.exam.id,
       target_table: '',
       correct_sql: '',
@@ -254,7 +250,7 @@ const saveExamIntroduction = async () => {
 // --- Inline intro preview ---
 const showIntroPreview = ref(false)
 const previewImages = ref<IntroImageMetadata[]>([])
-const previewThumbUrls = ref<Record<number, string>>({})
+const previewThumbUrls = ref<Record<string, string>>({})
 
 async function loadPreviewImages() {
   // Revoke stale blob URLs before re-fetching
@@ -333,16 +329,6 @@ const dismissDraft = () => {
 }
 
 const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(async () => {
-  // In create-new mode the ID is auto-assigned (the dropdown offers only
-  // existing questions or "create new"), so resolve it here rather than relying
-  // on the dropdown's @change having fired. Edit mode keeps the existing ID.
-  if (!isEditMode.value) {
-    question.value.id = nextFreeId.value
-  }
-  if (question.value.id == null || question.value.id <= 0) {
-    notify('Please enter a valid Question ID', 'error')
-    return
-  }
   questionValidation.markTouched('correct_sql')
   if (!questionValidation.validateAll()) return
 
@@ -373,6 +359,10 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     if (!response.ok) {
       throw new Error(data.error || 'Failed to save question')
     }
+
+    // Adopt the server-assigned real id (create sent id=0; the backend
+    // auto-assigns the PK on insert and returns it here).
+    if (data.id != null) question.value.id = data.id
 
     // Surface Phase 0 capture outcome so the lecturer knows whether the question
     // is ready to ship without having to inspect the DB.
@@ -411,13 +401,13 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         <div class="input-group">
           <label>Question ID:</label>
           <select @change="onQuestionDropdownChange" :value="isEditMode ? question.id : ''">
-            <option value="">Create new question (ID: {{ nextFreeId }})</option>
+            <option value="">Create new question</option>
             <option v-for="q in examQuestions" :key="q.id" :value="q.id">
               Q{{ q.id }} — {{ (q.requirement || '').slice(0, 50) }}
             </option>
           </select>
           <span v-if="isEditMode" class="badge badge-info" style="margin-top: var(--space-1); font-size: 0.75rem;">Editing #{{ question.id }}</span>
-          <span v-else class="muted" style="font-size: 0.75rem; margin-top: var(--space-1);">New question (ID will be {{ nextFreeId }})</span>
+          <span v-else class="muted" style="font-size: 0.75rem; margin-top: var(--space-1);">New question - ID assigned on save</span>
         </div>
 
         <div class="input-group">

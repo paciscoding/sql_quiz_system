@@ -14,6 +14,7 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/controllers"
 	"github.com/paciscoding/sql-quiz-system/internal/middleware"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
@@ -23,6 +24,14 @@ func main() {
 	connString := os.Getenv("DATABASE_URL")
 	if connString == "" {
 		log.Fatal("DATABASE_URL is required")
+	}
+
+	// Public-id codec: derives the opaque-token alphabet from ID_SALT. Fail
+	// fast on an empty/invalid salt rather than silently defaulting to the
+	// unshuffled (predictable) alphabet - publicid.Init already rejects an
+	// empty salt.
+	if err := publicid.Init(os.Getenv("ID_SALT")); err != nil {
+		log.Fatalf("Failed to initialize publicid codec: %v", err)
 	}
 
 	// Initialize Repository
@@ -244,7 +253,7 @@ func main() {
 			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)
 			staff.GET("/lecturer/scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetConsolidatedScores)
-			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateAccount)
+			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin), userCtrl.CreateAccount)
 			// Single-student create/upsert — shares the importer's parity path.
 			staff.POST("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateStudent)
 
@@ -320,6 +329,8 @@ func main() {
 			practiceLecturer.POST("/categories/:id/intro-images", practiceCtrl.UploadCategoryIntroImage)
 			practiceLecturer.DELETE("/categories/:id/intro-images/:imageId", practiceCtrl.DeleteCategoryIntroImage)
 			practiceLecturer.PUT("/categories/:id/intro-images/order", practiceCtrl.ReorderCategoryIntroImages)
+			// Per-student per-question practice breakdown for the lecturer (ARCH-006).
+			practiceLecturer.GET("/results", lecturerCtrl.GetPracticeResults)
 		}
 	}
 

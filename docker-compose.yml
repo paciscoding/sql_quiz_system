@@ -19,7 +19,7 @@ services:
   backend:
     # `image` + `build` together: CI pushes this tag to GHCR and the VPS pulls it,
     # while local `docker compose up --build` still builds from ./backend as before.
-    image: ghcr.io/paciscoding/sql-quiz-backend:${IMAGE_TAG:-latest}
+    # image: ghcr.io/paciscoding/sql-quiz-backend:${IMAGE_TAG:-latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -31,6 +31,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       PORT: 8080
       JWT_SECRET: ${JWT_SECRET}
+      ID_SALT: ${ID_SALT}
       ALLOWED_ORIGINS: http://localhost,http://localhost:80
       EMAIL_SENDER_ADDRESS: ${EMAIL_SENDER_ADDRESS}
       EMAIL_SENDER_APP_PASSWORD: ${EMAIL_SENDER_APP_PASSWORD}
@@ -44,7 +45,7 @@ services:
     restart: always
 
   frontend:
-    image: ghcr.io/paciscoding/sql-quiz-frontend:${IMAGE_TAG:-latest}
+    # image: ghcr.io/paciscoding/sql-quiz-frontend:${IMAGE_TAG:-latest}
     build:
       context: ./frontend
       dockerfile: Dockerfile

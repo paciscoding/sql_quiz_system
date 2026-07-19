@@ -13,13 +13,13 @@ export interface WindowState {
 // persisted keys are unchanged.
 export type WindowVariant = 'diagram' | 'intro'
 
-function storageKey(scope: 'category' | 'exam', id: number, variant: WindowVariant): string {
+function storageKey(scope: 'category' | 'exam', id: string, variant: WindowVariant): string {
   return variant === 'diagram'
     ? `schema-window:${scope}:${id}`
     : `schema-window:${variant}:${scope}:${id}`
 }
 
-export function loadState(scope: 'category' | 'exam', id: number, variant: WindowVariant = 'diagram'): WindowState | null {
+export function loadState(scope: 'category' | 'exam', id: string, variant: WindowVariant = 'diagram'): WindowState | null {
   try {
     const raw = localStorage.getItem(storageKey(scope, id, variant))
     if (!raw) return null
@@ -34,7 +34,7 @@ export function loadState(scope: 'category' | 'exam', id: number, variant: Windo
 // but writes for distinct keys (e.g. two windows mounted at once) never drop each other.
 const _saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-export function saveState(scope: 'category' | 'exam', id: number, state: WindowState, variant: WindowVariant = 'diagram'): void {
+export function saveState(scope: 'category' | 'exam', id: string, state: WindowState, variant: WindowVariant = 'diagram'): void {
   const key = storageKey(scope, id, variant)
   const existing = _saveTimers.get(key)
   if (existing !== undefined) clearTimeout(existing)

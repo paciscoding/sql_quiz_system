@@ -28,16 +28,17 @@ func TestCreateQuestion_SmartQuoteDMLCaptures(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()
 	examID, tbl, uid := mkExamAndTable(t, repo, ctx) // tbl is public.<tbl>(id int)
+	eid := models.ExamID(examID)
 
 	q := models.Question{
-		ExamID:      &examID,
+		ExamID:      &eid,
 		TargetTable: tbl,
 		// Curly quotes around the value — exactly what a paste from a doc produces.
 		CorrectSQL:  "INSERT INTO " + tbl + " VALUES (‘42’)",
 		Type:        "DML",
 		Points:      5,
 		Requirement: "insert 42",
-		CreatedBy:   uid,
+		CreatedBy:   models.UserID(uid),
 	}
 	id, err := repo.CreateQuestion(ctx, q)
 	if err != nil {

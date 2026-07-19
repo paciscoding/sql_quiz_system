@@ -6,7 +6,7 @@ import { loadState, saveState, type WindowState } from '../utils/schemaWindowSta
 
 const props = defineProps<{
   scope: 'category' | 'exam'
-  ownerId: number
+  ownerId: string
   introduction: string
   tables: TableIntrospection[]
   imported?: boolean
