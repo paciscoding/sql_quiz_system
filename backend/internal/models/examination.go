@@ -24,6 +24,14 @@ type Examination struct {
 	// tables. Defaults to 'public'; updated to curriculum_exam_{id} when a
 	// lecturer imports a per-exam curriculum via ImportSchemaIntoExamCurriculum.
 	CurriculumSchema string `json:"curriculum_schema"`
+	// PreviewCurriculumSchema is the decoy curriculum schema (dual-schema
+	// grading) imported for this exam's student previews; empty when no decoy
+	// has been imported. Mirrors CurriculumSchema.
+	PreviewCurriculumSchema string `json:"preview_curriculum_schema"`
+	// HasPreviewSchema is a derived convenience flag: PreviewCurriculumSchema
+	// != "". Populated by the lecturer list read path; false when no decoy
+	// curriculum has been imported.
+	HasPreviewSchema bool `json:"has_preview_schema"`
 	// Readiness counts — populated only by the lecturer list path.
 	QuestionCount   int     `json:"question_count"`
 	TotalPoints     float64 `json:"total_points"`

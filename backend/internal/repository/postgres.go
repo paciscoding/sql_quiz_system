@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
@@ -107,6 +109,22 @@ type PreviewResult struct {
 
 type PostgresRepository struct {
 	pool *pgxpool.Pool
+
+	// studentPool is the restricted connection pool ALL student-submitted SQL
+	// must execute through (ARCH-025). Its LOGIN role is `quiz_exec`, which
+	// owns nothing and has no privileges on the app schema, so `SET ROLE
+	// postgres` / `RESET ROLE` / `SELECT set_config('role','postgres',false)`
+	// issued from inside student SQL land somewhere useless instead of on the
+	// superuser session_user that `pool` connects as. See
+	// postgres_student_pool.go for the full rationale and construction.
+	// Lazily created (studentPoolOnce) so this file's four evaluate* callers
+	// work whether the pool was already warmed by cmd/main.go's explicit
+	// InitStudentPool boot call or is being created on first use by a test
+	// that never calls it — either way there is exactly one restricted pool,
+	// and NEVER a fallback to the privileged `pool` above.
+	studentPool     *pgxpool.Pool
+	studentPoolOnce sync.Once
+	studentPoolErr  error
 }
 
 func NewPostgresRepository(connString string) (*PostgresRepository, error) {
@@ -116,6 +134,16 @@ func NewPostgresRepository(connString string) (*PostgresRepository, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Pin the QUERY-path exec mode to the extended protocol so a
+	// "?default_query_exec_mode=simple_protocol" parameter in the DSN cannot
+	// downgrade tx.Query to the simple protocol, which accepts multiple
+	// statements per call (e.g. "RESET ROLE; SELECT ..."). This deliberately
+	// does NOT affect the argument-less multi-statement tx.Exec used by the
+	// lecturer schema-import sites: pgx always forces simple protocol for
+	// Exec calls with no arguments regardless of this setting (conn.go:515),
+	// so whole-file schema imports keep working unchanged.
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
 
 	// Pool Tuning for high-concurrency exams
 	config.MaxConns = 20
@@ -136,6 +164,9 @@ func NewPostgresRepository(connString string) (*PostgresRepository, error) {
 }
 
 func (r *PostgresRepository) Close() {
+	if r.studentPool != nil {
+		r.studentPool.Close()
+	}
 	r.pool.Close()
 }
 

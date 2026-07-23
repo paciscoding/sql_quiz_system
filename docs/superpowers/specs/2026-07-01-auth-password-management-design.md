@@ -141,6 +141,15 @@ StudentUpsert(row StudentRow) -> (created|updated, error)
   SendChangeNotice to `ADMIN_NOTIFY_EMAIL` env), so enabling real SMTP later is a
   one-file swap. No real SMTP in this change.
 
+### 7a. Seed admin parity (2026-07-10)
+
+- `SeedAdminAccount` now mirrors staff-create: it **generates** the admin password
+  (`GeneratePassword`), stores `ADMIN_EMAIL` on the account (so admin forgot-password
+  works), logs a `create` event (nil actor — system-seeded), and `SendCredential`s the
+  password to `ADMIN_EMAIL`. `ADMIN_PASS` is removed. The generated password is also
+  printed to the backend log once at first seed as a no-lockout bootstrap fallback.
+  Idempotent: a subsequent boot does not re-generate or re-email.
+
 ## 8. Frontend (`AdminView.vue`, `services/auth.ts`)
 
 - **Create staff** form: username + role (LECTURER/ADMIN) only (no password
@@ -179,3 +188,28 @@ tradeoff), crypto/rand generation, admin-only access with access logging, and
 ## 11. Out of scope
 
 Real SMTP/email transport; login throttling; forced-first-login change.
+
+## 12. Amendment (2026-07-02): OTP-verified forgot-password + password classes
+
+Superseded parts of the original forgot-password design:
+
+- **Forgot-password becomes two-step.** `POST /api/v1/forgot-password {username}`
+  no longer regenerates the password directly. It now emails a **6-digit
+  verification code** (OTP) to the email on file: SHA-256 hash stored on
+  `system_users` (`reset_otp_hash`, `reset_otp_expires_at`,
+  `reset_otp_attempts`), 10-minute TTL, max 5 attempts, single active code.
+  New public `POST /api/v1/forgot-password/verify {username, otp}` checks the
+  code (constant-time compare, attempts counted before compare); on success it
+  clears the OTP and runs the existing async reset (generate password → bcrypt
+  → bump token_version → `forgot_reset` event → email new password to the same
+  address). All failure causes return one generic 400 "invalid or expired
+  code"; step 1 keeps the generic 200 and the 5-minute
+  `last_forgot_reset_at` throttle.
+- **Password generation now guarantees character classes.** `GeneratePassword()`
+  stays 14 chars, crypto/rand, unambiguous alphabet, but guarantees at least
+  one uppercase, one lowercase, one digit, and one special character from
+  `!@#$%&*+-=?` (one per class + 10 from the union, crypto/rand shuffle).
+- **EmailSender** gains `SendResetCode(toEmail, username, code string) error`.
+- Frontend `ForgotPasswordView.vue` becomes a two-step wizard (username → code
+  → done), enumeration-safe: step 1 always advances, step 2 shows only the
+  generic error.

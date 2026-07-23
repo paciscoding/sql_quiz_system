@@ -100,3 +100,10 @@ When writing repository methods, qualify system-table queries with `app.`, curri
 - **API Testing:** Use the Bruno files located in `/api_tests`.
 - **Database:** Test submissions against a local `test_sandbox` schema before committing logic.
 - **Frontend tests:** Vitest + `@vue/test-utils` + `happy-dom`. Run with `cd frontend && bun run test` (or `npx vitest run`). Test files live in `frontend/src/__tests__/`, mirroring `composables/`, `services/`, `utils/`, and `components/`. Current count: **22 files, 198 cases.** `vite.config.ts` imports `defineConfig` from `vitest/config` so `vue-tsc -b` accepts the `test` block; do not change that import.
+- **Running the DML grading integration tests:** `backend/internal/repository/postgres_dml_grading_integration_test.go` covers D1 (target_table case resolution), D2 (heap-reorder-tolerant grading), D3 (0-row model answer hard block), and ARCH-013 (schema-rebuild lock blocking) against a real Postgres. Like every other `repository` integration test, it uses `openTestRepo(t)` and SKIPs cleanly when `TEST_DATABASE_URL` is unset, so the default `go test ./...` stays green with no database. To run it against a throwaway database:
+  ```bash
+  docker run -d --name dml_grading_test_pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb -p 55432:5432 postgres:15-alpine
+  TEST_DATABASE_URL="postgres://postgres:test@localhost:55432/testdb?sslmode=disable" go test ./backend/internal/repository/... -run DMLGrading -v
+  docker rm -f dml_grading_test_pg
+  ```
+  Each test creates its own scratch practice category (and owned schema) and force-deletes it on return, so re-runs against the same database leave no residue.

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
 
@@ -186,7 +188,7 @@ func (r *PostgresRepository) UpdatePracticeCategoryIntroduction(ctx context.Cont
 func (r *PostgresRepository) ListPracticeCategories(ctx context.Context) ([]models.PracticeCategory, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT c.id, c.name, c.schema_name, c.created_by, c.created_at, c.updated_at,
-		       COUNT(q.id) AS question_count, c.introduction
+		       COUNT(q.id) AS question_count, c.introduction, COALESCE(c.preview_schema_name, '')
 		FROM app.practice_categories c
 		LEFT JOIN app.practice_questions q ON q.category_id = c.id
 		GROUP BY c.id
@@ -200,9 +202,10 @@ func (r *PostgresRepository) ListPracticeCategories(ctx context.Context) ([]mode
 	for rows.Next() {
 		var c models.PracticeCategory
 		if err := rows.Scan(&c.ID, &c.Name, &c.SchemaName, &c.CreatedBy,
-			&c.CreatedAt, &c.UpdatedAt, &c.QuestionCount, &c.Introduction); err != nil {
+			&c.CreatedAt, &c.UpdatedAt, &c.QuestionCount, &c.Introduction, &c.PreviewSchemaName); err != nil {
 			return nil, err
 		}
+		c.HasPreviewSchema = c.PreviewSchemaName != ""
 		cats = append(cats, c)
 	}
 	return cats, rows.Err()
@@ -226,7 +229,9 @@ func (r *PostgresRepository) RenamePracticeCategory(ctx context.Context, id int,
 // ErrCategoryHasQuestions) when the category still has practice questions. With
 // force it cascades: deletes the questions (and their attempts via ON DELETE
 // CASCADE), drops the owned schema, then removes the category row. The
-// Uncategorized fallback category can never be deleted.
+// Uncategorized fallback category can never be deleted. Also reclaims the
+// category's decoy preview schema, if any, by canonical name (ARCH-019); a
+// failure to do so is warned-and-continued, not fatal.
 func (r *PostgresRepository) DeletePracticeCategory(ctx context.Context, id int, force bool) error {
 	var name string
 	var schema string
@@ -260,11 +265,42 @@ func (r *PostgresRepository) DeletePracticeCategory(ctx context.Context, id int,
 			return err
 		}
 		if schema != "" {
+			// ARCH-013: take the schema's exclusive rebuild lock before dropping it,
+			// so a practice evaluation in flight against this category is never
+			// dropped out from under it.
+			if err := acquireSchemaRebuildLockTx(ctx, tx, schema); err != nil {
+				return fmt.Errorf("failed to acquire schema rebuild lock: %w", err)
+			}
 			safe := pgx.Identifier{schema}.Sanitize()
 			if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safe)); err != nil {
 				return err
 			}
 		}
+
+		// Decoy preview schema (dual-schema grading, ARCH-019): dropped
+		// unconditionally by canonical name (not gated on
+		// practice_categories.preview_schema_name), so a failed or partial
+		// decoy import that never stamped the column is still reclaimed. Takes
+		// the same rebuild-lock discipline as the real schema above — load-
+		// bearing here too, because evaluateDMLPreview takes the shared eval
+		// lock on this exact schema — but deliberately, unlike the real-schema
+		// block above, a failure of EITHER the lock acquisition OR the drop is
+		// warned-and-continued rather than aborting the whole category delete:
+		// the decoy is display-only, so leaving one reclaimable schema behind
+		// is better than failing a delete over it. Mirrors the preview-drop
+		// precedent in ArchiveExamination (postgres_exams.go).
+		previewSchema := PracticeCategoryPreviewSchemaName(id)
+		if err := func() error {
+			if err := acquireSchemaRebuildLockTx(ctx, tx, previewSchema); err != nil {
+				return fmt.Errorf("failed to acquire preview schema rebuild lock: %w", err)
+			}
+			safePreview := pgx.Identifier{previewSchema}.Sanitize()
+			_, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safePreview))
+			return err
+		}(); err != nil {
+			fmt.Printf("Warning: failed to drop practice category preview schema %s during delete: %v\n", previewSchema, err)
+		}
+
 		return nil
 	})
 }
@@ -288,19 +324,34 @@ func (r *PostgresRepository) CategoryExists(ctx context.Context, id int) (bool, 
 	return exists, err
 }
 
+// CategoryHasMixedDualSchema reports whether a category holds BOTH a
+// dual_schema=true and a dual_schema=false question (GAP 4 mitigation,
+// ARCH-018). A category with zero or one question is never mixed. Used to
+// warn the lecturer that a student can open a non-dual question's preview in
+// the same category to read the grading schema, bypassing the decoy on the
+// category's dual-schema questions.
+func (r *PostgresRepository) CategoryHasMixedDualSchema(ctx context.Context, categoryID int) (bool, error) {
+	var mixed bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT COALESCE(bool_or(dual_schema) AND bool_or(NOT dual_schema), false)
+		FROM app.practice_questions
+		WHERE category_id = $1`, categoryID).Scan(&mixed)
+	return mixed, err
+}
+
 // GetPracticeCategory returns the full row for a single category including its
 // live question_count and introduction. Returns ErrCategoryNotFound if missing.
 func (r *PostgresRepository) GetPracticeCategory(ctx context.Context, id int) (*models.PracticeCategory, error) {
 	var cat models.PracticeCategory
 	err := r.pool.QueryRow(ctx, `
 		SELECT c.id, c.name, c.schema_name, c.created_by, c.created_at, c.updated_at,
-		       COUNT(q.id) AS question_count, c.introduction
+		       COUNT(q.id) AS question_count, c.introduction, COALESCE(c.preview_schema_name, '')
 		FROM app.practice_categories c
 		LEFT JOIN app.practice_questions q ON q.category_id = c.id
 		WHERE c.id = $1
 		GROUP BY c.id`, id).Scan(
 		&cat.ID, &cat.Name, &cat.SchemaName, &cat.CreatedBy, &cat.CreatedAt, &cat.UpdatedAt,
-		&cat.QuestionCount, &cat.Introduction,
+		&cat.QuestionCount, &cat.Introduction, &cat.PreviewSchemaName,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -308,6 +359,7 @@ func (r *PostgresRepository) GetPracticeCategory(ctx context.Context, id int) (*
 		}
 		return nil, err
 	}
+	cat.HasPreviewSchema = cat.PreviewSchemaName != ""
 	return &cat, nil
 }
 
@@ -326,25 +378,41 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 	status := "captured"
 	var captureErr string
 	var expectedResult, expectedCols []byte
+	var expectedRowsAffected *int
 
-	err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols)
-	if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
-		return err
+	if q.Type != "QUERY" {
+		if canonical, resolveErr := r.ResolveTargetTable(ctx, schema, q.TargetTable); resolveErr != nil {
+			status = "failed"
+			captureErr = resolveErr.Error()
+			q.TargetTable = strings.TrimSpace(q.TargetTable)
+		} else {
+			q.TargetTable = canonical
+			err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+			if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
+				return err
+			}
+		}
+	} else {
+		err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+		if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
+			return err
+		}
 	}
+	q.ExpectedRowsAffected = expectedRowsAffected
 
 	query := `
 		INSERT INTO app.practice_questions (
 			created_by, category_id, target_table, correct_sql, question_type, requirement,
 			points, strict_ordering, strict_attrs, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			capture_error, title, expected_result_captured_at, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW(), NOW())
+			capture_error, title, expected_rows_affected, dual_schema, expected_result_captured_at, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW(), NOW())
 		RETURNING id, created_at, updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CreatedBy, q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.Title,
+		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema,
 	).Scan(&q.ID, &q.CreatedAt, &q.UpdatedAt)
 }
 
@@ -353,7 +421,7 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 // the marshalled expected result + columns. Returns errCaptureRollback on
 // success (so WithTransaction discards the lecturer's DML side effects) or
 // errCaptureFailed when the SQL aborts.
-func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema string, q *models.PracticeQuestion, status *string, captureErr *string, expectedResult *[]byte, expectedCols *[]byte) error {
+func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema string, q *models.PracticeQuestion, status *string, captureErr *string, expectedResult *[]byte, expectedCols *[]byte, expectedRowsAffected **int) error {
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		safeSchema := pgx.Identifier{schema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", safeSchema)); err != nil {
@@ -369,9 +437,21 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 			if q.TargetTable == "" {
 				return fmt.Errorf("target table is required for DML questions")
 			}
-			_, err = tx.Exec(ctx, q.CorrectSQL)
+			var tag pgconn.CommandTag
+			tag, err = tx.Exec(ctx, q.CorrectSQL)
 			if err == nil {
-				results, orderedCols, err = r.queryWithTxCols(ctx, tx, schema, fmt.Sprintf("SELECT * FROM %s", q.TargetTable))
+				// D3 (ARCH-008): a model answer that affects 0 rows is unGRADEABLE —
+				// every student statement, correct or not, produces the same
+				// untouched end state. Hard block, no override.
+				if tag.RowsAffected() == 0 {
+					*status = "failed"
+					*captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
+					return errCaptureFailed
+				}
+				rowsAffected := int(tag.RowsAffected())
+				*expectedRowsAffected = &rowsAffected
+				safeTable := pgx.Identifier{q.TargetTable}.Sanitize()
+				results, orderedCols, err = r.queryWithTxCols(ctx, tx, schema, fmt.Sprintf("SELECT * FROM %s", safeTable))
 			}
 		}
 
@@ -394,6 +474,78 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 	})
 }
 
+// PreviewPracticeCorrectSQL dry-runs a lecturer's correct SQL for a practice
+// question against its owning category's schema (never 'public'), inside a
+// transaction that is always rolled back. For DML the post-image of the
+// resolved target_table is returned. Mirrors PreviewCorrectSQLInSchema
+// (postgres_questions.go) but resolves the category schema instead of an exam
+// curriculum schema (ARCH-003). When useDecoy is true, previews against the
+// category's decoy preview schema (ARCH-006 / "Preview as student" for
+// dual-schema questions) instead of the real grading schema; it never falls
+// back silently to the real schema when no decoy has been imported.
+func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, categoryID int, qType, targetTable, sqlText string, useDecoy bool) ([]map[string]interface{}, error) {
+	if sqlText == "" {
+		return nil, fmt.Errorf("sql text is empty")
+	}
+	if qType == "DML" && targetTable == "" {
+		return nil, fmt.Errorf("target_table is required for DML preview")
+	}
+
+	sqlText = normalizeSmartQuotes(sqlText)
+
+	var previewSchema string
+	var err error
+	if useDecoy {
+		previewSchema, err = r.GetPracticeCategoryPreviewSchema(ctx, categoryID)
+		if err != nil {
+			return nil, err
+		}
+		if previewSchema == "" {
+			return nil, fmt.Errorf("no decoy schema uploaded for this category")
+		}
+	} else {
+		previewSchema, err = r.GetPracticeCategorySchema(ctx, categoryID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if qType == "DML" {
+		canonical, resolveErr := r.ResolveTargetTable(ctx, previewSchema, targetTable)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		targetTable = canonical
+	}
+
+	var results []map[string]interface{}
+	previewErr := r.WithTransaction(ctx, func(tx pgx.Tx) error {
+		safe := pgx.Identifier{previewSchema}.Sanitize()
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safe)); err != nil {
+			return err
+		}
+		var err error
+		if qType == "QUERY" {
+			results, err = r.queryWithTx(ctx, tx, previewSchema, sqlText)
+		} else {
+			if _, err = tx.Exec(ctx, sqlText); err != nil {
+				return err
+			}
+			safeTable := pgx.Identifier{targetTable}.Sanitize()
+			results, err = r.queryWithTx(ctx, tx, previewSchema, fmt.Sprintf("SELECT * FROM %s", safeTable))
+		}
+		if err != nil {
+			return err
+		}
+		// Roll back so the category schema stays pristine for next preview / capture.
+		return errCaptureRollback
+	})
+	if previewErr != nil && !errors.Is(previewErr, errCaptureRollback) {
+		return nil, previewErr
+	}
+	return results, nil
+}
+
 func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error {
 	// Repair typographic quotes before capture and persistence (see Create).
 	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
@@ -406,11 +558,27 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 	status := "captured"
 	var captureErr string
 	var expectedResult, expectedCols []byte
+	var expectedRowsAffected *int
 
-	err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols)
-	if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
-		return err
+	if q.Type != "QUERY" {
+		if canonical, resolveErr := r.ResolveTargetTable(ctx, schema, q.TargetTable); resolveErr != nil {
+			status = "failed"
+			captureErr = resolveErr.Error()
+			q.TargetTable = strings.TrimSpace(q.TargetTable)
+		} else {
+			q.TargetTable = canonical
+			err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+			if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
+				return err
+			}
+		}
+	} else {
+		err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+		if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
+			return err
+		}
 	}
+	q.ExpectedRowsAffected = expectedRowsAffected
 
 	query := `
 		UPDATE app.practice_questions
@@ -418,25 +586,26 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 		    points=$6, strict_ordering=$7, strict_attrs=$8, strict_column_order=$9,
 		    expected_result=$10, expected_columns=$11,
 		    expected_result_status=$12, capture_error=$13, title=$14,
+		    expected_rows_affected=$15, dual_schema=$16,
 		    expected_result_captured_at=NOW(), updated_at=NOW()
-		WHERE id=$15
+		WHERE id=$17
 		RETURNING updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.Title, q.ID,
+		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, q.ID,
 	).Scan(&q.UpdatedAt)
 }
 
 func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]models.PracticeQuestion, error) {
 	query := `
 		SELECT pq.id, pq.created_by, pq.category, COALESCE(pq.category_id, 0),
-		       COALESCE(pc.name, ''), COALESCE(pc.schema_name, ''),
+		       COALESCE(pc.name, ''), COALESCE(pc.schema_name, ''), pq.dual_schema, COALESCE(pc.preview_schema_name, ''),
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
 		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
-		       pq.created_at, pq.updated_at
+		       pq.expected_rows_affected, pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		ORDER BY pq.id ASC`
@@ -451,11 +620,11 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 	for rows.Next() {
 		var q models.PracticeQuestion
 		err := rows.Scan(
-			&q.ID, &q.CreatedBy, &q.Category, &q.CategoryID, &q.CategoryName, &q.CategorySchema,
+			&q.ID, &q.CreatedBy, &q.Category, &q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.DualSchema, &q.CategoryPreviewSchema,
 			&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 			&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
 			&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
-			&q.CreatedAt, &q.UpdatedAt)
+			&q.ExpectedRowsAffected, &q.CreatedAt, &q.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -467,22 +636,22 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*models.PracticeQuestion, error) {
 	query := `
 		SELECT pq.id, pq.created_by, pq.category, COALESCE(pq.category_id, 0),
-		       COALESCE(pc.name, ''), COALESCE(pc.schema_name, ''),
+		       COALESCE(pc.name, ''), COALESCE(pc.schema_name, ''), pq.dual_schema, COALESCE(pc.preview_schema_name, ''),
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
 		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
-		       pq.created_at, pq.updated_at
+		       pq.expected_rows_affected, pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		WHERE pq.id=$1`
 
 	var q models.PracticeQuestion
 	err := r.pool.QueryRow(ctx, query, id).Scan(
-		&q.ID, &q.CreatedBy, &q.Category, &q.CategoryID, &q.CategoryName, &q.CategorySchema,
+		&q.ID, &q.CreatedBy, &q.Category, &q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.DualSchema, &q.CategoryPreviewSchema,
 		&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 		&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
 		&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
-		&q.CreatedAt, &q.UpdatedAt)
+		&q.ExpectedRowsAffected, &q.CreatedAt, &q.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

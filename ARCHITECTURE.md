@@ -213,19 +213,22 @@ Practice questions are organized into **categories** (`app.practice_categories`)
 ### Practice During Exams (Per-Exam Toggle)
 Because each category owns a schema separate from `public` and the exam sandboxes, practice is **live during exams by default** — there is no shared-state split-brain to guard against. Practice student endpoints are gated by `PracticeFreezeMiddleware`, which blocks practice (**423 Locked**, `{"error": "practice_unavailable_during_exam"}`) only when an active examination has its `block_practice_during_exam` toggle set (the optional "focus" rule, flipped via PUT `/api/v1/lecturer/exams/:id/practice-freeze`). The check is cached in-process for 5 seconds and invalidated on activate/deactivate/toggle. With every exam's toggle off (the default) practice stays available throughout exams. Lecturer-facing practice endpoints are never frozen. (`ExamFreezeMiddleware`, which froze on *any* active exam, is retained but no longer wired to the practice group.)
 
-### Advisory Lock Partitioning
-Practice DML submissions follow the same serialisation pattern as exam submissions but use a separate namespace for advisory locks to avoid collisions. The lock key is derived from `FNV1a("practice:" + target_table)`. This partitioning allows practice questions targeting different tables to be evaluated in parallel, while ensuring that concurrent submissions to the same table are serialised.
+### Practice Evaluation Concurrency
+Practice DML (and SELECT) submissions do **not** pass through the `SubmissionQueue` — that queue is exam-only, wired in `quiz_controller.go` (single worker, capacity 256, 30 s per-job timeout). Practice evaluations run directly on pool connections; there is no serialisation queue for practice at all. Instead, correctness comes from two independent mechanisms:
+- **Savepoint-rollback isolation**: every practice DML submission executes inside its own transaction with `SAVEPOINT student_eval` immediately rolled back, so concurrent students never see each other's writes and the category schema is unchanged after every attempt.
+- **A shared per-schema advisory lock**: every evaluation path (`evaluateQuery`, `evaluateDML`, `evaluateDMLPreview`) takes `pg_advisory_xact_lock_shared` keyed on the schema it runs against (`schemaRebuildLockKey`, see `postgres_rebuild_lock.go`) for the life of its transaction. Its only purpose is to guard against a schema being dropped and rebuilt mid-evaluation — `ResetPracticeSandbox`, category import-with-replace, and category delete all take the same key EXCLUSIVELY (`pg_advisory_xact_lock`) before dropping a schema, so a rebuild blocks until every in-flight evaluation against that schema finishes, and new evaluations wait until the rebuild completes. Shared holders never block each other, so two categories (or an exam sandbox and a category) never contend, and concurrent submissions against the *same* table are graded independently, not serialised — the savepoint rollback is what keeps them from interfering.
 
 ### Savepoint-Rollback Semantics
 Each DML practice submission is executed within a transaction using the following sequence:
 1. `BEGIN;`
-2. `SAVEPOINT student_eval;`
-3. `SET LOCAL search_path = practice_cat_{categoryID}, public;`
-4. `SET LOCAL ROLE exam_student;`
-5. Execute student SQL.
-6. `SELECT * FROM target_table;` (capture post-state for validation).
-7. `ROLLBACK TO SAVEPOINT student_eval;`
-8. `COMMIT;`
+2. Take the shared per-schema advisory lock (`acquireSchemaEvalLock`).
+3. `SAVEPOINT student_eval;`
+4. `SET LOCAL search_path = practice_cat_{categoryID}, public;`
+5. `SET LOCAL ROLE exam_student;`
+6. Execute student SQL.
+7. `SELECT * FROM target_table;` (capture post-state for validation).
+8. `RESET ROLE; ROLLBACK TO SAVEPOINT student_eval;`
+9. `COMMIT;` (a commit failure here is a no-op for grading — the savepoint rollback already emptied the transaction).
 
 This pattern ensures the category's `practice_cat_{id}` schema remains in its original state after every attempt, providing a hermetic environment for each student. SELECT (Query) practice submissions read the same category schema under the `exam_student_readonly` role (no public fallback), so they too are isolated from the exam curriculum.
 

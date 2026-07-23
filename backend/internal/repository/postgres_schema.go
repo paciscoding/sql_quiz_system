@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -16,16 +17,6 @@ import (
 // practiceSandboxSchema is the single shared schema that every practice
 // evaluation runs against and that ResetPracticeSandbox rebuilds.
 const practiceSandboxSchema = "sandbox_practice"
-
-// practiceResetLockKey is the Postgres advisory-lock key that serialises a
-// full practice-sandbox rebuild against in-flight practice evaluations.
-// ResetPracticeSandbox takes it EXCLUSIVELY (pg_advisory_lock); each practice
-// evaluation takes it SHARED (pg_advisory_xact_lock_shared) for the life of its
-// transaction. Shared holders run concurrently; the exclusive reset waits for
-// every in-flight eval to finish and blocks new ones until the rebuild is done,
-// so no student SQL can ever execute against a half-dropped / half-cloned
-// schema. The key is derived once, deterministically, from a stable string.
-var practiceResetLockKey = fnv1a64Signed("sql_quiz/practice:reset")
 
 // fnv1a64Signed hashes s with FNV-1a (64-bit) and reinterprets the bits as an
 // int64 so it fits Postgres advisory-lock's bigint key argument.
@@ -48,12 +39,97 @@ func (r *PostgresRepository) CreateRestrictedUser(ctx context.Context) error {
 		"GRANT USAGE ON SCHEMA public TO exam_student_readonly",
 		"GRANT SELECT ON ALL TABLES IN SCHEMA public TO exam_student_readonly",
 		"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO exam_student_readonly",
+		// ARCH-020 (GAP 3): two preview-only roles, used ONLY when a preview
+		// resolves to a dual-schema decoy (postgres_evaluation.go). They are
+		// deliberately never granted USAGE/SELECT on public here (unlike
+		// exam_student / exam_student_readonly above) — their only privileges
+		// come from grantPreviewSchemaPermissions on the decoy schemas
+		// themselves, so they can never read a real curriculum/category schema.
+		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'exam_student_preview') THEN CREATE ROLE exam_student_preview NOLOGIN NOINHERIT; END IF; END $$",
+		"REVOKE ALL ON SCHEMA public FROM exam_student_preview",
+		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'exam_student_preview_readonly') THEN CREATE ROLE exam_student_preview_readonly NOLOGIN NOINHERIT; END IF; END $$",
+		"REVOKE ALL ON SCHEMA public FROM exam_student_preview_readonly",
 	}
 
 	for _, q := range queries {
 		if _, err := r.pool.Exec(ctx, q); err != nil {
 			return fmt.Errorf("failed to setup restricted roles: %w", err)
 		}
+	}
+
+	// Provision the quiz_exec LOGIN role (ARCH-025) here too, so a fresh volume
+	// needs no external script and `docker compose up` boots healthy on its own.
+	if err := r.ensureStudentExecRole(ctx); err != nil {
+		return fmt.Errorf("failed to provision quiz_exec role: %w", err)
+	}
+
+	// Boot-time self-heal (ARCH-020): decoy preview schemas created by the
+	// already-merged dual-schema code have no grants for the two roles above.
+	// Sweeping and re-applying grantPreviewSchemaPermissions here means a plain
+	// `docker compose down && up` fixes every existing decoy with no migration
+	// file and no manual DBA step.
+	return r.reconcilePreviewSchemaGrants(ctx)
+}
+
+// ensureStudentExecRole provisions the quiz_exec LOGIN role (ARCH-025) at boot
+// so a fresh volume needs no external provisioning script. Student SQL
+// authenticates as this role through the restricted pool
+// (postgres_student_pool.go); its password is the single source of truth in
+// STUDENT_DB_PASSWORD and is resynced every boot so the role and the pool can
+// never drift apart.
+//
+// This requires the app connection to hold CREATEROLE, which is true while
+// DB_USER is a superuser. Once the app role is de-privileged (NOCREATEROLE —
+// the deferred ARCH-022 posture), it can no longer create or alter roles. That
+// is tolerated here: if quiz_exec already exists (provisioned out of band by
+// scripts/deprivilege_app_db_user.sql) a privilege failure is logged, not
+// fatal, and InitStudentPool remains the authoritative gate. A MISSING role we
+// still cannot create is a hard error — the backend genuinely cannot run.
+func (r *PostgresRepository) ensureStudentExecRole(ctx context.Context) error {
+	pw := os.Getenv(StudentDBPasswordEnv)
+	if pw == "" {
+		// Let InitStudentPool emit the one authoritative "required" fatal.
+		return nil
+	}
+	// standard_conforming_strings is on by default: escape only the quote.
+	lit := "'" + strings.ReplaceAll(pw, "'", "''") + "'"
+	const attrs = "LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS"
+
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'quiz_exec')").Scan(&exists); err != nil {
+		return fmt.Errorf("check quiz_exec existence: %w", err)
+	}
+
+	verb := "CREATE ROLE"
+	if exists {
+		verb = "ALTER ROLE"
+	}
+	if _, err := r.pool.Exec(ctx, verb+" quiz_exec "+attrs+" PASSWORD "+lit); err != nil {
+		if exists {
+			// Present but we lack privilege to resync the password (deprivileged
+			// app role). Treat the out-of-band password as authoritative.
+			log.Printf("ARCH-025: quiz_exec present but password not resynced (%v); "+
+				"assuming out-of-band STUDENT_DB_PASSWORD is authoritative", err)
+			return nil
+		}
+		return fmt.Errorf("create quiz_exec role: %w", err)
+	}
+
+	// Membership in the four sandbox roles the evaluator SET LOCAL ROLEs into.
+	// Idempotent; safe every boot. The sandbox roles are created just above.
+	if _, err := r.pool.Exec(ctx,
+		"GRANT exam_student, exam_student_readonly, exam_student_preview, "+
+			"exam_student_preview_readonly TO quiz_exec"); err != nil {
+		return fmt.Errorf("grant sandbox roles to quiz_exec: %w", err)
+	}
+
+	// CONNECT is granted to PUBLIC by default; make it explicit so the role
+	// still connects if CONNECT is ever revoked from PUBLIC (ARCH-022).
+	var dbname string
+	if err := r.pool.QueryRow(ctx, "SELECT current_database()").Scan(&dbname); err == nil {
+		_, _ = r.pool.Exec(ctx, "GRANT CONNECT ON DATABASE "+
+			pgx.Identifier{dbname}.Sanitize()+" TO quiz_exec")
 	}
 	return nil
 }
@@ -342,19 +418,45 @@ func (r *PostgresRepository) ImportSchemaIntoCategory(ctx context.Context, categ
 		return err
 	}
 
+	// Check-and-drop runs inside a transaction holding the schema's exclusive
+	// rebuild lock (ARCH-013), so a practice evaluation in flight against this
+	// category's schema is never dropped out from under it: the DROP waits for
+	// every shared holder (acquireSchemaEvalLock) to finish, and new
+	// evaluations wait until this transaction commits.
 	var tableCount int
-	if err := r.pool.QueryRow(ctx,
-		"SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = $1", schema).Scan(&tableCount); err != nil {
+	if err := func() error {
+		conn, err := r.pool.Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Release()
+
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+
+		if err := acquireSchemaRebuildLockTx(ctx, tx, schema); err != nil {
+			return fmt.Errorf("failed to acquire schema rebuild lock: %w", err)
+		}
+
+		if err := tx.QueryRow(ctx,
+			"SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = $1", schema).Scan(&tableCount); err != nil {
+			return err
+		}
+		if tableCount > 0 {
+			if !confirmReplace {
+				return ErrCategoryNotEmpty
+			}
+			safe := pgx.Identifier{schema}.Sanitize()
+			if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safe)); err != nil {
+				return fmt.Errorf("failed to drop category schema for replace: %w", err)
+			}
+		}
+		return tx.Commit(ctx)
+	}(); err != nil {
 		return err
-	}
-	if tableCount > 0 {
-		if !confirmReplace {
-			return ErrCategoryNotEmpty
-		}
-		safe := pgx.Identifier{schema}.Sanitize()
-		if _, err := r.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safe)); err != nil {
-			return fmt.Errorf("failed to drop category schema for replace: %w", err)
-		}
 	}
 	// (Re)create the empty schema with role grants before importing.
 	if err := r.ensureCategorySchema(ctx, categoryID); err != nil {
@@ -832,25 +934,27 @@ func (r *PostgresRepository) InitializePracticeSandbox(ctx context.Context) erro
 // the caller can include it in API responses.
 func (r *PostgresRepository) ResetPracticeSandbox(ctx context.Context) (time.Time, error) {
 	const schema = practiceSandboxSchema
+	lockKey := schemaRebuildLockKey(schema)
 
 	// Serialise the whole rebuild against in-flight practice evaluations. We
 	// hold a dedicated connection and take the advisory lock EXCLUSIVELY at the
 	// SESSION level: pg_advisory_lock blocks until every shared holder (each an
-	// in-flight eval, see evaluate*) has released, then keeps new evals waiting
-	// until we unlock. Advisory locks are cooperative and cross-connection, so
-	// the DDL below may keep using the pool — only the lock discipline matters.
+	// in-flight eval, see evaluate*/acquireSchemaEvalLock) has released, then
+	// keeps new evals waiting until we unlock. Advisory locks are cooperative
+	// and cross-connection, so the DDL below may keep using the pool — only the
+	// lock discipline matters.
 	lockConn, err := r.pool.Acquire(ctx)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to acquire lock connection for practice reset: %w", err)
 	}
 	defer lockConn.Release()
-	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", practiceResetLockKey); err != nil {
+	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
 		return time.Time{}, fmt.Errorf("failed to acquire practice reset lock: %w", err)
 	}
 	// Best-effort explicit unlock. Releasing the connection would also drop the
 	// session lock, but unlocking eagerly frees waiting evals a moment sooner.
 	defer func() {
-		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", practiceResetLockKey)
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", lockKey)
 	}()
 
 	// Drop and recreate for a clean slate.
@@ -930,7 +1034,8 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			scheduled_start_at TIMESTAMP WITH TIME ZONE,
 			scheduled_end_at TIMESTAMP WITH TIME ZONE,
 			block_practice_during_exam BOOLEAN NOT NULL DEFAULT FALSE,
-			introduction TEXT NOT NULL DEFAULT ''
+			introduction TEXT NOT NULL DEFAULT '',
+			preview_curriculum_schema TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS app.questions (
 			id INTEGER PRIMARY KEY,
@@ -948,6 +1053,8 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			expected_result_status VARCHAR(16) DEFAULT 'pending',
 			expected_result_captured_at TIMESTAMP WITH TIME ZONE,
 			capture_error TEXT,
+			expected_rows_affected INTEGER,
+			dual_schema BOOLEAN NOT NULL DEFAULT false,
 			created_by INTEGER REFERENCES app.system_users(id),
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -997,7 +1104,9 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			expected_columns JSONB,
 			expected_result_status TEXT NOT NULL DEFAULT 'pending' CHECK (expected_result_status IN ('pending','captured','failed')),
 			capture_error TEXT,
+			expected_rows_affected INTEGER,
 			expected_result_captured_at TIMESTAMPTZ,
+			dual_schema BOOLEAN NOT NULL DEFAULT false,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);`,
@@ -1028,7 +1137,8 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			created_by INTEGER NOT NULL REFERENCES app.system_users(id),
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			introduction TEXT NOT NULL DEFAULT ''
+			introduction TEXT NOT NULL DEFAULT '',
+			preview_schema_name TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS app.schema_import_audit (
 			id SERIAL PRIMARY KEY,
@@ -1167,6 +1277,20 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		// Practice-question display title (2026-07-19). Nullable/optional: existing
 		// rows read back as empty string; the UI falls back to an ordinal when unset.
 		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS title TEXT",
+		// DML grading correctness (2026-07-19, ARCH-009). Diagnostics-only rows-
+		// affected count captured from the lecturer's correct_sql CommandTag. NULL
+		// for QUERY questions, for failed captures, and for every pre-existing row
+		// (captured before this column existed) — never read during grading.
+		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS expected_rows_affected INTEGER",
+		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS expected_rows_affected INTEGER",
+		// Dual-schema grading (2026-07-22, ARCH-001): a lecturer can toggle a
+		// question to preview against a decoy schema while grading stays on the
+		// real curriculum/practice schema. DEFAULT false / '' so every existing
+		// question and category keeps today's single-schema behaviour untouched.
+		"ALTER TABLE app.practice_categories ADD COLUMN IF NOT EXISTS preview_schema_name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE app.examinations ADD COLUMN IF NOT EXISTS preview_curriculum_schema TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS dual_schema BOOLEAN NOT NULL DEFAULT false",
+		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS dual_schema BOOLEAN NOT NULL DEFAULT false",
 	}
 
 	for _, q := range extraMigrations {

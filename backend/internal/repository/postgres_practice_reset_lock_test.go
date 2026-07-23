@@ -6,25 +6,30 @@ import (
 	"time"
 )
 
-// TestPracticeResetLockKey_Stable pins the advisory-lock key so it can never
-// drift silently. The key MUST be identical on the reset side and the eval side
-// (both derive it from practiceResetLockKey); if a refactor changed the seed
-// string on only one side the two would stop mutually excluding and the race
-// this whole feature closes would come back undetected. No database needed.
-func TestPracticeResetLockKey_Stable(t *testing.T) {
-	if practiceResetLockKey == 0 {
-		t.Fatal("practiceResetLockKey must be non-zero")
+// TestSchemaRebuildLockKey_Stable pins schemaRebuildLockKey so it can never
+// drift silently. The key MUST be identical on the rebuild side and the eval
+// side (both derive it from the same function); if a refactor changed the
+// derivation on only one side the two would stop mutually excluding and the
+// race this whole feature closes would come back undetected. No database
+// needed.
+func TestSchemaRebuildLockKey_Stable(t *testing.T) {
+	key := schemaRebuildLockKey(practiceSandboxSchema)
+	if key == 0 {
+		t.Fatal("schemaRebuildLockKey(sandbox_practice) must be non-zero")
 	}
-	if got := fnv1a64Signed("sql_quiz/practice:reset"); got != practiceResetLockKey {
-		t.Fatalf("practiceResetLockKey drifted: got %d want %d", practiceResetLockKey, got)
+	if got := fnv1a64Signed("sql_quiz/schema-rebuild:" + practiceSandboxSchema); got != key {
+		t.Fatalf("schemaRebuildLockKey drifted: got %d want %d", key, got)
 	}
-	// acquirePracticeEvalLock is a no-op for non-practice schemas and must not
-	// touch the (here nil) tx — exam evaluations pay nothing.
-	if err := acquirePracticeEvalLock(context.Background(), nil, "sandbox_exam_9"); err != nil {
-		t.Fatalf("non-practice schema must skip the lock, got %v", err)
+	// Unlike the retired acquirePracticeEvalLock, acquireSchemaEvalLock has no
+	// schema-name filter: it is keyed per-schema and every distinct schema gets
+	// a distinct, deterministic key.
+	if schemaRebuildLockKey("sandbox_exam_9") == schemaRebuildLockKey("practice_cat_1") {
+		t.Fatal("distinct schemas must not collide on the same lock key")
 	}
-	if err := acquirePracticeEvalLock(context.Background(), nil, "public"); err != nil {
-		t.Fatalf("public schema must skip the lock, got %v", err)
+	// acquireSchemaEvalLock is a true no-op only for an empty schema string —
+	// it must not touch the (here nil) tx in that case.
+	if err := acquireSchemaEvalLock(context.Background(), nil, ""); err != nil {
+		t.Fatalf("empty schema must skip the lock, got %v", err)
 	}
 }
 
@@ -53,7 +58,7 @@ func TestResetPracticeSandbox_BlocksOnInFlightEval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin eval tx: %v", err)
 	}
-	if _, err := evalTx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1)", practiceResetLockKey); err != nil {
+	if _, err := evalTx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1)", schemaRebuildLockKey(practiceSandboxSchema)); err != nil {
 		t.Fatalf("take shared lock: %v", err)
 	}
 

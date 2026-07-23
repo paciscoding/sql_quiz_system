@@ -19,6 +19,12 @@ type PracticeCategory struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 	Introduction  string     `json:"introduction"`
+	// PreviewSchemaName is the decoy schema (dual-schema grading) imported for
+	// this category's student previews; empty when no decoy has been imported.
+	PreviewSchemaName string `json:"preview_schema_name"`
+	// HasPreviewSchema is a derived convenience flag: PreviewSchemaName != "".
+	// Populated by the category read paths; false when no decoy exists.
+	HasPreviewSchema bool `json:"has_preview_schema"`
 }
 
 // PracticeQuestion mirrors models.Question (submission.go) minus ExamID.
@@ -34,13 +40,22 @@ type PracticeQuestion struct {
 	// convenience; they are not stored on app.practice_questions.
 	CategoryName   string `json:"category_name,omitempty"`
 	CategorySchema string `json:"-"`
-	Category       string `json:"category,omitempty"`
+	// CategoryPreviewSchema is the category's decoy schema (dual-schema
+	// grading), populated by read joins for response convenience; not stored
+	// on app.practice_questions. Empty when the category has no decoy.
+	CategoryPreviewSchema string `json:"-"`
+	Category              string `json:"category,omitempty"`
 	// Title is the practice-question display name. Empty string means "no
 	// title set"; the UI falls back to an ordinal in that case (ARCH-009).
-	Title                    string          `json:"title"`
-	TargetTable              string          `json:"target_table"`
-	CorrectSQL               string          `json:"correct_sql"`
-	Type                     string          `json:"question_type"`
+	Title       string `json:"title"`
+	TargetTable string `json:"target_table"`
+	CorrectSQL  string `json:"correct_sql"`
+	Type        string `json:"question_type"`
+	// DualSchema, when true, routes the student PREVIEW to the category's
+	// decoy schema (CategoryPreviewSchema) while GRADING stays on the real
+	// category schema. Defaults to false — unset/omitted means single-schema
+	// (today's) behaviour.
+	DualSchema               bool            `json:"dual_schema"`
 	Requirement              string          `json:"requirement"`
 	Points                   float64         `json:"points"`
 	StrictOrdering           bool            `json:"strict_ordering"`
@@ -51,8 +66,12 @@ type PracticeQuestion struct {
 	ExpectedResultStatus     string          `json:"expected_result_status"`
 	CaptureError             string          `json:"capture_error,omitempty"`
 	ExpectedResultCapturedAt *time.Time      `json:"expected_result_captured_at,omitempty"`
-	CreatedAt                time.Time       `json:"created_at"`
-	UpdatedAt                time.Time       `json:"updated_at"`
+	// ExpectedRowsAffected is the rows-affected count of the lecturer's DML
+	// correct_sql at capture time, for diagnostics only. NULL for QUERY
+	// questions and for failed captures. Never read during grading (ARCH-009).
+	ExpectedRowsAffected *int      `json:"expected_rows_affected,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // AsQuestion builds a *Question suitable for passing to ValidationService.
@@ -67,6 +86,7 @@ func (pq *PracticeQuestion) AsQuestion() *Question {
 		ID:                       int(pq.ID),
 		ExamID:                   nil,
 		Type:                     pq.Type,
+		DualSchema:               pq.DualSchema,
 		TargetTable:              pq.TargetTable,
 		CorrectSQL:               pq.CorrectSQL,
 		Points:                   pq.Points,
@@ -76,6 +96,7 @@ func (pq *PracticeQuestion) AsQuestion() *Question {
 		ExpectedColumns:          pq.ExpectedColumns,
 		ExpectedResultStatus:     pq.ExpectedResultStatus,
 		ExpectedResultCapturedAt: pq.ExpectedResultCapturedAt,
+		ExpectedRowsAffected:     pq.ExpectedRowsAffected,
 		CaptureError:             pq.CaptureError,
 		CreatedBy:                pq.CreatedBy,
 		CreatedAt:                pq.CreatedAt,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -41,8 +42,21 @@ func (ctrl *PracticeController) ListForStudent(c *gin.Context) {
 	// Zero out sensitive fields for students
 	for i := range questions {
 		questions[i].CorrectSQL = ""
-		questions[i].ExpectedResult = nil
-		questions[i].ExpectedColumns = nil
+		// QUERY questions show their Expected Result to students (parity with
+		// the exam view); it is a target output, not the SQL answer. DML
+		// questions keep it hidden (it can leak grading-schema row data).
+		if questions[i].Type != "QUERY" {
+			questions[i].ExpectedResult = nil
+			questions[i].ExpectedColumns = nil
+		}
+		// ARCH-018 (e5): capture_error and expected_rows_affected are
+		// B-derived (the lecturer's correct_sql executed on the grading
+		// schema); expected_rows_affected in particular is a direct numeric
+		// hint about B's data. Dual-only, to keep non-dual byte-identical.
+		if questions[i].DualSchema {
+			questions[i].CaptureError = ""
+			questions[i].ExpectedRowsAffected = nil
+		}
 	}
 
 	c.JSON(http.StatusOK, questions)
@@ -63,8 +77,20 @@ func (ctrl *PracticeController) GetForStudent(c *gin.Context) {
 
 	// Zero out sensitive fields for students
 	question.CorrectSQL = ""
-	question.ExpectedResult = nil
-	question.ExpectedColumns = nil
+	// QUERY questions show their Expected Result to students (parity with the
+	// exam view); it is a target output, not the SQL answer. DML questions keep
+	// it hidden (it can leak grading-schema row data).
+	if question.Type != "QUERY" {
+		question.ExpectedResult = nil
+		question.ExpectedColumns = nil
+	}
+	// ARCH-018 (e5): capture_error and expected_rows_affected are B-derived
+	// (the lecturer's correct_sql executed on the grading schema); dual-only,
+	// to keep non-dual byte-identical.
+	if question.DualSchema {
+		question.CaptureError = ""
+		question.ExpectedRowsAffected = nil
+	}
 
 	c.JSON(http.StatusOK, question)
 }
@@ -87,6 +113,17 @@ func (ctrl *PracticeController) Submit(c *gin.Context) {
 	question, err := ctrl.repo.GetPracticeQuestion(ctx, int(req.PracticeQuestionID))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "practice question not found"})
+		return
+	}
+
+	// ARCH-004: refuse to grade a question whose model answer was never
+	// successfully captured — grading it would silently compare against a nil
+	// expected_result and mark every submission "The result is wrong."
+	if question.ExpectedResultStatus != "captured" {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "question_not_ready",
+			"message": "This question is not ready yet - its model answer could not be verified. Please tell your lecturer.",
+		})
 		return
 	}
 
@@ -146,8 +183,20 @@ func (ctrl *PracticeController) Preview(c *gin.Context) {
 		return
 	}
 
+	previewSchema := ""
+	if question.DualSchema && question.CategoryPreviewSchema != "" {
+		if hasTables, _ := ctrl.repo.SchemaHasTables(ctx, question.CategoryPreviewSchema); hasTables {
+			previewSchema = question.CategoryPreviewSchema
+		}
+	}
+	if question.DualSchema && previewSchema == "" {
+		// Dual-without-decoy fallback (spec 6.1): single-schema fallback to B. The student is
+		// never blocked and never told; the lecturer is warned on save instead (see Upsert).
+		log.Printf("dual-schema fallback: practice question %d (category %d) has dual_schema=true but no usable decoy; preview running on grading schema B", question.ID, question.CategoryID)
+	}
+
 	q := question.AsQuestion()
-	vResult, rows, columns, rowCount, truncated, err := ctrl.validator.ValidatePreview(ctx, int(student.ID), *q, req.SQLText, schema)
+	vResult, rows, columns, rowCount, truncated, err := ctrl.validator.ValidatePreview(ctx, int(student.ID), *q, req.SQLText, schema, previewSchema)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -160,9 +209,23 @@ func (ctrl *PracticeController) Preview(c *gin.Context) {
 		columns = []string{}
 	}
 
+	// ARCH-006's DML diff (missing/extra row contents) belongs in Feedback for
+	// Submit, where the attempt is recorded and the diff is the whole point.
+	// On Preview ("Test Run") nothing is recorded and retries are unlimited, so
+	// leaking the diff here would let a student iterate to a correct answer
+	// without writing correct SQL. Suppress it for correct/incorrect results;
+	// syntax_error feedback is preserved verbatim so students still see real
+	// SQL errors. Unlike the exam preview guard, status is left untouched —
+	// practice preview has always returned real correct/incorrect status and
+	// the frontend does not treat preview status as an answer signal.
+	feedback := vResult.Feedback
+	if vResult.Status == "correct" || vResult.Status == "incorrect" {
+		feedback = ""
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"status":    vResult.Status,
-		"feedback":  vResult.Feedback,
+		"feedback":  feedback,
 		"rows":      rows,
 		"columns":   columns,
 		"row_count": rowCount,
@@ -247,12 +310,33 @@ func (ctrl *PracticeController) Upsert(c *gin.Context) {
 		return
 	}
 
+	tw := repository.DMLCorrectSQLTargetTableWarning(saved.Type, saved.CorrectSQL, saved.TargetTable)
+
+	dsw := ""
+	if saved.DualSchema && saved.CategoryPreviewSchema == "" {
+		dsw = "Dual schema is enabled but no decoy schema has been uploaded for this category/exam - previews will use the grading schema until you upload one."
+	}
+
+	// Mixed dual/non-dual warning (GAP 4, ARCH-018): a category holding both
+	// dual and non-dual questions lets a student bypass the decoy by opening
+	// the non-dual question's preview. Warn-only; a lookup failure must never
+	// turn a successful save into an error, so its error is discarded.
+	mdw := ""
+	mixed, _ := ctrl.repo.CategoryHasMixedDualSchema(ctx, int(saved.CategoryID))
+	if mixed {
+		mdw = "This category contains both dual-schema and normal questions. A student can open a normal question's preview to read the grading schema, which bypasses the decoy on your dual-schema questions. Consider making every question here dual-schema."
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":                     "Practice question saved",
 		"id":                          saved.ID,
 		"expected_result_status":      saved.ExpectedResultStatus,
 		"expected_result_captured_at": saved.ExpectedResultCapturedAt,
+		"expected_rows_affected":      saved.ExpectedRowsAffected,
 		"capture_error":               saved.CaptureError,
+		"table_warning":               tw,
+		"dual_schema_warning":         dsw,
+		"mixed_dual_warning":          mdw,
 	})
 }
 
@@ -296,9 +380,11 @@ func (ctrl *PracticeController) ResetSandbox(c *gin.Context) {
 // LecturerPreview (POST /lecturer/practice/preview)
 func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 	var req struct {
-		Type        string `json:"type"`
-		TargetTable string `json:"target_table"`
-		CorrectSQL  string `json:"correct_sql"`
+		Type        string            `json:"type"`
+		TargetTable string            `json:"target_table"`
+		CorrectSQL  string            `json:"correct_sql"`
+		CategoryID  models.CategoryID `json:"category_id"`
+		Schema      string            `json:"schema"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -309,7 +395,14 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 		return
 	}
 
-	rows, err := ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
+	var rows []map[string]interface{}
+	var err error
+	useDecoy := req.Schema == "preview"
+	if int(req.CategoryID) > 0 {
+		rows, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy)
+	} else {
+		rows, err = ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
+	}
 	if err != nil {
 		// Surface engine errors with status='error' to match LecturerController
 		c.JSON(http.StatusOK, gin.H{"status": "error", "error": err.Error()})
@@ -558,6 +651,45 @@ func (ctrl *PracticeController) ImportCategorySchema(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Database imported into category"})
+}
+
+// ImportCategoryPreviewSchema (POST /lecturer/practice/categories/:id/import-preview[?confirm_replace=true])
+func (ctrl *PracticeController) ImportCategoryPreviewSchema(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	lecturer := userVal.(models.User)
+
+	id, ok := idParam(c, "id", publicid.TypeCategory)
+	if !ok {
+		return
+	}
+	var req struct {
+		SQL string `json:"sql"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.SQL) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sql is required"})
+		return
+	}
+	confirmReplace := c.Query("confirm_replace") == "true"
+
+	parityWarning, err := ctrl.repo.ImportSchemaIntoCategoryPreview(c.Request.Context(), id, req.SQL, int(lecturer.ID), confirmReplace)
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrCategoryNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrSchemaQualifiedName):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrCategoryNotEmpty):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Decoy database imported into category", "parity_warning": parityWarning})
 }
 
 // ─── Category Intro Images ────────────────────────────────────────────────────

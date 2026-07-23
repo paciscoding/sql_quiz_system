@@ -13,7 +13,7 @@ import (
 // MockExecutor implements DBExecutor for testing
 type MockExecutor struct {
 	EvaluateFunc        func(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error)
-	EvaluatePreviewFunc func(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (repository.PreviewResult, error)
+	EvaluatePreviewFunc func(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (repository.PreviewResult, error)
 }
 
 func (m *MockExecutor) Query(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
@@ -23,8 +23,8 @@ func (m *MockExecutor) Exec(ctx context.Context, schema, sql string) error { ret
 func (m *MockExecutor) Evaluate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
 	return m.EvaluateFunc(ctx, studentID, question, studentSQL, sandboxSchema)
 }
-func (m *MockExecutor) EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (repository.PreviewResult, error) {
-	return m.EvaluatePreviewFunc(ctx, studentID, question, studentSQL, sandboxSchema)
+func (m *MockExecutor) EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (repository.PreviewResult, error) {
+	return m.EvaluatePreviewFunc(ctx, studentID, question, studentSQL, sandboxSchema, previewSchema)
 }
 
 func TestValidationService_Validate(t *testing.T) {
@@ -180,7 +180,7 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 	t.Run("Correct Preview", func(t *testing.T) {
 		rows := []map[string]interface{}{{"id": float64(1)}}
 		cols := []string{"id"}
-		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (repository.PreviewResult, error) {
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string, previewSchema string) (repository.PreviewResult, error) {
 			return repository.PreviewResult{
 				Result:   models.ValidationResult{Status: "success"},
 				Rows:     rows,
@@ -189,7 +189,7 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 			}, nil
 		}
 
-		vResult, vRows, vCols, vCount, vTrunc, err := service.ValidatePreview(ctx, 123, question, "SELECT * FROM t", "sandbox_exam_1")
+		vResult, vRows, vCols, vCount, vTrunc, err := service.ValidatePreview(ctx, 123, question, "SELECT * FROM t", "sandbox_exam_1", "")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -207,7 +207,7 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 	t.Run("Incorrect Preview", func(t *testing.T) {
 		rows := []map[string]interface{}{{"id": float64(99)}}
 		cols := []string{"id"}
-		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (repository.PreviewResult, error) {
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string, previewSchema string) (repository.PreviewResult, error) {
 			return repository.PreviewResult{
 				Result:   models.ValidationResult{Status: "success"},
 				Rows:     rows,
@@ -216,7 +216,7 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 			}, nil
 		}
 
-		vResult, vRows, _, _, _, err := service.ValidatePreview(ctx, 123, question, "SELECT * FROM t", "sandbox_exam_1")
+		vResult, vRows, _, _, _, err := service.ValidatePreview(ctx, 123, question, "SELECT * FROM t", "sandbox_exam_1", "")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -229,13 +229,13 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 	})
 
 	t.Run("Syntax Error Preview", func(t *testing.T) {
-		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string) (repository.PreviewResult, error) {
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string, previewSchema string) (repository.PreviewResult, error) {
 			return repository.PreviewResult{
 				Result: models.ValidationResult{Status: "error", Feedback: "SQL Error: foo"},
 			}, nil
 		}
 
-		vResult, _, _, _, _, err := service.ValidatePreview(ctx, 123, question, "INVALID SQL", "sandbox_exam_1")
+		vResult, _, _, _, _, err := service.ValidatePreview(ctx, 123, question, "INVALID SQL", "sandbox_exam_1", "")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}

@@ -4,16 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 )
 
+// dualExecErrorFeedback replaces syntax_error Feedback for dual-schema questions
+// before it reaches the student (ARCH-018). The original executor Feedback is
+// produced by running the student's SQL against the hidden grading schema B
+// (pgconn.PgError.Error() text), and its Message is a data-dependent oracle over
+// B, so it must never be shown to the student; the original is still logged
+// server-side so lecturers/ops can diagnose A/B structure drift.
+const dualExecErrorFeedback = "Your SQL could not be executed against the grading dataset. Use Test Run to check your statement."
+
 type DBExecutor interface {
 	Query(ctx context.Context, schema, sql string) ([]map[string]interface{}, error)
 	Exec(ctx context.Context, schema, sql string) error
 	Evaluate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error)
-	EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (repository.PreviewResult, error)
+	EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (repository.PreviewResult, error)
 }
 
 type ValidationService struct {
@@ -24,7 +33,40 @@ func NewValidationService(executor DBExecutor) *ValidationService {
 	return &ValidationService{executor: executor}
 }
 
-func (s *ValidationService) Validate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
+func (s *ValidationService) Validate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (result models.ValidationResult, err error) {
+	// ARCH-018: dual-schema questions grade against the hidden schema B, and the
+	// rows/columns captured for grading must never reach the student. A deferred
+	// func runs AFTER the return expression below has already been evaluated, so
+	// decideStatus (further down) has already consumed ValidationDetails/Columns
+	// for grading before this scrub runs — the verdict (Status/IsCorrect/Score)
+	// is therefore provably unchanged. This is total over EVERY return path of
+	// Validate, including the empty-SQL and executor-error early returns, so no
+	// future return path can forget to scrub.
+	defer func() {
+		if !question.DualSchema {
+			return
+		}
+		if result.Status == "syntax_error" {
+			// ARCH-021: the multi-statement rejection message is our own fixed
+			// constant, not the executor's raw SQL error text - it carries no
+			// data from any schema and is produced before the student's
+			// statement ever reaches the planner, so unlike every other
+			// syntax_error Feedback it is not a data-dependent oracle over the
+			// hidden grading schema B. Exact-equality only (never substring or
+			// pattern matching on student-controlled text), so it cannot be
+			// spoofed by crafting a student SQL error that merely contains this
+			// text.
+			if result.Feedback == repository.MultiStatementFeedback {
+				log.Printf("dual-schema multi-statement rejection for student %d, question %d", studentID, question.ID)
+			} else {
+				log.Printf("dual-schema syntax error suppressed from student %d for question %d: %s", studentID, question.ID, result.Feedback)
+				result.Feedback = dualExecErrorFeedback
+			}
+		}
+		result.ValidationDetails = nil
+		result.Columns = nil
+	}()
+
 	if studentSQL == "" {
 		return models.ValidationResult{
 			Status:    "syntax_error",
@@ -34,7 +76,7 @@ func (s *ValidationService) Validate(ctx context.Context, studentID int, questio
 		}, nil
 	}
 
-	result, err := s.executor.Evaluate(ctx, studentID, question, studentSQL, sandboxSchema)
+	result, err = s.executor.Evaluate(ctx, studentID, question, studentSQL, sandboxSchema)
 	if err != nil {
 		return models.ValidationResult{}, err
 	}
@@ -57,7 +99,7 @@ func (s *ValidationService) Validate(ctx context.Context, studentID int, questio
 // ValidatePreview runs the student SQL in a read-only sandbox and returns the
 // three-state status together with the result rows and metadata. Unlike Validate
 // it never persists a submission.
-func (s *ValidationService) ValidatePreview(ctx context.Context, studentID int, q models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, []map[string]interface{}, []string, int, bool, error) {
+func (s *ValidationService) ValidatePreview(ctx context.Context, studentID int, q models.Question, studentSQL string, sandboxSchema string, previewSchema string) (models.ValidationResult, []map[string]interface{}, []string, int, bool, error) {
 	if studentSQL == "" {
 		return models.ValidationResult{
 			Status:   "syntax_error",
@@ -65,7 +107,7 @@ func (s *ValidationService) ValidatePreview(ctx context.Context, studentID int, 
 		}, []map[string]interface{}{}, []string{}, 0, false, nil
 	}
 
-	pr, err := s.executor.EvaluatePreview(ctx, studentID, q, studentSQL, sandboxSchema)
+	pr, err := s.executor.EvaluatePreview(ctx, studentID, q, studentSQL, sandboxSchema, previewSchema)
 	if err != nil {
 		return models.ValidationResult{}, nil, nil, 0, false, err
 	}
@@ -90,6 +132,15 @@ func (s *ValidationService) decideStatus(execResult models.ValidationResult, stu
 		execResult.Score = 0
 		execResult.Feedback = "The result is wrong."
 		return execResult
+	}
+
+	// DML grading (ARCH-005): the two snapshots are unordered full-table
+	// captures, so ordering is never graded, the ColumnOrder gate never
+	// applies, and attribute comparison is always key-aware regardless of the
+	// stored strict_attrs flag. The QUERY path below (compareResults /
+	// compareRows / valuesEqual) is completely untouched.
+	if q.Type != "QUERY" {
+		return s.decideDMLStatus(execResult, teacherData, studentData, q)
 	}
 
 	if q.StrictMode.ColumnOrder {
@@ -119,6 +170,41 @@ func (s *ValidationService) decideStatus(execResult models.ValidationResult, stu
 		execResult.Score = 0
 		execResult.Feedback = "The result is wrong."
 	}
+	return execResult
+}
+
+// decideDMLStatus grades a DML question by comparing the teacher's and
+// student's post-image table snapshots as a multiset of rows under key-aware
+// equality (ARCH-005): no ColumnOrder gate, no ordering, no non-strict
+// attribute mode — DML forces all three regardless of the stored flags.
+func (s *ValidationService) decideDMLStatus(execResult models.ValidationResult, teacherData, studentData []map[string]interface{}, q models.Question) models.ValidationResult {
+	missing, extra := diffRowMultiset(teacherData, studentData)
+	if len(missing) == 0 && len(extra) == 0 {
+		execResult.Status = "correct"
+		execResult.IsCorrect = true
+		execResult.Score = q.Points
+		execResult.Feedback = "Correct! Full points awarded."
+		return execResult
+	}
+
+	execResult.Status = "incorrect"
+	execResult.IsCorrect = false
+	execResult.Score = 0
+
+	if q.DualSchema {
+		// Leak-proofing (ARCH-007): the teacher's post-image snapshot lives on the
+		// hidden grading schema B. A dual question's student never sees B's data,
+		// so the row-level diff (which would dump B's expected rows via
+		// formatDMLDiff) must never reach Feedback here.
+		execResult.Feedback = "Your result does not match the expected outcome."
+		return execResult
+	}
+
+	var teacherCols []string
+	if len(q.ExpectedColumns) > 0 {
+		_ = json.Unmarshal(q.ExpectedColumns, &teacherCols)
+	}
+	execResult.Feedback = formatDMLDiff(q.TargetTable, len(teacherData), len(studentData), missing, extra, teacherCols)
 	return execResult
 }
 

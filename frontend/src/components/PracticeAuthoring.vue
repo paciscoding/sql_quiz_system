@@ -10,6 +10,7 @@ import {
   renameCategory,
   deleteCategory,
   importCategorySchema,
+  importCategoryPreviewSchema,
   setCategoryIntroduction,
   ApiError,
   type PracticeQuestion,
@@ -39,12 +40,21 @@ const form = ref<Partial<PracticeQuestion>>({
   points: 1.0,
   strict_ordering: false,
   strict_attrs: false,
-  strict_column_order: false
+  strict_column_order: false,
+  dual_schema: false
 })
 const previewRows = ref<any[]>([])
 const previewCols = ref<string[]>([])
 const previewLoading = ref(false)
 const previewError = ref('')
+
+// "Preview as student" (schema: 'preview') results — kept in a separate set of
+// refs from the grading-schema Preview above so the lecturer can see both the
+// student's decoy-schema view (A) and the grading-schema view (B) side by side.
+const previewAsStudentRows = ref<any[]>([])
+const previewAsStudentCols = ref<string[]>([])
+const previewAsStudentLoading = ref(false)
+const previewAsStudentError = ref('')
 
 // --- Category management panel state ---
 const showCategoryPanel = ref(false)
@@ -63,6 +73,10 @@ const toggleCategoryPanel = async () => {
 }
 const importCategoryId = ref<string | null>(null)
 const importSql = ref('')
+
+// Decoy (preview-only) schema import state — parallel to importCategoryId/importSql above.
+const importPreviewCategoryId = ref<string | null>(null)
+const importPreviewSql = ref('')
 
 // Per-category introduction editor state (keyed by category id)
 const categoryIntroEdits = ref<Record<string, string>>({})
@@ -94,6 +108,17 @@ const categoryNameById = computed<Record<string, string>>(() => {
   categories.value.forEach(c => { map[c.id] = c.name })
   return map
 })
+
+// Independent client-side check (dual-schema spec §6.1): dual_schema on a
+// category with no decoy schema is allowed (grading falls back to schema B)
+// but must be flagged to the lecturer with zero network round-trips. Purely
+// derived from the already-loaded categories list + form state, so it reacts
+// automatically to toggling form.dual_schema, loading a question into the
+// form (editQuestion does form.value = { ...q }), and changing the category
+// <select> — no extra watcher needed.
+const selectedCategoryHasDecoy = computed(() =>
+  categories.value.find(c => c.id === form.value.category_id)?.has_preview_schema ?? false
+)
 
 const loadCategories = async () => {
   try {
@@ -149,11 +174,15 @@ const resetForm = () => {
     points: 1.0,
     strict_ordering: false,
     strict_attrs: false,
-    strict_column_order: false
+    strict_column_order: false,
+    dual_schema: false
   }
   previewRows.value = []
   previewCols.value = []
   previewError.value = ''
+  previewAsStudentRows.value = []
+  previewAsStudentCols.value = []
+  previewAsStudentError.value = ''
 }
 
 function newPracticeQuestion() {
@@ -177,6 +206,10 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     } else {
       notify('Question saved', 'success')
     }
+    // Non-blocking warnings from the backend — never prevent the save flow below.
+    if (res.table_warning) notify(res.table_warning, 'error')
+    if (res.dual_schema_warning) notify(res.dual_schema_warning, 'error')
+    if (res.mixed_dual_warning) notify(res.mixed_dual_warning, 'error')
     await loadQuestions()
     clearDraft()
     resetForm()
@@ -219,6 +252,38 @@ const handlePreview = async () => {
     handleApiError(err, { fallback: 'Preview failed' })
   } finally {
     previewLoading.value = false
+  }
+}
+
+// Runs the same correct_sql against the decoy schema (schema: 'preview') so the
+// lecturer can see exactly what the student sees on a dual-schema question.
+// Unlike handlePreview, this must send category_id — the backend needs it to
+// resolve the category's decoy schema.
+const handlePreviewAsStudent = async () => {
+  previewAsStudentLoading.value = true
+  previewAsStudentError.value = ''
+  try {
+    const payload = {
+      type: form.value.question_type ?? 'QUERY',
+      target_table: form.value.target_table ?? '',
+      correct_sql: form.value.correct_sql ?? '',
+      category_id: form.value.category_id,
+      schema: 'preview' as const
+    }
+    const res = await lecturerPreview(payload)
+    if (res.status === 'error') {
+      previewAsStudentError.value = res.error || 'SQL execution failed'
+      previewAsStudentRows.value = []
+      previewAsStudentCols.value = []
+    } else {
+      previewAsStudentRows.value = res.rows || []
+      previewAsStudentCols.value = res.columns || []
+    }
+  } catch (err) {
+    previewAsStudentError.value = (err as Error).message || 'Preview failed'
+    handleApiError(err, { fallback: 'Preview failed' })
+  } finally {
+    previewAsStudentLoading.value = false
   }
 }
 
@@ -338,6 +403,72 @@ const { inFlight: importLoading, run: doImport } = useSingleFlight(async () => {
   }
 })
 
+// --- Decoy (preview-only) schema import — parallel to the grading-schema
+// import above, same 409-then-confirm-replace flow, targeting
+// importCategoryPreviewSchema instead of importCategorySchema. ---
+
+const importPreviewFileName = ref('')
+
+const openImportPreview = (cat: PracticeCategory) => {
+  importPreviewCategoryId.value = cat.id
+  importPreviewSql.value = ''
+  importPreviewFileName.value = ''
+}
+
+const cancelImportPreview = () => {
+  importPreviewCategoryId.value = null
+  importPreviewSql.value = ''
+  importPreviewFileName.value = ''
+}
+
+// Mirrors loadSqlFile for the decoy-schema file input.
+const loadPreviewSqlFile = (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!/\.sql$/i.test(file.name)) {
+    notify('File must be a .sql file', 'error')
+    input.value = ''
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    importPreviewSql.value = typeof reader.result === 'string' ? reader.result : ''
+    importPreviewFileName.value = file.name
+  }
+  reader.onerror = () => notify('Failed to read the file', 'error')
+  reader.readAsText(file)
+  input.value = '' // reset so re-selecting the same file re-fires @change
+}
+
+const { inFlight: importPreviewLoading, run: doImportPreview } = useSingleFlight(async () => {
+  if (importPreviewCategoryId.value === null || !importPreviewSql.value.trim()) return
+  const id = importPreviewCategoryId.value
+  try {
+    const res = await importCategoryPreviewSchema(id, importPreviewSql.value, false)
+    notify('Decoy schema imported', 'success')
+    if (res.parity_warning) notify(res.parity_warning, 'error')
+    cancelImportPreview()
+    await loadCategories()
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      const ok = await confirm({ title: 'Replace existing decoy schema?', body: 'This category already has a decoy schema. Importing will drop the existing tables and replace them. Continue?', confirmLabel: 'Replace', danger: true })
+      if (!ok) return
+      try {
+        const res2 = await importCategoryPreviewSchema(id, importPreviewSql.value, true)
+        notify('Decoy schema replaced', 'success')
+        if (res2.parity_warning) notify(res2.parity_warning, 'error')
+        cancelImportPreview()
+        await loadCategories()
+      } catch (err2) {
+        handleApiError(err2, { fallback: 'Failed to import decoy schema' })
+      }
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to import decoy schema' })
+  }
+})
+
 onMounted(() => {
   loadQuestions()
   loadCategories()
@@ -432,6 +563,7 @@ onMounted(() => {
             <div style="display: flex; gap: var(--space-1); flex-wrap: wrap;">
               <button class="btn btn-secondary btn-sm" @click="doRenameCategory(c)">{{ UI_COPY.RENAME_CATEGORY }}</button>
               <button class="btn btn-secondary btn-sm" @click="openImport(c)">{{ UI_COPY.IMPORT_CATEGORY_DB }}</button>
+              <button class="btn btn-secondary btn-sm" @click="openImportPreview(c)">Import Decoy Schema</button>
               <button class="btn btn-secondary btn-sm" @click="doDeleteCategory(c)" style="border-color: var(--color-danger); color: var(--color-danger);">{{ UI_COPY.DELETE_CATEGORY }}</button>
             </div>
           </div>
@@ -458,6 +590,34 @@ onMounted(() => {
               </div>
             </div>
             <p v-else class="muted" style="margin: 0;">Import a .sql to (re)load this category's database.</p>
+          </div>
+
+          <!-- Decoy database schema sub-panel (preview only — same tables/columns as
+               the grading schema above, different data; used by dual-schema questions
+               so the student's preview never leaks the grading data). -->
+          <div class="cat-subpanel">
+            <span class="cat-subpanel-label">Decoy database schema (preview only)</span>
+            <div v-if="importPreviewCategoryId === c.id">
+              <h3>Import decoy database into "{{ c.name }}"</h3>
+              <p class="muted">Upload a <code>.sql</code> file or paste a SQL script with the same tables and columns as the grading database above, but different data. Students previewing a dual-schema question see this data instead of the real grading data.</p>
+              <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
+                <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
+                  Choose .sql file
+                  <input type="file" accept=".sql,text/plain,application/sql" @change="loadPreviewSqlFile" style="display: none;" />
+                </label>
+                <span v-if="importPreviewFileName" class="muted">Loaded: <code>{{ importPreviewFileName }}</code> — review or edit below, then import.</span>
+              </div>
+              <SqlEditor v-model="importPreviewSql" height="200px" />
+              <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+                <button class="btn btn-primary" :disabled="importPreviewLoading || !importPreviewSql.trim()" @click="doImportPreview">
+                  <Spinner v-if="importPreviewLoading" size="sm" inline :invert="true" />{{ importPreviewLoading ? 'Importing' : 'Import Decoy Schema' }}
+                </button>
+                <button class="btn btn-secondary" @click="cancelImportPreview">Cancel</button>
+              </div>
+            </div>
+            <p v-else class="muted" style="margin: 0;">
+              {{ c.has_preview_schema ? 'Decoy schema loaded — used for dual-schema question previews.' : 'Import a decoy .sql (same structure, different data) to enable dual-schema previews for this category.' }}
+            </p>
           </div>
 
           <!-- Description sub-panel -->
@@ -553,7 +713,7 @@ onMounted(() => {
           <label>Points</label>
           <input type="number" v-model.number="form.points" class="input" step="0.1" />
         </div>
-        <div class="field" style="display: flex; flex-direction: row; gap: var(--space-4); align-items: flex-end;">
+        <div v-if="form.question_type !== 'DML'" class="field" style="display: flex; flex-direction: row; gap: var(--space-4); align-items: flex-end;">
           <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
             <input type="checkbox" v-model="form.strict_ordering" /> Strict Ordering
           </label>
@@ -563,6 +723,21 @@ onMounted(() => {
           <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
             <input type="checkbox" v-model="form.strict_column_order" /> Strict Column Order
           </label>
+        </div>
+        <div v-else class="field muted" style="align-self: flex-end;">
+          DML answers are graded on the final table contents as an unordered set of rows, matched by column name. Ordering and column-order options do not apply.
+        </div>
+        <!-- Dual schema applies to both QUERY and DML, so it lives outside the
+             question_type v-if/v-else pair above. -->
+        <div class="field" style="display: flex; flex-direction: column; gap: var(--space-1); align-self: flex-end;">
+          <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
+            <input type="checkbox" v-model="form.dual_schema" /> Dual schema (hidden grading)
+          </label>
+          <!-- Independent, client-only validation (spec §6.1): no network round-trip,
+               purely reactive to form.dual_schema + selectedCategoryHasDecoy. -->
+          <span v-if="form.dual_schema && !selectedCategoryHasDecoy" class="badge badge-warning" style="display: inline-block; font-weight: 600;">
+            Dual schema is enabled but this category has no decoy schema yet - previews will use the grading schema until you upload one.
+          </span>
         </div>
       </div>
 
@@ -584,22 +759,38 @@ onMounted(() => {
         >
           <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : 'Save Question' }}
         </button>
-        <button 
-          class="btn btn-secondary" 
-          @click="handlePreview" 
+        <button
+          class="btn btn-secondary"
+          @click="handlePreview"
           :disabled="previewLoading"
         >
           {{ previewLoading ? 'Running...' : 'Preview' }}
         </button>
+        <button
+          class="btn btn-secondary"
+          @click="handlePreviewAsStudent"
+          :disabled="previewAsStudentLoading"
+        >
+          {{ previewAsStudentLoading ? 'Running...' : 'Preview as Student' }}
+        </button>
       </div>
 
-      <!-- Preview Results -->
+      <!-- Preview Results (grading schema B — same as the student's submit-time verdict source) -->
       <div v-if="previewError" class="badge badge-danger" style="margin-top: var(--space-4); display: block; padding: var(--space-2); font-family: monospace;">
         {{ previewError }}
       </div>
       <div v-if="previewRows.length > 0" style="margin-top: var(--space-4);">
         <h3>Preview Results</h3>
         <ResultTable :rows="previewRows" :columns="previewCols" />
+      </div>
+
+      <!-- Preview-as-student Results (decoy schema A — what the student actually sees for a dual-schema question) -->
+      <div v-if="previewAsStudentError" class="badge badge-danger" style="margin-top: var(--space-4); display: block; padding: var(--space-2); font-family: monospace;">
+        {{ previewAsStudentError }}
+      </div>
+      <div v-if="previewAsStudentRows.length > 0" style="margin-top: var(--space-4);">
+        <h3>Preview Results (as student sees — decoy schema)</h3>
+        <ResultTable :rows="previewAsStudentRows" :columns="previewAsStudentCols" />
       </div>
     </div>
   </div>

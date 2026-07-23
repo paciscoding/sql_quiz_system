@@ -15,7 +15,7 @@ var ErrQueueFull = errors.New("submission queue: queue is full")
 var ErrQueueShutdown = errors.New("submission queue: queue is shut down")
 
 type job struct {
-	fn      func() error
+	fn      func(context.Context) error
 	replyCh chan error
 	ctx     context.Context
 }
@@ -80,14 +80,14 @@ func (q *SubmissionQueue) runJob(j job) (err error) {
 			err = fmt.Errorf("submission queue: panic: %v", r)
 		}
 	}()
-	return j.fn()
+	return j.fn(j.ctx)
 }
 
 // Run enqueues fn for serial execution by the single worker goroutine.
 // The job inherits a per-job timeout derived from ctx and q.jobTimeout
 // (whichever is shorter). Returns ErrQueueFull if the channel is at capacity,
 // ErrQueueShutdown if Shutdown was called.
-func (q *SubmissionQueue) Run(ctx context.Context, fn func() error) (err error) {
+func (q *SubmissionQueue) Run(ctx context.Context, fn func(context.Context) error) (err error) {
 	runCtx, cancel := context.WithTimeout(ctx, q.jobTimeout)
 	defer cancel()
 

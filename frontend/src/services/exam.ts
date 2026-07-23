@@ -48,3 +48,16 @@ export const importExamCurriculum = (examId: string, sql: string, confirmReplace
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sql })
   })
+
+// importExamCurriculumPreview POSTs a SQL script into the per-exam decoy curriculum
+// schema (curriculum_exam_{examId}_preview), used for the dual-schema student preview.
+// Pass confirmReplace=true to overwrite a non-empty schema.
+// Auth: ADMIN | LECTURER.
+// 409 if the exam is currently active, or if the schema already has tables and
+// confirmReplace is false. 404 if the exam does not exist.
+export const importExamCurriculumPreview = (examId: string, sql: string, confirmReplace = false): Promise<{ message: string; parity_warning?: string }> =>
+  apiFetch(`/api/v1/lecturer/exams/${examId}/curriculum/import-preview${confirmReplace ? '?confirm_replace=true' : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql })
+  })

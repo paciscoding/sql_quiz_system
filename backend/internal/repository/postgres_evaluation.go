@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,20 +55,6 @@ func querySchemaFor(question models.Question, sandboxSchema string) string {
 	return sandboxSchema
 }
 
-// acquirePracticeEvalLock takes the practice-reset advisory lock in SHARED mode
-// on the given transaction, but only when the evaluation actually runs against
-// the shared practice sandbox. Exam evaluations (their own per-exam sandbox, or
-// the read-only public curriculum) are never rebuilt by ResetPracticeSandbox,
-// so they skip the lock entirely and pay nothing. The lock releases
-// automatically when the transaction ends (pg_advisory_xact_lock_shared).
-func acquirePracticeEvalLock(ctx context.Context, tx pgx.Tx, schema string) error {
-	if schema != practiceSandboxSchema {
-		return nil
-	}
-	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1)", practiceResetLockKey)
-	return err
-}
-
 func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.Question, studentSQL string, querySchema string) (models.ValidationResult, error) {
 	// Repair typographic quotes so pasted SELECTs run instead of failing with a
 	// spurious "column ... does not exist". Consistent with the preview path.
@@ -75,7 +62,14 @@ func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	conn, err := r.pool.Acquire(ctx)
+	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
+	// never on r.pool (the privileged application connection) — see
+	// postgres_student_pool.go. No fallback on error.
+	studentPool, err := r.ensureStudentPool(ctx)
+	if err != nil {
+		return models.ValidationResult{}, err
+	}
+	conn, err := studentPool.Acquire(ctx)
 	if err != nil {
 		return models.ValidationResult{}, err
 	}
@@ -92,14 +86,17 @@ func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.
 	if querySchema == "" {
 		querySchema = "public"
 	}
-	// Guard against a concurrent practice-sandbox rebuild dropping the schema
-	// out from under this read. Shared advisory lock: many evals run in
-	// parallel; ResetPracticeSandbox's exclusive lock waits for us to finish.
-	if err := acquirePracticeEvalLock(ctx, tx, querySchema); err != nil {
+	// Guard against a concurrent schema rebuild (practice reset, category
+	// import-with-replace, category delete) dropping the schema out from under
+	// this read. Shared advisory lock: many evals run in parallel; the
+	// exclusive rebuild lock waits for us to finish.
+	if err := acquireSchemaEvalLock(ctx, tx, querySchema); err != nil {
 		return models.ValidationResult{}, err
 	}
+	// ARCH-023: pg_temp appended LAST — see the matching comment in
+	// evaluateDML for why position matters.
 	safeQuerySchema := pgx.Identifier{querySchema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safeQuerySchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, pg_temp", safeQuerySchema)); err != nil {
 		return models.ValidationResult{}, err
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student_readonly"); err != nil {
@@ -138,9 +135,18 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	if question.TargetTable == "" {
 		return models.ValidationResult{}, fmt.Errorf("DML question is missing target_table")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	schema := sandboxSchema
-	conn, err := r.pool.Acquire(ctx)
+	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
+	// never on r.pool (the privileged application connection) — see
+	// postgres_student_pool.go. No fallback on error.
+	studentPool, err := r.ensureStudentPool(ctx)
+	if err != nil {
+		return models.ValidationResult{}, err
+	}
+	conn, err := studentPool.Acquire(ctx)
 	if err != nil {
 		return models.ValidationResult{}, err
 	}
@@ -152,10 +158,10 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	}
 	defer tx.Rollback(ctx)
 
-	// Guard against a concurrent practice-sandbox rebuild dropping the schema
-	// mid-evaluation. No-op for exam sandboxes (sandbox_exam_*), which reset
-	// never touches. Shared: parallel evals fine; reset waits for us.
-	if err := acquirePracticeEvalLock(ctx, tx, schema); err != nil {
+	// Guard against a concurrent schema rebuild (practice reset, category
+	// import-with-replace, category delete) dropping the schema mid-evaluation.
+	// Shared: parallel evals fine; the exclusive rebuild lock waits for us.
+	if err := acquireSchemaEvalLock(ctx, tx, schema); err != nil {
 		return models.ValidationResult{}, err
 	}
 
@@ -163,8 +169,16 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 		return models.ValidationResult{}, err
 	}
 
+	// ARCH-023: pg_temp is appended LAST, never first or omitted. Postgres
+	// searches pg_temp before every schema in search_path regardless of
+	// where (or whether) it is listed explicitly — UNLESS it is named
+	// explicitly, in which case it is searched in the position given. Naming
+	// it last here forces it back to being searched last, so a student's
+	// single-statement `CREATE TEMP TABLE <target_table> AS SELECT ...`
+	// cannot shadow the real target table for the post-image capture below.
+	// See TestPgTempForgery_TargetTableShadowing_Rejected.
 	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", safeSchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public, pg_temp", safeSchema)); err != nil {
 		return models.ValidationResult{}, err
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student"); err != nil {
@@ -175,7 +189,7 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	var studentCols []string
 	var studentErr error
 
-	if _, execErr := tx.Exec(ctx, studentSQL); execErr != nil {
+	if _, execErr := execStudentStatement(ctx, tx, studentSQL); execErr != nil {
 		studentErr = execErr
 	} else {
 		safeTable := pgx.Identifier{question.TargetTable}.Sanitize()
@@ -187,9 +201,30 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 		}
 	}
 
-	// Restore sandbox state for the next student in the per-target queue.
-	_, _ = tx.Exec(ctx, "RESET ROLE")
-	_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval")
+	// Discard the student's writes so the shared sandbox is unchanged for the
+	// next evaluation. Both statements' errors MUST be checked: if either one
+	// fails, the student's mutations are still live in the transaction, and
+	// committing anyway would permanently corrupt the shared sandbox for every
+	// subsequent student. Roll the whole transaction back and bail out instead.
+	//
+	// ORDER MATTERS (ARCH-021): ROLLBACK TO SAVEPOINT runs FIRST. When the
+	// student's statement above errors, the transaction is left in the aborted
+	// state (SQLSTATE 25P02), in which every statement except ROLLBACK fails —
+	// so a RESET ROLE attempted first always fails too, turning every failed
+	// student DML submission into a hard error that the controllers surface as
+	// an HTTP 500 with raw internal error text. ROLLBACK TO SAVEPOINT succeeds
+	// even in the aborted state and, on its own, already restores current_user
+	// to the app role, because the savepoint above is taken BEFORE SET LOCAL
+	// ROLE; the RESET ROLE that follows is therefore belt-and-braces and cannot
+	// fail.
+	if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval"); err != nil {
+		_ = tx.Rollback(ctx)
+		return models.ValidationResult{}, fmt.Errorf("failed to roll back student eval savepoint: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "RESET ROLE"); err != nil {
+		_ = tx.Rollback(ctx)
+		return models.ValidationResult{}, fmt.Errorf("failed to reset role after student eval: %w", err)
+	}
 
 	capturedJSON, _ := json.Marshal(studentResults)
 	result := models.ValidationResult{
@@ -198,11 +233,22 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	}
 	if studentErr != nil {
 		result.Status = "error"
-		result.Feedback = fmt.Sprintf("SQL Error: %v", studentErr)
+		result.Feedback = studentSQLErrorFeedback(studentErr)
 	} else {
 		result.Columns = studentCols
 	}
-	return result, tx.Commit(ctx)
+
+	// Invariant: by this point RESET ROLE and ROLLBACK TO SAVEPOINT have both
+	// already succeeded, so the transaction contains no student writes — it is
+	// equivalent to an empty, read-only transaction. A Commit failure here is
+	// therefore a connection-level event with no correctness consequence for
+	// grading: there is nothing left to lose by not committing, so we log it
+	// and return the already fully-populated result with a nil error rather
+	// than turning a correctly-graded submission into a 500.
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		log.Printf("Warning: evaluateDML commit failed after empty (fully rolled-back) transaction: %v", commitErr)
+	}
+	return result, nil
 }
 
 const previewRowCap = 200
@@ -211,19 +257,54 @@ const previewRowCap = 200
 // back, returning up to previewRowCap rows plus metadata. The Result field uses
 // the internal "success"/"error" status; callers (ValidationService) map that to
 // the three-state "correct"/"incorrect"/"syntax_error" vocabulary.
-func (r *PostgresRepository) EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (PreviewResult, error) {
+func (r *PostgresRepository) EvaluatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (PreviewResult, error) {
+	// ARCH-020 (GAP 3): useDecoy is computed BEFORE the empty-string fallbacks
+	// below — previewSchema is non-empty only when a controller resolved a real
+	// decoy schema (practice_controller.go / quiz_controller.go). That is the
+	// single, exact rule for whether this preview must run under a preview-only
+	// role instead of today's exam_student / exam_student_readonly: those two
+	// roles hold USAGE+SELECT (and, for exam_student, full DML) on EVERY real
+	// schema, so a dual preview running under them could read grading schema B
+	// via a schema-qualified name. When previewSchema == "" the preview target
+	// already IS the real schema (no decoy uploaded), so keeping today's role
+	// there discloses nothing extra and — per spec §6.1 — must never hard-fail
+	// the preview.
+	useDecoy := previewSchema != ""
 	if question.Type == "QUERY" {
-		return r.evaluateQueryPreview(ctx, question, studentSQL, querySchemaFor(question, sandboxSchema))
+		schema := previewSchema
+		if schema == "" {
+			schema = querySchemaFor(question, sandboxSchema)
+		}
+		role := "exam_student_readonly"
+		if useDecoy {
+			role = rolePreviewStudentReadonly
+		}
+		return r.evaluateQueryPreview(ctx, question, studentSQL, schema, role)
 	}
-	return r.evaluateDMLPreview(ctx, question, studentSQL, sandboxSchema)
+	schema := previewSchema
+	if schema == "" {
+		schema = sandboxSchema
+	}
+	role := "exam_student"
+	if useDecoy {
+		role = rolePreviewStudent
+	}
+	return r.evaluateDMLPreview(ctx, question, studentSQL, schema, role)
 }
 
-func (r *PostgresRepository) evaluateQueryPreview(ctx context.Context, question models.Question, studentSQL string, querySchema string) (PreviewResult, error) {
+func (r *PostgresRepository) evaluateQueryPreview(ctx context.Context, question models.Question, studentSQL string, querySchema string, role string) (PreviewResult, error) {
 	studentSQL = normalizeSmartQuotes(studentSQL)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	conn, err := r.pool.Acquire(ctx)
+	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
+	// never on r.pool (the privileged application connection) — see
+	// postgres_student_pool.go. No fallback on error.
+	studentPool, err := r.ensureStudentPool(ctx)
+	if err != nil {
+		return PreviewResult{}, err
+	}
+	conn, err := studentPool.Acquire(ctx)
 	if err != nil {
 		return PreviewResult{}, err
 	}
@@ -238,11 +319,13 @@ func (r *PostgresRepository) evaluateQueryPreview(ctx context.Context, question 
 	if querySchema == "" {
 		querySchema = "public"
 	}
+	// ARCH-023: pg_temp appended LAST — see the matching comment in
+	// evaluateDML for why position matters.
 	safeQuerySchema := pgx.Identifier{querySchema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safeQuerySchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, pg_temp", safeQuerySchema)); err != nil {
 		return PreviewResult{}, err
 	}
-	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student_readonly"); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL ROLE %s", pgx.Identifier{role}.Sanitize())); err != nil {
 		return PreviewResult{}, err
 	}
 
@@ -274,14 +357,23 @@ func (r *PostgresRepository) evaluateQueryPreview(ctx context.Context, question 
 	return pr, nil
 }
 
-func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question models.Question, studentSQL string, sandboxSchema string) (PreviewResult, error) {
+func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question models.Question, studentSQL string, sandboxSchema string, role string) (PreviewResult, error) {
 	if question.TargetTable == "" {
 		return PreviewResult{}, fmt.Errorf("DML question is missing target_table")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	studentSQL = normalizeSmartQuotes(studentSQL)
 	schema := sandboxSchema
-	conn, err := r.pool.Acquire(ctx)
+	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
+	// never on r.pool (the privileged application connection) — see
+	// postgres_student_pool.go. No fallback on error.
+	studentPool, err := r.ensureStudentPool(ctx)
+	if err != nil {
+		return PreviewResult{}, err
+	}
+	conn, err := studentPool.Acquire(ctx)
 	if err != nil {
 		return PreviewResult{}, err
 	}
@@ -295,30 +387,43 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 
 	var pr PreviewResult
 
+	// Guard against a concurrent schema rebuild dropping the schema
+	// mid-preview — this was previously missing, unlike evaluateDML.
+	if err := acquireSchemaEvalLock(ctx, tx, schema); err != nil {
+		pr.Result.Status = "error"
+		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", err)
+		return pr, nil
+	}
+
 	if _, err := tx.Exec(ctx, "SAVEPOINT student_eval"); err != nil {
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", err)
 		return pr, nil
 	}
 
-	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student"); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL ROLE %s", pgx.Identifier{role}.Sanitize())); err != nil {
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", err)
 		return pr, nil
 	}
 
+	// ARCH-023: pg_temp appended LAST — see the matching comment in
+	// evaluateDML for why position matters.
 	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, public", safeSchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, public, pg_temp", safeSchema)); err != nil {
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", err)
 		return pr, nil
 	}
 
-	if _, execErr := tx.Exec(ctx, studentSQL); execErr != nil {
+	if _, execErr := execStudentStatement(ctx, tx, studentSQL); execErr != nil {
 		pr.Result.Status = "error"
-		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", execErr)
-		_, _ = tx.Exec(ctx, "RESET ROLE")
+		pr.Result.Feedback = studentSQLErrorFeedback(execErr)
+		// ORDER MATTERS (ARCH-021): see the matching comment in evaluateDML —
+		// ROLLBACK TO SAVEPOINT must run before RESET ROLE so recovery still
+		// succeeds when the student's statement left the transaction aborted.
 		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval")
+		_, _ = tx.Exec(ctx, "RESET ROLE")
 		_ = tx.Rollback(ctx)
 		return pr, nil
 	}

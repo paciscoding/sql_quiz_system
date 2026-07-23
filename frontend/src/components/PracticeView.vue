@@ -351,6 +351,15 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
             <p style="white-space: pre-wrap; margin: 0;">{{ selectedQuestion.requirement }}</p>
           </div>
 
+          <template v-if="selectedQuestion.question_type === 'QUERY' && selectedQuestion.expected_columns">
+            <h4 style="margin: var(--space-4) 0 var(--space-2) 0;">Expected Result</h4>
+            <ResultTable
+              :rows="selectedQuestion.expected_result || []"
+              :columns="selectedQuestion.expected_columns || []"
+              max-height="200px"
+            />
+          </template>
+
           <h3 style="margin: var(--space-4) 0 var(--space-2) 0;">Your SQL</h3>
           <SqlEditor v-model="sqlText" height="240px" />
 
@@ -440,13 +449,13 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
 
 .pane-grid {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: 1fr;
   gap: var(--space-5);
   align-items: start;
 }
 
 .pane-grid.list-collapsed {
-  grid-template-columns: 48px 1fr;
+  grid-template-columns: 1fr;
 }
 
 .question-list-card.collapsed {
@@ -624,6 +633,8 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
   margin: 0;
   font-size: 1.1rem;
   font-weight: 700;
+  white-space: pre-line;
+  overflow-wrap: break-word;
 }
 
 .score {

@@ -58,6 +58,15 @@ func main() {
 		log.Fatalf("Failed to setup restricted database role: %v", err)
 	}
 
+	// ARCH-025: eagerly create and verify the restricted student-SQL pool
+	// (LOGIN role quiz_exec, which owns nothing and has no privileges on the
+	// app schema). Fail fast here, exactly like the ID_SALT check above -
+	// there must be no path where a missing/invalid STUDENT_DB_PASSWORD
+	// silently leaves student SQL executing on the privileged connection.
+	if err := repo.InitStudentPool(ctx); err != nil {
+		log.Fatalf("Failed to initialize restricted student SQL pool: %v", err)
+	}
+
 	// Initialize System Tables
 	if err := repo.InitializeSystemTables(ctx); err != nil {
 		log.Fatalf("Failed to initialize system tables: %v", err)
@@ -249,6 +258,8 @@ func main() {
 			staff.PUT("/lecturer/exams/:id/intro-images/order", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ReorderExamIntroImages)
 			// Per-exam curriculum schema import. Mirrors the practice category import endpoint.
 			staff.POST("/lecturer/exams/:id/curriculum/import", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportExamCurriculum)
+			// Decoy-schema preview for the curriculum import above (dual-schema grading).
+			staff.POST("/lecturer/exams/:id/curriculum/import-preview", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportExamCurriculumPreview)
 			staff.GET("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamRoster)
 			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)
@@ -323,6 +334,8 @@ func main() {
 			practiceLecturer.PUT("/categories/:id", practiceCtrl.RenameCategory)
 			practiceLecturer.DELETE("/categories/:id", practiceCtrl.DeleteCategory)
 			practiceLecturer.POST("/categories/:id/import", practiceCtrl.ImportCategorySchema)
+			// Decoy-schema preview for the import above (dual-schema grading).
+			practiceLecturer.POST("/categories/:id/import-preview", practiceCtrl.ImportCategoryPreviewSchema)
 			// Lecturer writes the category description.
 			practiceLecturer.PUT("/categories/:id/introduction", practiceCtrl.SetCategoryIntroduction)
 			// Practice category intro images: staff mutations (upload, delete, reorder).

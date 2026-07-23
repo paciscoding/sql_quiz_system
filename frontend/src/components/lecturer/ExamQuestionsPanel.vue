@@ -14,7 +14,8 @@ import { handleApiError } from '../../services/error_handler'
 import { useFormValidation, required } from '../../composables/useFormValidation'
 import { useKeyboardShortcut } from '../../composables/useKeyboardShortcut'
 import { formatSql } from '../../utils/format_sql'
-import { setExamIntroduction } from '../../services/exam'
+import { setExamIntroduction, importExamCurriculumPreview } from '../../services/exam'
+import { ApiError } from '../../services/practice'
 import { listExamIntroImages, examImageBlobUrl, type IntroImageMetadata } from '../../services/schemaImages'
 
 const props = defineProps<{ exam: Examination }>()
@@ -22,6 +23,14 @@ const emit = defineEmits<{ changed: [] }>()
 
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
+
+// Independent client-side check (dual-schema spec §6.1): dual_schema on an
+// exam with no decoy curriculum is allowed (grading falls back to schema B)
+// but must be flagged to the lecturer with zero network round-trips. Purely
+// derived from props.exam, so it reacts automatically to switching exams,
+// toggling question.value.dual_schema, and loading a question into the form
+// (editQuestion / onQuestionDropdownChange) — no extra watcher needed.
+const examHasDecoy = computed(() => props.exam.has_preview_schema ?? false)
 
 const blankQuestion = () => ({
   id: null as number | null,
@@ -31,6 +40,7 @@ const blankQuestion = () => ({
   requirement: '',
   type: 'QUERY',
   points: 10,
+  dual_schema: false,
   strict_mode: {
     ordering: false,
     attributes: false,
@@ -129,6 +139,12 @@ const previewResult = ref<PreviewResult>({ status: '', rows: [], columns: [], er
 const previewLoading = ref(false)
 const questionFormRef = ref<HTMLElement | null>(null)
 
+// "Preview as student" (schema: 'preview') results — kept in a separate set
+// of refs from previewResult above so the lecturer can see both the
+// student's decoy-schema view (A) and the grading-schema view (B) side by side.
+const previewAsStudentResult = ref<PreviewResult>({ status: '', rows: [], columns: [], error: '' })
+const previewAsStudentLoading = ref(false)
+
 const editQuestion = (q: any) => {
   isEditMode.value = true
   question.value = {
@@ -139,6 +155,7 @@ const editQuestion = (q: any) => {
     requirement: q.requirement || '',
     type: q.question_type || 'QUERY',
     points: q.points || 0,
+    dual_schema: q.dual_schema || false,
     strict_mode: {
       ordering: q.strict_mode?.ordering || false,
       attributes: q.strict_mode?.attributes || false,
@@ -151,6 +168,7 @@ const editQuestion = (q: any) => {
     capturedAt: q.expected_result_captured_at || null
   }
   previewResult.value = { status: '', rows: [], columns: [], error: '' }
+  previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -168,10 +186,12 @@ function onQuestionDropdownChange(event: Event) {
       requirement: '',
       type: 'QUERY',
       points: 10,
+      dual_schema: false,
       strict_mode: { ordering: false, attributes: false, column_order: false }
     }
     lastCapture.value = { status: '', error: '', capturedAt: null }
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
+    previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   } else {
     const q = examQuestions.value.find((q: any) => q.id === Number(val))
     if (q) editQuestion(q)
@@ -226,6 +246,101 @@ const previewCorrectSQL = async () => {
     previewLoading.value = false
   }
 }
+
+// Runs the same correct_sql against the decoy curriculum (schema: 'preview')
+// so the lecturer can see exactly what the student sees on a dual-schema
+// question. Same body as previewCorrectSQL above, plus schema: 'preview'.
+const previewAsStudent = async () => {
+  if (!question.value.correct_sql) {
+    notify('Enter the Correct SQL before previewing', 'error')
+    return
+  }
+  if (question.value.type === 'DML' && !question.value.target_table) {
+    notify('Target table is required to preview a DML question', 'error')
+    return
+  }
+  previewAsStudentLoading.value = true
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const response = await fetch('/api/v1/lecturer/preview', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        exam_id: props.exam.id,
+        type: question.value.type,
+        target_table: question.value.target_table,
+        correct_sql: question.value.correct_sql,
+        schema: 'preview'
+      })
+    })
+    const data = await response.json().catch(() => ({} as any))
+    if (!response.ok) {
+      throw new Error(data.error || 'Preview failed')
+    }
+    if (data.status === 'error') {
+      previewAsStudentResult.value = { status: 'error', rows: [], columns: [], error: data.error || 'SQL error' }
+    } else {
+      previewAsStudentResult.value = {
+        status: 'ok',
+        rows: data.rows || [],
+        columns: data.columns || [],
+        error: ''
+      }
+    }
+  } catch (err) {
+    previewAsStudentResult.value = { status: 'error', rows: [], columns: [], error: (err as Error).message || 'Preview failed' }
+    handleApiError(err, { fallback: 'Preview failed' })
+  } finally {
+    previewAsStudentLoading.value = false
+  }
+}
+
+// --- Decoy curriculum (preview only) import — same tables/columns as the
+// grading curriculum, different data; used by dual-schema questions so the
+// student's preview never leaks the grading data. Mirrors the pattern in
+// the read-only-reference ExamSchemaPanel.vue (SqlEditor + single-flight +
+// 409-then-confirm-replace), replicated locally since that file is out of
+// this TODO's scope. ---
+const importPreviewSql = ref('')
+
+const { inFlight: importPreviewLoading, run: doImportPreview } = useSingleFlight(async () => {
+  if (!importPreviewSql.value.trim()) return
+  try {
+    const res = await importExamCurriculumPreview(props.exam.id, importPreviewSql.value, false)
+    notify('Decoy curriculum imported', 'success')
+    if (res.parity_warning) notify(res.parity_warning, 'error')
+    importPreviewSql.value = ''
+    emit('changed')
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      if (err.message.toLowerCase().includes('active')) {
+        handleApiError(err, { fallback: 'Cannot import decoy curriculum for an active exam' })
+        return
+      }
+      const ok = await confirm({
+        title: 'Replace existing decoy curriculum?',
+        body: 'This exam already has a decoy curriculum. Importing will drop the existing tables and replace them. Continue?',
+        confirmLabel: 'Replace',
+        danger: true,
+      })
+      if (!ok) return
+      try {
+        const res2 = await importExamCurriculumPreview(props.exam.id, importPreviewSql.value, true)
+        notify('Decoy curriculum replaced', 'success')
+        if (res2.parity_warning) notify(res2.parity_warning, 'error')
+        importPreviewSql.value = ''
+        emit('changed')
+      } catch (err2) {
+        handleApiError(err2, { fallback: 'Failed to import decoy curriculum' })
+      }
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to import decoy curriculum' })
+  }
+})
 
 // Exam description editor state
 const examIntroductionText = ref('')
@@ -380,6 +495,11 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
       notify(data.message || 'Question saved', 'success')
     }
 
+    // Non-blocking warnings from the backend — never prevent the save flow below.
+    if (data.table_warning) notify(data.table_warning, 'error')
+    if (data.dual_schema_warning) notify(data.dual_schema_warning, 'error')
+    if (data.mixed_dual_warning) notify(data.mixed_dual_warning, 'error')
+
     fetchExamQuestions()
     localStorage.removeItem(requirementDraftKey.value)
     emit('changed')
@@ -388,6 +508,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     question.value = blankQuestion()
     question.value.exam_id = props.exam.id
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
+    previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   } catch (err) {
     handleApiError(err, { fallback: 'Failed to save question' })
   }
@@ -434,6 +555,17 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           />
           <FieldError id="points-error" :message="questionValidation.touched.points ? questionValidation.errors.points : ''" />
         </div>
+
+        <!-- Dual schema applies to both QUERY and DML, so it is not gated by
+             question.type like the Target Table field above. -->
+        <div class="input-group">
+          <label><input type="checkbox" v-model="question.dual_schema" /> Dual schema (hidden grading)</label>
+          <!-- Independent, client-only validation (spec §6.1): no network round-trip,
+               purely reactive to question.value.dual_schema + examHasDecoy. -->
+          <span v-if="question.dual_schema && !examHasDecoy" class="badge badge-warning" style="display: inline-block; width: fit-content; font-weight: 600; margin-top: var(--space-1);">
+            Dual schema is enabled but this exam has no decoy curriculum yet — previews will use the grading schema until you upload one.
+          </span>
+        </div>
       </div>
 
       <div v-if="showDraftBanner" class="draft-banner">
@@ -468,9 +600,17 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           @click="previewCorrectSQL"
           :disabled="previewLoading || !question.correct_sql"
           class="secondary-btn"
-          style="margin-top: 0.5rem; width: auto; padding: 0.5rem 1rem;"
+          style="margin-top: 0.5rem; width: auto; padding: 0.5rem 1rem; margin-right: 0.5rem;"
         >
           {{ previewLoading ? 'Running...' : 'Preview Correct SQL Result' }}
+        </button>
+        <button
+          @click="previewAsStudent"
+          :disabled="previewAsStudentLoading || !question.correct_sql"
+          class="secondary-btn"
+          style="margin-top: 0.5rem; width: auto; padding: 0.5rem 1rem;"
+        >
+          {{ previewAsStudentLoading ? 'Running...' : 'Preview as Student' }}
         </button>
       </div>
 
@@ -493,13 +633,39 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         </div>
       </div>
 
-      <div class="strict-mode-section">
+      <!-- Preview-as-student results (decoy schema A — what the student
+           actually sees for a dual-schema question). Kept as a separate
+           panel from previewResult above so grading-schema (B) and
+           decoy-schema (A) results are visible side by side. -->
+      <div v-if="previewAsStudentResult.status" class="preview-block" :class="previewAsStudentResult.status">
+        <strong v-if="previewAsStudentResult.status === 'ok'">Preview as student ({{ previewAsStudentResult.rows.length }} row{{ previewAsStudentResult.rows.length === 1 ? '' : 's' }})</strong>
+        <strong v-else>Preview as student failed</strong>
+        <div v-if="previewAsStudentResult.status === 'error'" class="preview-error">{{ previewAsStudentResult.error }}</div>
+        <div v-else-if="previewAsStudentResult.rows.length === 0" class="preview-empty">(no rows returned)</div>
+        <div v-else class="preview-table-wrap sticky-table-head">
+          <table class="preview-table">
+            <thead>
+              <tr><th v-for="c in previewAsStudentResult.columns" :key="c">{{ c }}</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, i) in previewAsStudentResult.rows" :key="i">
+                <td v-for="c in previewAsStudentResult.columns" :key="c">{{ row[c] }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div v-if="question.type !== 'DML'" class="strict-mode-section">
         <h3>Strict Mode Options</h3>
         <div class="checkbox-group">
           <label><input type="checkbox" v-model="question.strict_mode.ordering" /> Row Ordering <span class="hint">(rows must match the teacher's order; off means set-equality)</span></label>
           <label><input type="checkbox" v-model="question.strict_mode.attributes" /> Exact Attributes <span class="hint">(column names must match)</span></label>
           <label><input type="checkbox" v-model="question.strict_mode.column_order" /> Column Order <span class="hint">(student columns must appear in the teacher's exact left-to-right order)</span></label>
         </div>
+      </div>
+      <div v-else class="strict-mode-section muted">
+        DML answers are graded on the final table contents as an unordered set of rows, matched by column name. Ordering and column-order options do not apply.
       </div>
 
       <button @click="saveQuestion" :disabled="saveQuestionLoading" class="primary-btn">
@@ -514,6 +680,29 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         <div v-if="lastCapture.capturedAt" class="capture-time">Captured at: {{ lastCapture.capturedAt }}</div>
       </div>
     </div><!-- /questionFormRef -->
+
+    <!-- Decoy curriculum (preview only) — same tables/columns as the exam's
+         real curriculum, different data; used by dual-schema questions so
+         the student's preview never leaks the grading data. Mirrors the
+         SqlEditor + single-flight + 409-then-confirm-replace pattern used by
+         the real-curriculum import in ExamSchemaPanel.vue, replicated
+         locally since that file is out of this TODO's scope. -->
+    <div style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">
+      <h3 style="margin: 0 0 var(--space-2) 0;">Decoy curriculum (preview only)</h3>
+      <p class="muted" style="margin: 0 0 var(--space-2) 0; font-size: 0.85rem;">
+        Paste a SQL script with the same tables and columns as this exam's real curriculum, but different data. Students previewing a dual-schema question see this data instead of the real grading data.
+      </p>
+      <SqlEditor v-model="importPreviewSql" height="200px" style="margin-bottom: var(--space-2);" />
+      <button
+        class="secondary-btn"
+        :disabled="importPreviewLoading || !importPreviewSql.trim()"
+        @click="doImportPreview"
+        style="margin-bottom: 0;"
+      >
+        <Spinner v-if="importPreviewLoading" size="sm" inline :invert="true" />{{ importPreviewLoading ? 'Importing...' : 'Import Decoy Curriculum' }}
+      </button>
+      <p v-if="examHasDecoy" class="muted" style="margin-top: var(--space-2); font-size: 0.85rem;">Decoy curriculum loaded — used for dual-schema question previews.</p>
+    </div>
 
     <!-- Exam Description editor -->
     <div style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">

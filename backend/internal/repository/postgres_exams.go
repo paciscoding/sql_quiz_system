@@ -125,6 +125,18 @@ func (r *PostgresRepository) ArchiveExamination(ctx context.Context, id int) err
 			return err
 		}
 
+		// Dual-schema grading (ARCH-002): unconditionally drop the exam's
+		// decoy preview sandbox, regardless of whether a real sandbox row
+		// exists (a pure-SELECT exam has no real sandbox but could still, in
+		// principle, have accumulated a preview sandbox). Runs on both the
+		// early-return path below (pure-SELECT exam) and the normal path, so
+		// it must be placed before the real-sandbox lookup.
+		previewSchema := ExamPreviewSandboxName(id)
+		safePreview := pgx.Identifier{previewSchema}.Sanitize()
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safePreview)); err != nil {
+			fmt.Printf("Warning: failed to drop exam preview sandbox %s: %v\n", previewSchema, err)
+		}
+
 		var schema string
 		err = tx.QueryRow(ctx,
 			"SELECT schema_name FROM app.exam_sandboxes WHERE exam_id = $1 AND dropped_at IS NULL",
@@ -174,9 +186,14 @@ func (r *PostgresRepository) IsStudentEnrolledInExam(ctx context.Context, studen
 }
 
 func (r *PostgresRepository) GetExamByID(ctx context.Context, id int) (models.Examination, error) {
-	query := `SELECT id, title, is_active, created_by, created_at, scheduled_start_at, scheduled_end_at, activated_at, archived_at, block_practice_during_exam, introduction FROM app.examinations WHERE id = $1`
+	// NOTE: curriculum_schema is included so callers (e.g. the dual-schema
+	// decoy import's structure-parity check) can compare the decoy against
+	// the exam's real curriculum schema instead of always seeing the zero
+	// value. COALESCE(...,'') matches how preview_curriculum_schema is
+	// populated elsewhere in this file (GetAllExaminationsWithCounts).
+	query := `SELECT id, title, is_active, created_by, created_at, scheduled_start_at, scheduled_end_at, activated_at, archived_at, block_practice_during_exam, introduction, COALESCE(curriculum_schema, '') FROM app.examinations WHERE id = $1`
 	var e models.Examination
-	err := r.pool.QueryRow(ctx, query, id).Scan(&e.ID, &e.Title, &e.IsActive, &e.CreatedBy, &e.CreatedAt, &e.ScheduledStartAt, &e.ScheduledEndAt, &e.ActivatedAt, &e.ArchivedAt, &e.BlockPracticeDuringExam, &e.Introduction)
+	err := r.pool.QueryRow(ctx, query, id).Scan(&e.ID, &e.Title, &e.IsActive, &e.CreatedBy, &e.CreatedAt, &e.ScheduledStartAt, &e.ScheduledEndAt, &e.ActivatedAt, &e.ArchivedAt, &e.BlockPracticeDuringExam, &e.Introduction, &e.CurriculumSchema)
 	return e, err
 }
 
@@ -214,6 +231,7 @@ func (r *PostgresRepository) GetAllExaminationsWithCounts(ctx context.Context) (
 		       e.scheduled_start_at, e.scheduled_end_at, e.activated_at, e.archived_at,
 		       e.block_practice_during_exam, e.introduction,
 		       COALESCE(e.curriculum_schema, 'public')                               AS curriculum_schema,
+		       COALESCE(e.preview_curriculum_schema, '')                            AS preview_curriculum_schema,
 		       COUNT(q.id)                                                          AS question_count,
 		       COALESCE(SUM(q.points), 0.0)                                         AS total_points,
 		       COUNT(q.id) FILTER (WHERE q.expected_result_status <> 'captured')    AS uncaptured_count
@@ -236,11 +254,13 @@ func (r *PostgresRepository) GetAllExaminationsWithCounts(ctx context.Context) (
 			&e.ScheduledStartAt, &e.ScheduledEndAt, &e.ActivatedAt, &e.ArchivedAt,
 			&e.BlockPracticeDuringExam, &e.Introduction,
 			&e.CurriculumSchema,
+			&e.PreviewCurriculumSchema,
 			&e.QuestionCount, &e.TotalPoints, &e.UncapturedCount,
 		)
 		if err != nil {
 			return nil, err
 		}
+		e.HasPreviewSchema = e.PreviewCurriculumSchema != ""
 		exams = append(exams, e)
 	}
 	return exams, rows.Err()
@@ -267,6 +287,8 @@ func (r *PostgresRepository) UpdateExaminationTitle(ctx context.Context, id int,
 //  3. app.examination_intro_images
 //  4. app.questions
 //  5. DROP exam sandbox schema (if present and not already dropped)
+//     5b. DROP per-exam curriculum schema (if not 'public')
+//     5c. DROP decoy preview curriculum + preview sandbox schemas (ARCH-019, unconditional by canonical name)
 //  6. app.exam_sandboxes
 //  7. app.examinations
 //
@@ -330,6 +352,25 @@ func (r *PostgresRepository) DeleteExamination(ctx context.Context, id int) erro
 			if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safe)); err != nil {
 				fmt.Printf("Warning: failed to drop exam curriculum schema %s during delete: %v\n", curriculumSchema, err)
 			}
+		}
+
+		// 5c. Decoy preview schemas (dual-schema grading, ARCH-019): unlike 5/5b
+		// above, these are dropped unconditionally by canonical name rather than
+		// by reading examinations.preview_curriculum_schema, so a failed or
+		// partial decoy import that never stamped the column is still reclaimed.
+		// Both names are derived from id and can never collide with 'public', so
+		// (unlike curriculum_schema above) no such guard is needed here. Mirrors
+		// how ArchiveExamination already treats the real sandbox/curriculum:
+		// warn-and-continue, never abort the delete over a decoy schema.
+		previewCurriculumSchema := ExamPreviewCurriculumSchemaName(id)
+		safePreviewCurriculum := pgx.Identifier{previewCurriculumSchema}.Sanitize()
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safePreviewCurriculum)); err != nil {
+			fmt.Printf("Warning: failed to drop exam preview curriculum schema %s during delete: %v\n", previewCurriculumSchema, err)
+		}
+		previewSandboxSchema := ExamPreviewSandboxName(id)
+		safePreviewSandbox := pgx.Identifier{previewSandboxSchema}.Sanitize()
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safePreviewSandbox)); err != nil {
+			fmt.Printf("Warning: failed to drop exam preview sandbox %s during delete: %v\n", previewSandboxSchema, err)
 		}
 
 		// 6. Sandbox bookkeeping row (covers both live and already-dropped entries)

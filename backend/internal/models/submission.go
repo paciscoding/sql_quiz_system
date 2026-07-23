@@ -38,22 +38,30 @@ type Submission struct {
 }
 
 type Question struct {
-	ID                       int             `json:"id"`
-	ExamID                   *ExamID         `json:"exam_id,omitempty"`
-	TargetTable              string          `json:"target_table"`
-	CorrectSQL               string          `json:"correct_sql"`
-	Type                     string          `json:"type"` // "QUERY" or "DML"
-	Points                   float64         `json:"points"`
-	Requirement              string          `json:"requirement"`
-	StrictMode               StrictMode      `json:"strict_mode"`
+	ID          int        `json:"id"`
+	ExamID      *ExamID    `json:"exam_id,omitempty"`
+	TargetTable string     `json:"target_table"`
+	CorrectSQL  string     `json:"correct_sql"`
+	Type        string     `json:"type"` // "QUERY" or "DML"
+	Points      float64    `json:"points"`
+	Requirement string     `json:"requirement"`
+	StrictMode  StrictMode `json:"strict_mode"`
+	// DualSchema, when true, routes the student PREVIEW to a decoy schema A
+	// while GRADING stays on the real schema B (dual-schema grading).
+	// Defaults to false — unset/omitted means single-schema (today's) behaviour.
+	DualSchema               bool            `json:"dual_schema"`
 	ExpectedResult           json.RawMessage `json:"expected_result,omitempty"`
 	ExpectedColumns          json.RawMessage `json:"expected_columns,omitempty"`
 	ExpectedResultStatus     string          `json:"expected_result_status"`
 	ExpectedResultCapturedAt *time.Time      `json:"expected_result_captured_at,omitempty"`
-	CaptureError             string          `json:"capture_error,omitempty"`
-	CreatedBy                UserID          `json:"created_by"`
-	CreatedAt                time.Time       `json:"created_at"`
-	UpdatedAt                time.Time       `json:"updated_at"`
+	// ExpectedRowsAffected is the rows-affected count of the lecturer's DML
+	// correct_sql at capture time, for diagnostics only. NULL for QUERY
+	// questions and for failed captures. Never read during grading (ARCH-009).
+	ExpectedRowsAffected *int      `json:"expected_rows_affected,omitempty"`
+	CaptureError         string    `json:"capture_error,omitempty"`
+	CreatedBy            UserID    `json:"created_by"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 	// CurriculumSchema is the schema that holds the exam's reference database for
 	// this question (populated by GetQuestion only, from the exam's curriculum_schema
 	// column). Defaults to 'public' when not set — the pre-curriculum-import

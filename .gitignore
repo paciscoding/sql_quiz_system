@@ -58,3 +58,6 @@ api_tests/environments/Local.bru
 # Custom Logs & Metrics
 *.log
 work_times.log
+
+# Antigravity CLI jail artifacts (agy-implementor lane)
+.agy/

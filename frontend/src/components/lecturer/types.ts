@@ -12,6 +12,7 @@ export interface Examination {
   total_points?: number
   uncaptured_count?: number
   block_practice_during_exam: boolean
+  has_preview_schema?: boolean
 }
 
 export interface Student {

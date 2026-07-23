@@ -29,6 +29,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      # Password for the restricted quiz_exec login role student SQL runs as
+      # (ARCH-025). Backend log.Fatal-s on boot if unset. Must match the
+      # password quiz_exec was created with in the DB.
+      STUDENT_DB_PASSWORD: ${STUDENT_DB_PASSWORD}
       PORT: 8080
       JWT_SECRET: ${JWT_SECRET}
       ID_SALT: ${ID_SALT}

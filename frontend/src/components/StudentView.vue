@@ -537,7 +537,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           <span class="muted" style="font-size: 0.8rem;">Final Submission</span>
           <span class="muted" style="margin-left: auto; font-size: 0.85rem;">Score: {{ result.score }} pts</span>
         </div>
-        <p style="margin: 0;">{{ result.feedback }}</p>
+        <p style="margin: 0; white-space: pre-line; overflow-wrap: break-word;">{{ result.feedback }}</p>
       </div>
 
       </template><!-- end v-else (questions sub-view) -->

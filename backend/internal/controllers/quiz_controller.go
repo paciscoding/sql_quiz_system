@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -135,12 +136,25 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 	// Students see the expected result for QUERY questions (it's the target
 	// rows they're supposed to reproduce) but NOT for DML — revealing the
 	// post-image of a mutation question would leak the answer outright.
+	// Dual-schema questions strip both fields regardless of type: expected_result
+	// is captured on grading schema B, and a dual QUERY question's preview runs
+	// on decoy schema A, so shipping B's captured rows would hand the student
+	// the answer outright. This is driven by DualSchema alone, so it still
+	// applies while the question is in dual-without-decoy fallback (spec 6.1).
 	// Correct SQL is also stripped regardless of type.
 	for i := range questions {
 		questions[i].CorrectSQL = ""
-		if questions[i].Type != "QUERY" {
+		if questions[i].Type != "QUERY" || questions[i].DualSchema {
 			questions[i].ExpectedResult = nil
 			questions[i].ExpectedColumns = nil
+		}
+		// ARCH-018 (e5): capture_error and expected_rows_affected are
+		// B-derived (the lecturer's correct_sql executed on the grading
+		// schema); expected_rows_affected in particular is a direct numeric
+		// hint about B's data. Dual-only, to keep non-dual byte-identical.
+		if questions[i].DualSchema {
+			questions[i].CaptureError = ""
+			questions[i].ExpectedRowsAffected = nil
 		}
 	}
 
@@ -229,16 +243,16 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 	// submission queue (single worker). SELECT runs lock-free against frozen
 	// public.* under the read-only role.
 	var result models.ValidationResult
-	evaluate := func() error {
+	evaluate := func(jobCtx context.Context) error {
 		var evalErr error
-		result, evalErr = ctrl.valService.Validate(ctx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)))
+		result, evalErr = ctrl.valService.Validate(jobCtx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)))
 		return evalErr
 	}
 
 	if question.Type == "DML" {
 		err = ctrl.submissionQueue.Run(ctx, evaluate)
 	} else {
-		err = evaluate()
+		err = evaluate(ctx)
 	}
 	if err != nil {
 		if errors.Is(err, services.ErrQueueFull) || errors.Is(err, services.ErrQueueShutdown) {
@@ -307,6 +321,34 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 		return
 	}
 
+	// Type-aware preview resolution to decoy schema A (spec 6.1): exam QUERY
+	// reads the curriculum, so A = preview curriculum; exam DML mutates the
+	// shared sandbox, so A = a preview sandbox cloned from the preview
+	// curriculum, built lazily on first use. If dual_schema is on but no
+	// usable decoy exists, previewSchema stays "" and ValidatePreview falls
+	// back to grading schema B — exactly today's behaviour — and the
+	// fallback is logged server-side. The student is never blocked or told.
+	previewSchema := ""
+	if question.DualSchema {
+		pc, _ := ctrl.repo.GetExamPreviewCurriculumSchema(ctx, int(*question.ExamID))
+		if pc != "" {
+			if question.Type == "QUERY" {
+				if hasTables, _ := ctrl.repo.SchemaHasTables(ctx, pc); hasTables {
+					previewSchema = pc
+				}
+			} else {
+				if err := ctrl.repo.EnsureExamPreviewSandboxReady(ctx, int(*question.ExamID)); err == nil {
+					previewSchema = repository.ExamPreviewSandboxName(int(*question.ExamID))
+				}
+			}
+		}
+		if previewSchema == "" {
+			// Dual-without-decoy fallback (spec 6.1): single-schema fallback to B. Student is
+			// never blocked/told; the lecturer is warned on save instead (see lecturer_controller.go).
+			log.Printf("dual-schema fallback: exam question %d (exam %d) has dual_schema=true but no usable decoy; preview running on grading schema B", question.ID, int(*question.ExamID))
+		}
+	}
+
 	var (
 		vResult models.ValidationResult
 		vRows   []map[string]interface{}
@@ -315,16 +357,16 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 		vTrunc  bool
 	)
 
-	preview := func() error {
+	preview := func(jobCtx context.Context) error {
 		var e error
-		vResult, vRows, vCols, vCount, vTrunc, e = ctrl.valService.ValidatePreview(ctx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)))
+		vResult, vRows, vCols, vCount, vTrunc, e = ctrl.valService.ValidatePreview(jobCtx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)), previewSchema)
 		return e
 	}
 
 	if question.Type == "DML" {
 		err = ctrl.submissionQueue.Run(ctx, preview)
 	} else {
-		err = preview()
+		err = preview(ctx)
 	}
 
 	if err != nil {

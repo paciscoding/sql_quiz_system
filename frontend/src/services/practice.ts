@@ -27,6 +27,8 @@ export interface PracticeCategory {
   created_at: string
   updated_at: string
   introduction: string
+  preview_schema_name?: string
+  has_preview_schema?: boolean
 }
 
 // Schema introspection types (shared between practice intro and exam intro)
@@ -75,6 +77,7 @@ export interface PracticeQuestion {
   expected_result_captured_at?: string
   created_at: string
   updated_at: string
+  dual_schema?: boolean
 }
 
 export interface PracticeAttempt {
@@ -164,7 +167,17 @@ export const getSummary = (): Promise<PracticeSummary[]> =>
 export const lecturerListQuestions = (): Promise<PracticeQuestion[]> =>
   apiFetch('/api/v1/lecturer/practice/questions')
 
-export const upsertQuestion = (payload: Partial<PracticeQuestion>): Promise<any> =>
+export const upsertQuestion = (payload: Partial<PracticeQuestion>): Promise<{
+  message: string
+  id?: string
+  expected_result_status?: string
+  expected_result_captured_at?: string
+  expected_rows_affected?: number
+  capture_error?: string
+  table_warning?: string
+  dual_schema_warning?: string
+  mixed_dual_warning?: string
+}> =>
   apiFetch('/api/v1/lecturer/practice/question', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -203,7 +216,14 @@ export const importCategorySchema = (id: string, sql: string, confirmReplace = f
     body: JSON.stringify({ sql })
   })
 
-export const lecturerPreview = (payload: { type: string; target_table: string; correct_sql: string }): Promise<any> =>
+export const importCategoryPreviewSchema = (id: string, sql: string, confirmReplace = false): Promise<{ message: string; parity_warning?: string }> =>
+  apiFetch(`/api/v1/lecturer/practice/categories/${id}/import-preview${confirmReplace ? '?confirm_replace=true' : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql })
+  })
+
+export const lecturerPreview = (payload: { type: string; target_table: string; correct_sql: string; category_id?: string; schema?: 'grading' | 'preview' }): Promise<any> =>
   apiFetch('/api/v1/lecturer/practice/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

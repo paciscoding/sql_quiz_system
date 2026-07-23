@@ -49,6 +49,7 @@ type LecturerExaminationResponse struct {
 	EffectiveState          string        `json:"effective_state"`
 	Introduction            string        `json:"introduction"`
 	CurriculumSchema        string        `json:"curriculum_schema"`
+	HasPreviewSchema        bool          `json:"has_preview_schema"`
 	QuestionCount           int           `json:"question_count"`
 	TotalPoints             float64       `json:"total_points"`
 	UncapturedCount         int           `json:"uncaptured_count"`
@@ -103,6 +104,7 @@ func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
 			EffectiveState:          repository.ExaminationEffectiveState(e).Phase,
 			Introduction:            e.Introduction,
 			CurriculumSchema:        e.CurriculumSchema,
+			HasPreviewSchema:        e.HasPreviewSchema,
 			QuestionCount:           e.QuestionCount,
 			TotalPoints:             e.TotalPoints,
 			UncapturedCount:         e.UncapturedCount,
@@ -391,12 +393,42 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 		return
 	}
 
+	// Warn-only DML correct-answer table check (spec §9): never blocks the save.
+	tw := repository.DMLCorrectSQLTargetTableWarning(saved.Type, saved.CorrectSQL, saved.TargetTable)
+
+	// Dual-without-decoy warning (spec §6.1): when dual_schema is on but the
+	// owning exam has no decoy curriculum uploaded yet, tell the lecturer the
+	// preview will fall back to the grading schema until they upload one.
+	// Never blocks the save.
+	dsw := ""
+	if saved.DualSchema && saved.ExamID != nil {
+		pc, _ := ctrl.repo.GetExamPreviewCurriculumSchema(c.Request.Context(), int(*saved.ExamID))
+		if pc == "" {
+			dsw = "Dual schema is enabled but no decoy schema has been uploaded for this category/exam - previews will use the grading schema until you upload one."
+		}
+	}
+
+	// Mixed dual/non-dual warning (GAP 4, ARCH-018): an exam holding both dual
+	// and non-dual questions lets a student bypass the decoy by opening the
+	// non-dual question's preview. Warn-only; a lookup failure must never turn
+	// a successful save into an error, so its error is discarded.
+	mdw := ""
+	if saved.ExamID != nil {
+		mixed, _ := ctrl.repo.ExamHasMixedDualSchema(c.Request.Context(), int(*saved.ExamID))
+		if mixed {
+			mdw = "This exam contains both dual-schema and normal questions. A student can open a normal question's preview to read the grading schema, which bypasses the decoy on your dual-schema questions. Consider making every question here dual-schema."
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":                     "Question saved successfully",
 		"id":                          saved.ID,
 		"expected_result_status":      saved.ExpectedResultStatus,
 		"expected_result_captured_at": saved.ExpectedResultCapturedAt,
 		"capture_error":               saved.CaptureError,
+		"table_warning":               tw,
+		"dual_schema_warning":         dsw,
+		"mixed_dual_warning":          mdw,
 	})
 }
 
@@ -453,12 +485,18 @@ func (ctrl *LecturerController) DeleteQuestion(c *gin.Context) {
 // Optional field exam_id: when present and > 0, the preview runs against that
 // exam's curriculum schema instead of 'public'. Absent (or 0) keeps the
 // existing 'public' behaviour byte-for-byte.
+//
+// Optional field schema: "grading" (default) previews on the real curriculum,
+// matching today's behaviour byte-for-byte; "preview" previews on the exam's
+// decoy curriculum (dual-schema grading) so the lecturer can see exactly what
+// a dual-schema student would see.
 func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	var req struct {
 		Type        string        `json:"type"`
 		TargetTable string        `json:"target_table"`
 		CorrectSQL  string        `json:"correct_sql"`
 		ExamID      models.ExamID `json:"exam_id"` // optional; 0 = use public schema
+		Schema      string        `json:"schema"`  // optional; "grading" (default) or "preview"
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -469,7 +507,8 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		return
 	}
 
-	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID))
+	useDecoy := req.Schema == "preview"
+	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), useDecoy)
 	if err != nil {
 		// Surface engine errors with status='error' so the frontend can render
 		// the message inline (this is expected during authoring).
@@ -533,6 +572,55 @@ func (ctrl *LecturerController) ImportExamCurriculum(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Curriculum imported into exam"})
+}
+
+// ImportExamCurriculumPreview handles
+// POST /api/v1/lecturer/exams/:id/curriculum/import-preview
+// Loads a SQL script into the exam's decoy curriculum schema (dual-schema
+// grading, spec §5/§10). Mirrors ImportExamCurriculum exactly, including the
+// confirm_replace=true query param and error-status mapping. On success the
+// response also carries parity_warning: a non-blocking notice when the decoy
+// curriculum's table/column structure differs from the real curriculum.
+func (ctrl *LecturerController) ImportExamCurriculumPreview(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	lecturer := userVal.(models.User)
+
+	id, ok := idParam(c, "id", publicid.TypeExam)
+	if !ok {
+		return
+	}
+	var req struct {
+		SQL string `json:"sql"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.SQL) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sql is required"})
+		return
+	}
+	confirmReplace := c.Query("confirm_replace") == "true"
+
+	parityWarning, err := ctrl.repo.ImportSchemaIntoExamCurriculumPreview(
+		c.Request.Context(), id, req.SQL, int(lecturer.ID), confirmReplace,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": "exam not found"})
+		case errors.Is(err, repository.ErrSchemaQualifiedName):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrExamActive):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrExamCurriculumNotEmpty):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Decoy curriculum imported into exam", "parity_warning": parityWarning})
 }
 
 func (ctrl *LecturerController) ImportSchema(c *gin.Context) {
