@@ -164,9 +164,15 @@ func main() {
 	r := gin.Default()
 
 	config := cors.DefaultConfig()
+	config.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"}
 	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
 	if allowedOrigins != "" {
-		config.AllowOrigins = strings.Split(allowedOrigins, ",")
+		origins := strings.Split(allowedOrigins, ",")
+		for i := range origins {
+			origins[i] = strings.TrimSpace(origins[i])
+		}
+		config.AllowOrigins = origins
 	} else {
 		config.AllowOrigins = []string{"http://localhost"}
 	}
