@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -168,7 +167,7 @@ func main() {
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"}
 	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
 	if allowedOrigins != "" {
-		config.AllowOrigins = []string{"*"},
+		config.AllowOrigins = []string{"*"}
 	} else {
 		config.AllowOrigins = []string{"http://localhost"}
 	}
