@@ -168,11 +168,7 @@ func main() {
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"}
 	allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
 	if allowedOrigins != "" {
-		origins := strings.Split(allowedOrigins, ",")
-		for i := range origins {
-			origins[i] = strings.TrimSpace(origins[i])
-		}
-		config.AllowOrigins = origins
+		config.AllowOrigins = []string{"*"},
 	} else {
 		config.AllowOrigins = []string{"http://localhost"}
 	}
