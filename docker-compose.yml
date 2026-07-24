@@ -53,12 +53,16 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      # dockerfile: Dockerfile.caddy
     container_name: sql-quiz-frontend
     ports:
       - "80:80"
+      - "443:443"
     depends_on:
       backend:
         condition: service_healthy
+    volumes:
+      - /opt/nginx/certs:/etc/nginx/certs:ro
     restart: always
 
 volumes:
