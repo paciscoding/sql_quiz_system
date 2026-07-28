@@ -1,4 +1,5 @@
 package services
+
 import (
 	"context"
 	"crypto/subtle"
@@ -89,7 +90,6 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (mod
 	if err != nil {
 		return models.LoginResponse{}, err
 	}
-
 
 	user.Password = "" // Clear hash before returning
 	return models.LoginResponse{
@@ -445,6 +445,89 @@ func (s *AuthService) ResetPassword(ctx context.Context, actor models.User, targ
 		log.Printf("auth: SendCredential failed for reset of %q: %v", target.Username, err)
 	}
 	return password, nil
+}
+
+// ResolveBulkResetTargets delegates to the repository (same pattern as
+// ListUsersByRole/GetAllUsers/UpdateUser/DeleteUser above): the controller
+// holds only an *AuthService, not a repository reference, so this thin
+// pass-through is how BulkResetPassword's handler drives ARCH-031 (3)'s
+// target-set resolution without a new constructor dependency.
+func (s *AuthService) ResolveBulkResetTargets(ctx context.Context, mode string, userIDs []int, examID int, afterID int, limit int) ([]models.BulkResetTarget, int, error) {
+	return s.repo.ResolveBulkResetTargets(ctx, mode, userIDs, examID, afterID, limit)
+}
+
+// NonStudentUserIDs delegates to the repository, for the same reason as
+// ResolveBulkResetTargets above. Used only for mode=="ids": a non-empty
+// result must abort the WHOLE bulk-reset request before any write.
+func (s *AuthService) NonStudentUserIDs(ctx context.Context, userIDs []int) ([]int, error) {
+	return s.repo.NonStudentUserIDs(ctx, userIDs)
+}
+
+// BulkResetPasswords (admin-only) resets a batch of STUDENT targets already
+// resolved by repository.ResolveBulkResetTargets, one independent
+// per-student transaction at a time (ARCH-031 (4)/(5)). Each target gets its
+// own freshly generated random password (the same GeneratePassword used by
+// ResetPassword — never the student number, never a value shared across
+// targets) and its own bcrypt hash; bcrypt is deliberately NOT parallelised,
+// since it is CPU-expensive and this process also grades exams. A failure on
+// one target is appended to `failures` and the loop CONTINUES: the batch is
+// NOT transactional across students, so students already reset stay reset.
+//
+// This method MUST NOT reference s.email and MUST NOT call s.logPasswordEvent
+// — that helper calls s.email.SendChangeNotice for EVERY event when
+// ADMIN_EMAIL is configured, which would turn a 200-student batch into 200
+// admin emails. The encrypt+insert is instead done inline via
+// r.ApplyPasswordReset, so no email of any kind is ever sent on this path
+// (ARCH-031/032 S4). No SendCredential either: the plaintext is returned to
+// the caller in `results` and shown to the admin, never emailed to the
+// student.
+func (s *AuthService) BulkResetPasswords(ctx context.Context, actor models.User, targets []models.BulkResetTarget) (results []models.BulkResetResult, failures []models.BulkResetFailure) {
+	if s.cipher == nil {
+		log.Printf("auth: password-event logging disabled (no key); %d admin_reset events not recorded", len(targets))
+	}
+
+	actorID := int(actor.ID)
+	results = make([]models.BulkResetResult, 0, len(targets))
+	for _, target := range targets {
+		password := GeneratePassword()
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			failures = append(failures, models.BulkResetFailure{
+				UserID: models.UserID(target.UserID), Username: target.Username, Error: err.Error(),
+			})
+			continue
+		}
+
+		var enc, nonce []byte
+		if s.cipher != nil {
+			enc, nonce, err = s.cipher.Encrypt(password)
+			if err != nil {
+				failures = append(failures, models.BulkResetFailure{
+					UserID: models.UserID(target.UserID), Username: target.Username, Error: err.Error(),
+				})
+				continue
+			}
+		}
+
+		if err := s.repo.ApplyPasswordReset(ctx, target.UserID, string(hash), actorID, models.PasswordEventAdminReset, enc, nonce); err != nil {
+			failures = append(failures, models.BulkResetFailure{
+				UserID: models.UserID(target.UserID), Username: target.Username, Error: err.Error(),
+			})
+			continue
+		}
+
+		results = append(results, models.BulkResetResult{
+			UserID:        models.UserID(target.UserID),
+			Username:      target.Username,
+			StudentNumber: target.StudentNumber,
+			FirstName:     target.FirstName,
+			LastName:      target.LastName,
+			SecLec:        target.SecLec,
+			SecLab:        target.SecLab,
+			Password:      password,
+		})
+	}
+	return results, failures
 }
 
 // ResendCredential re-emails a user's current credential to their stored email

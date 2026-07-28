@@ -60,6 +60,20 @@ interface Question {
   target_table: string
   expected_result?: Record<string, any>[] | null
   expected_columns?: string[] | null
+  category_id?: string
+  category_name?: string
+}
+
+// QuestionGroup buckets contiguous runs of `questions` sharing the same
+// category (ARCH-030 (5)). `questions` is already category-ordered by the
+// backend (category_id IS NULL last, name ASC, id ASC — TODO-053), so a
+// single linear pass is enough to group it; no re-sorting happens here.
+// `index` is each question's position in the flat `questions` array, kept so
+// the <option> label stays the sequential Q-number (1-based), not a
+// per-group-restarted count.
+interface QuestionGroup {
+  label: string
+  items: { question: Question; index: number }[]
 }
 
 // ─── SELECT phase state ──────────────────────────────────────────────────────
@@ -141,6 +155,26 @@ const correctCount = computed(() => {
 })
 const progressPct = computed(() =>
   questions.value.length === 0 ? 0 : Math.round((answeredCount.value / questions.value.length) * 100))
+
+// hasCategorizedQuestions / questionGroups drive the optgroup-grouped question
+// picker (ARCH-030 (5)). Presentation only — questions/currentIndex/progress
+// above are untouched, and the flat <option> list renders exactly as before
+// this feature when no question carries a category.
+const hasCategorizedQuestions = computed(() => questions.value.some(q => q.category_id != null))
+
+const questionGroups = computed<QuestionGroup[]>(() => {
+  const groups: QuestionGroup[] = []
+  questions.value.forEach((q, index) => {
+    const label = q.category_id != null ? (q.category_name || 'Category') : 'Other'
+    const last = groups[groups.length - 1]
+    if (last && last.label === label) {
+      last.items.push({ question: q, index })
+    } else {
+      groups.push({ label, items: [{ question: q, index }] })
+    }
+  })
+  return groups
+})
 
 // ─── Watchers ────────────────────────────────────────────────────────────────
 watch(selectedQuestionId, () => {
@@ -437,9 +471,18 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           <label>Question</label>
           <select class="input" v-model="selectedQuestionId">
             <option :value="null">-- Select question --</option>
-            <option v-for="(q, i) in questions" :key="q.id" :value="q.id">
-              Q{{ i + 1 }} ({{ q.type }} - {{ q.points }} pts)
-            </option>
+            <template v-if="hasCategorizedQuestions">
+              <optgroup v-for="(group, gi) in questionGroups" :key="gi" :label="group.label">
+                <option v-for="item in group.items" :key="item.question.id" :value="item.question.id">
+                  Q{{ item.index + 1 }} ({{ item.question.type }} - {{ item.question.points }} pts)
+                </option>
+              </optgroup>
+            </template>
+            <template v-else>
+              <option v-for="(q, i) in questions" :key="q.id" :value="q.id">
+                Q{{ i + 1 }} ({{ q.type }} - {{ q.points }} pts)
+              </option>
+            </template>
           </select>
         </div>
       </div>

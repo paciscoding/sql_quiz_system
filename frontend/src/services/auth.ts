@@ -160,6 +160,93 @@ export async function resetPassword(id: string): Promise<ResetPasswordResponse> 
   return parseOrThrow<ResetPasswordResponse>(res, 'Failed to reset password')
 }
 
+export interface BulkResetResultRow {
+  user_id: string
+  username: string
+  student_number: string
+  first_name: string
+  last_name: string
+  sec_lec: string
+  sec_lab: string
+  /** Plaintext, shown to the admin exactly once — this response is the ONLY
+   * channel it ever travels on (ARCH-031/032); never persisted client-side. */
+  password: string
+}
+export interface BulkResetFailureRow {
+  user_id: string
+  username: string
+  error: string
+}
+export interface BulkResetResponse {
+  mode: 'ids' | 'all_students' | 'exam_roster'
+  processed: number
+  succeeded: number
+  failed: number
+  remaining: number
+  next_after_user_id: string | null
+  key_configured: boolean
+  results: BulkResetResultRow[]
+  failures: BulkResetFailureRow[]
+}
+
+export interface BulkResetPasswordsRequest {
+  mode: 'ids' | 'all_students' | 'exam_roster'
+  user_ids?: string[]
+  exam_id?: string
+  /** Must be the literal string "RESET", on every request including
+   * continuation batches — the server refuses with 400 otherwise (ARCH-032 S3). */
+  confirm: string
+  after_user_id?: string
+  batch_size?: number
+}
+
+/** POST /api/v1/users/bulk-reset-password — admin-only bulk reset (ARCH-031). */
+export async function bulkResetPasswords(payload: BulkResetPasswordsRequest): Promise<BulkResetResponse> {
+  const res = await fetch('/api/v1/users/bulk-reset-password', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(payload),
+  })
+  return parseOrThrow<BulkResetResponse>(res, 'Failed to bulk-reset passwords')
+}
+
+// ---------------------------------------------------------------------------
+// Read-only lookups for BulkPasswordReset.vue's selection screen. Defined
+// here (rather than inline fetch() calls in the component) so the component
+// never touches localStorage/sessionStorage directly — it goes through
+// authHeaders()/parseOrThrow() like every other call in this file (ARCH-032:
+// the component file must contain zero references to browser storage APIs).
+// ---------------------------------------------------------------------------
+
+export interface StudentSummary {
+  id: string
+  username: string
+}
+
+/** GET /api/v1/users/students — the full student roster (Admin, Lecturer). */
+export async function listStudents(): Promise<StudentSummary[]> {
+  const res = await fetch('/api/v1/users/students', { headers: authHeaders() })
+  return parseOrThrow<StudentSummary[]>(res, 'Failed to load students')
+}
+
+export interface ExamSummary {
+  id: string
+  title: string
+}
+
+/** GET /api/v1/lecturer/exams — examinations list (Admin, Lecturer). */
+export async function listExamsForSelection(): Promise<ExamSummary[]> {
+  const res = await fetch('/api/v1/lecturer/exams', { headers: authHeaders() })
+  return parseOrThrow<ExamSummary[]>(res, 'Failed to load examinations')
+}
+
+/** GET /api/v1/lecturer/exams/:id/students — roster size preview for exam_roster mode. */
+export async function getExamRosterCount(examId: string): Promise<number> {
+  const res = await fetch(`/api/v1/lecturer/exams/${examId}/students`, { headers: authHeaders() })
+  const data = await parseOrThrow<{ count: number }>(res, 'Failed to load exam roster')
+  return data.count ?? 0
+}
+
 export interface ResendCredentialResponse {
   emailed_to: string
 }

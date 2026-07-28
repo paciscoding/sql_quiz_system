@@ -1,0 +1,37 @@
+# Stage 1: Build Caddy with DuckDNS plugin
+FROM caddy:2.9-builder-alpine AS caddy-builder
+
+RUN xcaddy build \
+    --with github.com/caddy-dns/duckdns@v0.4.0
+
+# Stage 2: Build Frontend App with Bun
+FROM oven/bun:alpine AS frontend-builder
+
+WORKDIR /app
+
+# Install dependencies
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+# Copy source code and build
+COPY . .
+RUN bun run build
+
+# Stage 3: Production Runner Stage
+FROM caddy:2.9-alpine
+
+WORKDIR /app
+
+# Copy custom Caddy binary with DuckDNS plugin from builder
+COPY --from=caddy-builder /usr/bin/caddy /usr/bin/caddy
+
+# Copy built frontend assets
+COPY --from=frontend-builder /app/dist /usr/share/nginx/html
+
+# Copy custom Caddyfile
+COPY Caddyfile /etc/caddy/Caddyfile
+
+# Expose HTTP and HTTPS ports for Caddy
+EXPOSE 80 443 2019
+
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

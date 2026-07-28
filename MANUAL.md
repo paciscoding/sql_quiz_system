@@ -7,7 +7,7 @@ Welcome to the SQL Quiz System, a secure and scalable platform for PostgreSQL ex
 The system is fully containerized. To start the platform:
 1. Ensure Docker and Docker Compose are installed.
 2. Run: `docker-compose up -d --build`
-3. Access the web interface at: `http://localhost`
+3. Access the web interface over HTTPS at your server's address (e.g. `https://10.4.29.203`). The first visit shows a certificate warning — this is expected; see §5.
 
 ---
 
@@ -15,7 +15,7 @@ The system is fully containerized. To start the platform:
 The Administrator is responsible for system infrastructure and the initial creation of staff accounts.
 
 ### Initial Login
-- **URL:** `http://localhost` (Click "Login")
+- **URL:** your server's HTTPS address, e.g. `https://10.4.29.203` (Click "Login")
 - **Username:** `admin`
 - **Password:** `admin123`
 *(Note: Change your password immediately via the **"Profile"** settings or the `/api/v1/user/password` endpoint for security.)*
@@ -26,6 +26,12 @@ The Administrator is responsible for system infrastructure and the initial creat
 - **Resend a credential** re-emails the user's current password (requires an email on file and `PASSWORD_LOG_KEY` configured); it does not change the password.
 - **Password events** shows a per-user audit trail of password changes.
 - Users who forget their password can self-serve from the login page (see the Student workflow's *Forgot Password* note) if they have an email on file.
+
+**Bulk password reset (lab exams).** From **Account Administration → User Management**, the **"Bulk Reset Passwords"** button opens a dedicated page for resetting many students' passwords in one operation — for example, ahead of a proctored lab exam where every station needs a fresh, unknown password.
+- **Pick a selection mode:** *Selected students* (tick individually), *All students*, or *By exam roster* (every student assigned to one exam).
+- **Confirm.** The page states plainly how many students will be affected: every one of them is **signed out of all devices immediately**, and **nothing is ever emailed**. The reset button stays disabled until you type the literal word **`RESET`** into the confirmation box — the server independently re-checks that same word on every request, so this cannot be bypassed from the browser.
+- **Run.** Large selections are processed in batches (up to 200 students per request; 100 by default) and the page loops automatically, showing progress, until every selected student has a new password.
+- **Handle the result like a stack of printed passwords.** The response is a one-time list of plaintext passwords — this is a full credential dump for the students you selected. Download it as a **CSV**, or use **"Print table"** / **"Print slips"** to produce a page of per-student cut slips. Once you've printed or downloaded, hand the credentials out and then destroy the copies (paper and file) — there is no way to look a generated password up again afterward, and a printed batch that is never distributed leaves those students locked out until it is.
 
 ### Managing Staff (Lecturers)
 1. Navigate to the **"Manage Accounts"** tab.
@@ -235,3 +241,18 @@ For the full design, see `ARCHITECTURE.md § Phase Lifecycle`. Headlines:
 - **Hermetic DML Evaluation:** Each DML submission is wrapped in `BEGIN; SAVEPOINT student_eval; … ROLLBACK TO SAVEPOINT student_eval; COMMIT`. The student's writes never persist past the rollback, so the next student in the queue starts from the same byte-identical sandbox state.
 - **Persistence:** Every submission (success or failure) is recorded in `app.submissions` for audit and final scoring.
 - **Queueing:** All DML submissions across the whole system serialise through a single FIFO worker. When the queue is saturated, the submitter receives HTTP 503; on per-job timeout, HTTP 504. SELECT submissions don't queue at all.
+
+---
+
+## 5. About the Browser Security Warning (Students)
+The first time you open the site over **https**, your browser will show a warning such as **"Your connection is not private"** (Chrome/Edge) or **"Warning: Potential Security Risk Ahead"** (Firefox). This is **expected** for this system — it does **not** mean your machine or the site has been compromised.
+
+**Why it appears:** the server uses a self-signed certificate because it doesn't have a public domain name, so your browser can't automatically verify who issued it. Your connection is still fully **encrypted**.
+
+**How to proceed:**
+- **Chrome / Edge:** Click **"Advanced"**, then **"Proceed to `<address>` (unsafe)"**.
+- **Firefox:** Click **"Advanced…"**, then **"Accept the Risk and Continue"**.
+
+You only need to do this **once per browser** — subsequent visits will not show the warning again.
+
+This is a **temporary measure**; a properly trusted certificate is planned for the future.

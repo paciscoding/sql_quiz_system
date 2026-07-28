@@ -23,14 +23,15 @@ import (
 type Type byte
 
 const (
-	TypeUser       Type = 'U'
-	TypeExam       Type = 'E'
-	TypeQuestion   Type = 'Q'
-	TypeCategory   Type = 'C'
-	TypePractice   Type = 'P'
-	TypeImage      Type = 'I'
-	TypeSubmission Type = 'B'
-	TypeAttempt    Type = 'A'
+	TypeUser         Type = 'U'
+	TypeExam         Type = 'E'
+	TypeQuestion     Type = 'Q'
+	TypeCategory     Type = 'C'
+	TypePractice     Type = 'P'
+	TypeImage        Type = 'I'
+	TypeSubmission   Type = 'B'
+	TypeAttempt      Type = 'A'
+	TypeExamCategory Type = 'X'
 )
 
 const defaultAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

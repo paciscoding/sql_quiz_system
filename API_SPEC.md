@@ -33,16 +33,17 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Auth | POST | `/login` | public |
 | Auth | POST | `/forgot-password` | public |
 | Auth | POST | `/forgot-password/verify` | public |
-| Users | POST | `/user/password` | any auth |
-| Users | GET | `/user/students` | Admin/Lecturer |
+| Users | POST | `/users/password` | any auth |
+| Users | GET | `/users/students` | Admin/Lecturer |
 | Users | POST | `/users` | Admin/Lecturer |
 | Users | POST | `/students` | Admin/Lecturer |
-| Admin | GET | `/admin/users/all` | Admin |
-| Admin | PUT | `/admin/users/:id` | Admin |
-| Admin | DELETE | `/admin/users/:id` | Admin |
-| Admin | POST | `/admin/users/:id/reset-password` | Admin |
-| Admin | POST | `/admin/users/:id/resend-credential` | Admin |
-| Admin | GET | `/admin/users/:id/password-events` | Admin |
+| Admin | GET | `/users/all` | Admin |
+| Admin | PUT | `/users/:id` | Admin |
+| Admin | DELETE | `/users/:id` | Admin |
+| Admin | POST | `/users/:id/reset-password` | Admin |
+| Admin | POST | `/users/:id/resend-credential` | Admin |
+| Admin | GET | `/users/:id/password-events` | Admin |
+| Admin | POST | `/users/bulk-reset-password` | Admin |
 | Admin | GET | `/export/settings` | Admin |
 | Admin | PUT | `/export/settings` | Admin |
 | Admin | POST | `/export/run-now` | Admin |
@@ -55,6 +56,7 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Quiz | GET | `/quiz/exams/:id/introduction` | Student |
 | Quiz | GET | `/quiz/exams/:id/intro-images` | Student/Admin/Lecturer |
 | Quiz | GET | `/quiz/exams/:id/intro-images/:imageId` | Student/Admin/Lecturer |
+| Quiz | GET | `/quiz/exams/:id/categories` | Student/Admin/Lecturer |
 | Quiz | GET | `/quiz/results` | Student |
 | Lecturer | POST | `/lecturer/question` | Admin/Lecturer |
 | Lecturer | GET | `/lecturer/exams/max-scores` | Admin/Lecturer |
@@ -76,6 +78,14 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Lecturer | DELETE | `/lecturer/exams/:id/intro-images/:imageId` | Admin/Lecturer |
 | Lecturer | PUT | `/lecturer/exams/:id/intro-images/order` | Admin/Lecturer |
 | Lecturer | POST | `/lecturer/exams/:id/curriculum/import` | Admin/Lecturer |
+| Lecturer | POST | `/lecturer/exams/:id/curriculum/import-preview` | Admin/Lecturer |
+| Lecturer | GET | `/lecturer/exams/:id/categories` | Admin/Lecturer |
+| Lecturer | POST | `/lecturer/exams/:id/categories` | Admin/Lecturer |
+| Lecturer | PUT | `/lecturer/exams/:id/categories/:categoryId` | Admin/Lecturer |
+| Lecturer | DELETE | `/lecturer/exams/:id/categories/:categoryId` | Admin/Lecturer |
+| Lecturer | POST | `/lecturer/exams/:id/categories/:categoryId/import` | Admin/Lecturer |
+| Lecturer | POST | `/lecturer/exams/:id/categories/:categoryId/import-preview` | Admin/Lecturer |
+| Lecturer | PUT | `/lecturer/exams/:id/categories/:categoryId/introduction` | Admin/Lecturer |
 | Lecturer | GET | `/lecturer/exams/:id/students` | Admin/Lecturer |
 | Lecturer | DELETE | `/lecturer/exams/:id/students/:studentId` | Admin/Lecturer |
 | Lecturer | POST | `/lecturer/exams/:id/students` | Admin/Lecturer |
@@ -93,12 +103,14 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Practice (lecturer) | GET | `/lecturer/practice/questions` | Admin/Lecturer |
 | Practice (lecturer) | DELETE | `/lecturer/practice/question/:id` | Admin/Lecturer |
 | Practice (lecturer) | POST | `/lecturer/practice/preview` | Admin/Lecturer |
-| Practice (lecturer) | POST | `/lecturer/practice/reset-sandbox` | Admin/Lecturer |
+| Practice (lecturer) | POST | `/lecturer/practice/reset-sandbox` | ⚠ handler exists but **no route is registered** — see below |
+| Practice (lecturer) | GET | `/lecturer/practice/results` | Admin/Lecturer |
 | Practice (lecturer) | GET | `/lecturer/practice/categories` | Admin/Lecturer |
 | Practice (lecturer) | POST | `/lecturer/practice/categories` | Admin/Lecturer |
 | Practice (lecturer) | PUT | `/lecturer/practice/categories/:id` | Admin/Lecturer |
 | Practice (lecturer) | DELETE | `/lecturer/practice/categories/:id` | Admin/Lecturer |
 | Practice (lecturer) | POST | `/lecturer/practice/categories/:id/import` | Admin/Lecturer |
+| Practice (lecturer) | POST | `/lecturer/practice/categories/:id/import-preview` | Admin/Lecturer |
 | Practice (lecturer) | PUT | `/lecturer/practice/categories/:id/introduction` | Admin/Lecturer |
 | Practice (lecturer) | POST | `/lecturer/practice/categories/:id/intro-images` | Admin/Lecturer |
 | Practice (lecturer) | DELETE | `/lecturer/practice/categories/:id/intro-images/:imageId` | Admin/Lecturer |
@@ -133,20 +145,20 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 ## Protected Endpoints — Users
 
 ### Change Password (any authenticated role)
-- `POST /user/password`
+- `POST /users/password`
 - **Payload:** `{"old_password": "...", "new_password": "..."}`
 - **200:** `{"token": "..."}` — a fresh JWT (bumped `token_version`) so the current device stays logged in; **all other devices are evicted**.
 - **401:** `{"error": "invalid old password"}` (other service faults also surface as 401 here).
 - **Notable:** records a `self_change` password event when `PASSWORD_LOG_KEY` is configured.
 
 ### List Students (Admin / Lecturer)
-- `GET /user/students`
+- `GET /users/students`
 - **200:** array of STUDENT `User` objects, each with the six nullable profile fields (`student_number`, `student_id_ext`, `sec_lec`, `sec_lab`, `first_name`, `last_name`), omitted when null.
 
 ### Create Staff User (Admin / Lecturer)
 - `POST /users`
 - **Payload:** `{"username": "...", "role": "LECTURER"|"ADMIN", "email": "..."?}` — any supplied `password` is **ignored** (server-generated).
-- **201:** `{"id": int, "generated_password": "..."}` — shown once.
+- **201:** `{"id": "<opaque user token>", "generated_password": "..."}` — shown once.
 - **400:** `{"error": "STUDENT accounts must be created via /api/v1/students"}` when `role=STUDENT`.
 - **403:** role-hierarchy violations (`lecturers cannot create admin accounts`, etc.).
 - **409:** `{"error": "email already in use"}`.
@@ -155,7 +167,7 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 ### Create / Upsert Single Student (Admin / Lecturer)
 - `POST /students`
 - **Payload:** `{"student_number": "...", "student_id_ext": "...", "sec_lec"?, "sec_lab"?, "first_name"?, "last_name"?, "email"?}` — `student_number` and `student_id_ext` (the login username) are required.
-- **201:** `{"id": int, "created": bool}`, plus `"generated_password"` **only when `created == true`**.
+- **201:** `{"id": "<opaque user token>", "created": bool}`, plus `"generated_password"` **only when `created == true`**.
 - **400:** `{"error": "student_number is required"}` / `{"error": "student_id is required"}`.
 - **409:** `{"error": "email already in use"}`.
 - **Notable:** conflict on an existing student **preserves the existing password** — re-adding never resets it and returns no generated password. Shares the roster-import upsert path.
@@ -165,29 +177,47 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 ## Admin-only User Management
 
 ### List All Users
-- `GET /admin/users/all` → **200:** array of every `User`.
+- `GET /users/all` → **200:** array of every `User`.
 
 ### Update User
-- `PUT /admin/users/:id`
+- `PUT /users/:id`
 - **Payload:** full `User` object (path `id` wins; password not settable here).
-- **200:** `{"message": "User updated successfully"}`. **400:** `{"error": "Invalid user ID"}`.
+- **200:** `{"message": "User updated successfully"}`. **400:** `{"error": "invalid id id"}` (malformed/mistyped opaque token — see `idParam`).
 
 ### Delete User
-- `DELETE /admin/users/:id` → **200:** `{"message": "User deleted successfully"}`.
+- `DELETE /users/:id` → **200:** `{"message": "User deleted successfully"}`.
 
 ### Reset Password
-- `POST /admin/users/:id/reset-password`
-- **200:** `{"generated_password": "..."}` — shown once.
-- **Notable:** updates hash, **bumps `token_version`** (evicts sessions), records an `admin_reset` event. No email is sent (recipient passed empty).
+Single-user counterpart of **Bulk Reset Passwords** below. Unlike the bulk path, this one *can* email the new password — but only on explicit opt-in.
+- `POST /users/:id/reset-password`
+- **Payload:** `{"email_password": bool}` — **optional**; an absent or malformed body is tolerated and defaults to `false`.
+- **200:** `{"generated_password": "...", "email_requested": bool}` — the password is shown once.
+- **Notable:** updates the hash, **bumps `token_version`** (evicts every session), and records an `admin_reset` event. The password is emailed **only** when `email_password` is `true` *and* the target has an address on file; otherwise the recipient is passed empty and nothing is sent. Emailing a plaintext password is a deliberate opt-in tradeoff, so it defaults off.
+
+### Bulk Reset Passwords
+Resets a batch of **STUDENT** accounts in one call — random generated passwords, never emailed, handed back to the admin as plaintext.
+- `POST /users/bulk-reset-password`
+- **Payload:** `{"mode": "ids"|"all_students"|"exam_roster", "user_ids": ["<opaque user token>", ...], "exam_id": "<opaque exam token>", "confirm": "RESET", "after_user_id": "<opaque user token>", "batch_size": 100}`.
+  - `mode` is an explicit enum — never inferred from which optional field happens to be present.
+  - `user_ids` required and non-empty **iff** `mode == "ids"` (max 1000 per request); must be **absent** for the other two modes.
+  - `exam_id` required **iff** `mode == "exam_roster"`; must be absent otherwise.
+  - `confirm` must be the literal string `"RESET"` on **every** request, including continuation batches — the server never trusts the UI's own confirm gate for this.
+  - `after_user_id` — opaque continuation cursor from a previous response's `next_after_user_id`; absent starts from the beginning.
+  - `batch_size` — optional; default `100`, clamped to `[1, 200]` (below 1 → 1, above 200 → 200).
+- **Behaviour:** every check below runs before any write, in this order: confirmation literal → mode enum → mode/field agreement → `user_ids` cap → `batch_size` clamp → opaque-token decode. For `mode == "ids"` only, the **whole request** is then rejected with 400 if even one supplied id does not resolve to an existing **STUDENT** row — no ADMIN or LECTURER account, including the actor's own, can ever be reset through this path. Each resolved target gets an independently generated random password (`GeneratePassword`, the same generator the single-user reset uses — never the student number, never a shared value) and its own bcrypt hash, applied in its **own** transaction (password hash + `token_version` bump + optional `password_events` row). The batch is **not** transactional across students: a failure on one target is recorded in `failures` and the loop continues, so students already reset stay reset.
+- **200:** `{"mode": "...", "processed": int, "succeeded": int, "failed": int, "remaining": int, "next_after_user_id": "<opaque>"|null, "key_configured": bool, "results": [{"user_id", "username", "student_number", "first_name", "last_name", "sec_lec", "sec_lab", "password"}], "failures": [{"user_id", "username", "error"}]}` with `Cache-Control: no-store`. `remaining` is the count of matching targets not yet processed for this mode/filter. A partial failure is still **200** (not a server error); a failing target's password and `token_version` are left unchanged. The client loops, passing the previous response's `next_after_user_id` back in as the next request's `after_user_id`, until `next_after_user_id` is `null`.
+- **400:** `{"error": "confirmation_required"}` (missing/wrong `confirm`) / `{"error": "unknown mode"}` / a mode/field mismatch (e.g. `exam_id` set for `mode=ids`) / `{"error": "too_many_ids"}` (`user_ids` over 1000) / `{"error": "non_student_target", "user_ids": [...]}` (`mode=ids` naming a non-student) / an invalid opaque token in `user_ids`/`exam_id`/`after_user_id`.
+- **401:** unauthenticated. **403:** LECTURER or STUDENT token (this route is Admin-only, not Admin/Lecturer like the roster-reading routes).
+- **Notable:** **no email of any kind is ever sent on this path** — it deliberately bypasses the single-user reset path's `logPasswordEvent` helper (which would otherwise fire one admin notice per student when `ADMIN_EMAIL` is configured). Exactly **one** structured audit log line is written per request — actor username + id, mode, `exam_id`, `requested`/`succeeded`/`failed` counts, and the internal ids of the affected set — and it never contains a password, a hash, or ciphertext. **There is no rate limiter on this endpoint**; the audit line is its only detective control (see `TODO.md`).
 
 ### Resend Credential
-- `POST /admin/users/:id/resend-credential`
+- `POST /users/:id/resend-credential`
 - **200:** `{"emailed_to": "..."}` — re-emails the *current* credential; does **not** regenerate the password or evict sessions.
 - **400:** no email on file / `PASSWORD_LOG_KEY` not configured / no password on record / decrypt failure / SMTP send failure (all ResendCredential faults map to 400).
 - **Notable:** recovers the plaintext from the newest `password_events` row (requires `PASSWORD_LOG_KEY`).
 
 ### Password Events (audit)
-- `GET /admin/users/:id/password-events`
+- `GET /users/:id/password-events`
 - **200:** `{"key_configured": bool, "events": [{"source", "changed_by_username", "created_at", "new_password?"}]}` — newest first; `new_password` present only when the key is configured and decrypt succeeds. The admin's view access is itself logged (metadata only).
 
 ---
@@ -252,8 +282,8 @@ Validates a submission and persists it to `app.submissions`.
 
 ### Get Exam Questions (Student)
 - `GET /quiz/exams/:id/questions`
-- **Behaviour:** enrollment + effectively-`active` required. Lazily prepares the DML sandbox (`EnsureExamSandboxReady`) and broadcasts an `active` status frame over the SSE Hub.
-- **200:** array of `Question`. `correct_sql` is always cleared; for DML questions `expected_result`/`expected_columns` are nulled (QUERY questions keep them as the target to reproduce).
+- **Behaviour:** enrollment + effectively-`active` required. Lazily prepares the DML sandbox (`EnsureExamSandboxReady`) and, for a category that owns its own schema, that category's own DML sandbox (`EnsureExamCategorySchemasReady`). Broadcasts an `active` status frame over the SSE Hub.
+- **200:** array of `Question`. `correct_sql` is always cleared; for DML questions `expected_result`/`expected_columns` are nulled (QUERY questions keep them as the target to reproduce). **Additive, backward-compatible fields (exam categories):** each element gains `category_id` and `category_name` (both omitted, not null, when the question has no category) — never `schema_name`/`preview_schema_name`, which stay grading-internal. **Ordering:** the array is ordered categorised-questions-first, `category name ASC, id ASC`, then uncategorised questions by `id ASC`, so a client can group by category with a single pass.
 - **Errors:** 400, 403 (not enrolled / exam not found / not active), 500.
 
 ### Get Exam Results (Student)
@@ -268,6 +298,13 @@ Validates a submission and persists it to `app.submissions`.
 ### Exam Intro Images (Student / Admin / Lecturer)
 - `GET /quiz/exams/:id/intro-images` → **200:** `{"images": [{"id", "owner_id", "sort_order", "mime_type", "byte_size", "created_at", "updated_at"}]}` (metadata only). Students must be enrolled; staff skip the enrollment check.
 - `GET /quiz/exams/:id/intro-images/:imageId` → **200:** raw image bytes with the stored `Content-Type`, `ETag` (updated-at unix seconds), `Cache-Control: private, max-age=86400, must-revalidate`; **304** when `If-None-Match` matches.
+
+### Get Exam Categories (Student / Admin / Lecturer)
+Read-only "category header" view — what the flat question array in **Get Exam Questions** cannot carry: a category with zero questions, its introduction text, and its own table structure.
+- `GET /quiz/exams/:id/categories`
+- **Behaviour:** enrollment-gated exactly like **Get Exam Introduction**; staff (Admin/Lecturer) skip the enrollment check. **Not** active-gated, so it can back the intro page before the exam starts. Ordered `name ASC, id ASC` — the same order categorised questions in **Get Exam Questions** are grouped by.
+- **200:** `{"categories": [{"id", "name", "introduction", "question_count", "imported": bool, "tables": [{"name", "columns": [{"name", "data_type", "nullable", "is_primary_key", "is_foreign_key", "references_table?", "references_column?"}]}]}]}` — the same per-table introspection shape as **Get Exam Introduction**. `imported` reflects whether the category's schema currently has any tables. **Never** carries `schema_name` / `preview_schema_name` — those stay grading-internal.
+- **403:** not enrolled (student only). **404:** exam not found.
 
 ### Get My Results Summary (Student)
 - `GET /quiz/results`
@@ -371,6 +408,20 @@ Imports a SQL script into the exam's own `curriculum_exam_{id}` schema.
 - **200:** `{"message": "Curriculum imported into exam"}`.
 - **400:** schema-qualified identifier / empty sql. **404:** exam not found. **409:** exam active, or schema non-empty without `confirm_replace`.
 
+### Exam Categories
+Organises an exam's questions into per-category databases, mirroring the practice-category surface but scoped under the owning exam (`ExamCategory`: `{"id", "exam_id", "name", "schema_name", "preview_schema_name", "has_preview_schema", "introduction", "question_count", "created_by", "created_at", "updated_at", "owns_schema"}`). `owns_schema` is `false` for a category auto-adopted from a pre-existing exam by the boot migration — it still shares the exam's own schema (often literally `public`) until a lecturer imports a database directly into it. Every route below checks `category.exam_id == :id` from the path — a category token from a different exam 404s, exactly like an unknown id.
+- `GET /lecturer/exams/:id/categories` → **200:** array of `ExamCategory`. **404:** exam not found.
+- `POST /lecturer/exams/:id/categories` — **Payload:** `{"name": "..."}` (required, trimmed). **201:** the created `ExamCategory` (its `exam_cat_{id}` schema is provisioned and granted to `exam_student_readonly` before the response returns). **400:** empty name. **404:** exam not found. **409:** name already used within this exam.
+- `PUT /lecturer/exams/:id/categories/:categoryId` — **Payload:** `{"name": "..."}` (required, trimmed) — renames only; `schema_name` is never touched. **200:** `{"message": "Category renamed"}`. **400:** empty name. **404:** category not found (incl. cross-exam token). **409:** name already used within this exam.
+- `DELETE /lecturer/exams/:id/categories/:categoryId` → **200:** `{"message": "Category deleted"}`, dropping the category's four canonical schemas (`exam_cat_{id}`, `exam_cat_{id}_preview`, and both `sandbox_exam_cat_{id}` variants) wherever they exist. **404:** category not found. **409:** `{"error": "...", "attached_question_count": N}` whenever **any** question still references the category. **There is no `force` (or any other) query parameter on this route** — unlike practice-category delete, an exam category can never be force-deleted out from under its questions; the lecturer must reassign or delete the attached questions first. (Detaching would silently re-point a question at the exam-level curriculum schema, so it would grade against different data than it was authored and captured against.)
+- `POST /lecturer/exams/:id/categories/:categoryId/import?confirm_replace=true`
+  - **Payload:** `{"sql": "<unqualified SQL>"}` — schema-qualified names rejected with 400.
+  - **Behaviour:** same shape as **Import Per-Exam Curriculum**, scoped to the category's own `exam_cat_{id}` schema. On success, stamps `schema_name = exam_cat_{id}` (this is what flips a migrated `General` category from sharing the exam's schema to owning its own) and drops the category's now-stale DML sandbox so the next activation re-clones it.
+  - **200:** `{"message": "Database imported into category"}`.
+  - **400:** schema-qualified identifier / empty sql. **404:** category not found. **409:** exam active, or category schema non-empty without `confirm_replace`.
+- `POST /lecturer/exams/:id/categories/:categoryId/import-preview?confirm_replace=true` — same shape, against the category's decoy schema (`exam_cat_{id}_preview`), stamping `preview_schema_name`. **200:** `{"message": "Decoy database imported into category", "parity_warning": "..."}` — `parity_warning` is `""` when the decoy structurally matches the category's real schema, or names the offending table when it does not; either way the import **succeeds**. Same 400/404/409 cases as the import above.
+- `PUT /lecturer/exams/:id/categories/:categoryId/introduction` — **Payload:** `{"introduction": "..."}` (max 20 000 chars). **200:** `{"message": "Category introduction updated"}`. **400:** over the length cap. **404:** category not found. **Notable:** unlike exam- and practice-level introductions, an exam category has **no** intro-images sub-feature — introduction text only.
+
 ### Exam Roster
 - `GET /lecturer/exams/:id/students` → **200:** `{"count": int, "students": [...]}`.
 - `DELETE /lecturer/exams/:id/students/:studentId` → **200:** `{"message": "Student removed from roster"}` (409 while active).
@@ -411,6 +462,7 @@ Student practice endpoints return **423 Locked** (`{"error": "practice_unavailab
 - `DELETE /lecturer/practice/question/:id` → **200:** `{"message": "Practice question deleted"}`.
 - `POST /lecturer/practice/preview` — **Payload:** `{"type", "target_table", "correct_sql"}` (no `exam_id`). **200 (ok):** `{"status": "ok", "rows", "columns"}`; **200 (engine error):** `{"status": "error", "error"}`.
 - `POST /lecturer/practice/reset-sandbox` → **200:** `{"reset_at": <timestamp>}`. Rebuilds practice schemas.
+  - ⚠ **Currently unreachable — returns 404.** `PracticeController.ResetSandbox` (`practice_controller.go`) and `PostgresRepository.ResetPracticeSandbox` (`postgres_schema.go`) both exist and are tested, but no route is registered for them in `cmd/main.go`. Either the registration was dropped in a refactor or the endpoint was retired without removing the handler. Resolve by registering the route or deleting the handler — do not assume this endpoint works.
 - `GET /lecturer/practice/categories` → **200:** array of categories.
 - `POST /lecturer/practice/categories` — **Payload:** `{"name": "..."}` → **201:** created category.
 - `PUT /lecturer/practice/categories/:id` — **Payload:** `{"name": "..."}` → **200:** `{"message": "Category renamed"}`. **404:** not found.

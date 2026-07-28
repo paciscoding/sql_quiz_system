@@ -41,6 +41,14 @@ func (r *PostgresRepository) Evaluate(ctx context.Context, studentID int, questi
 // exam curriculum.
 func querySchemaFor(question models.Question, sandboxSchema string) string {
 	if question.ExamID != nil {
+		// ARCH-028 (0): the question's category wins when present — this is
+		// what lets a QUERY question read a different reference database than
+		// its exam's curriculum. CategorySchema is populated by GetQuestion's
+		// LEFT JOIN and is empty for an uncategorised question, so this branch
+		// is a no-op for every pre-existing exam.
+		if question.CategorySchema != "" {
+			return question.CategorySchema
+		}
 		// Use the per-exam curriculum schema populated by GetQuestion.
 		// Falls back to 'public' if CurriculumSchema is empty (e.g., a Question
 		// value that was not loaded through GetQuestion).
@@ -55,6 +63,41 @@ func querySchemaFor(question models.Question, sandboxSchema string) string {
 	return sandboxSchema
 }
 
+// ExamGradingSandboxFor resolves the writable DML sandbox schema an exam
+// question's grading executes against (ARCH-028 (0)). It is a pure, DB-free
+// function: when q has a category AND that category owns its schema
+// (ExamCategoryOwnsSchema), the category's own sandbox
+// (ExamCategorySandboxName) is used; otherwise the exam-level sandbox
+// (ExamSandboxName) is used, exactly as before per-category grading existed.
+// Returns "" for a non-exam (practice) question, which has no sandbox concept
+// here — practice sandboxing is resolved by the caller via a different path.
+func ExamGradingSandboxFor(q models.Question) string {
+	if q.ExamID == nil {
+		return ""
+	}
+	if q.CategoryID != nil && ExamCategoryOwnsSchema(int(*q.CategoryID), q.CategorySchema) {
+		return ExamCategorySandboxName(int(*q.CategoryID))
+	}
+	return ExamSandboxName(int(*q.ExamID))
+}
+
+// ExamPreviewSandboxFor resolves the writable decoy DML sandbox schema an exam
+// question's dual-schema preview executes against (ARCH-028 (0)). Same
+// ownership predicate and same DB-free purity as ExamGradingSandboxFor: a
+// category that owns its schema previews against its own decoy sandbox
+// (ExamCategoryPreviewSandboxName); otherwise the exam-level preview sandbox
+// (ExamPreviewSandboxName) is used, unchanged from today. Returns "" for a
+// non-exam (practice) question.
+func ExamPreviewSandboxFor(q models.Question) string {
+	if q.ExamID == nil {
+		return ""
+	}
+	if q.CategoryID != nil && ExamCategoryOwnsSchema(int(*q.CategoryID), q.CategorySchema) {
+		return ExamCategoryPreviewSandboxName(int(*q.CategoryID))
+	}
+	return ExamPreviewSandboxName(int(*q.ExamID))
+}
+
 func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.Question, studentSQL string, querySchema string) (models.ValidationResult, error) {
 	// Repair typographic quotes so pasted SELECTs run instead of failing with a
 	// spurious "column ... does not exist". Consistent with the preview path.
@@ -62,10 +105,10 @@ func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
-	// never on r.pool (the privileged application connection) — see
-	// postgres_student_pool.go. No fallback on error.
-	studentPool, err := r.ensureStudentPool(ctx)
+	// ARCH-022: graded SELECT executes on the restricted exam_student_readonly
+	// pool, never on r.pool (the privileged application connection). poolForRole
+	// never falls back to r.pool — see postgres_student_pool.go.
+	studentPool, err := r.poolForRole("exam_student_readonly")
 	if err != nil {
 		return models.ValidationResult{}, err
 	}
@@ -139,10 +182,10 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	defer cancel()
 
 	schema := sandboxSchema
-	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
-	// never on r.pool (the privileged application connection) — see
-	// postgres_student_pool.go. No fallback on error.
-	studentPool, err := r.ensureStudentPool(ctx)
+	// ARCH-022: graded DML executes on the restricted exam_student pool, never
+	// on r.pool (the privileged application connection). poolForRole never falls
+	// back to r.pool — see postgres_student_pool.go.
+	studentPool, err := r.poolForRole("exam_student")
 	if err != nil {
 		return models.ValidationResult{}, err
 	}
@@ -297,10 +340,11 @@ func (r *PostgresRepository) evaluateQueryPreview(ctx context.Context, question 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
-	// never on r.pool (the privileged application connection) — see
-	// postgres_student_pool.go. No fallback on error.
-	studentPool, err := r.ensureStudentPool(ctx)
+	// ARCH-022: the QUERY preview executes on the restricted pool for `role`
+	// (exam_student_readonly, or the decoy exam_student_preview_readonly) — never
+	// on r.pool. poolForRole never falls back to r.pool — see
+	// postgres_student_pool.go.
+	studentPool, err := r.poolForRole(role)
 	if err != nil {
 		return PreviewResult{}, err
 	}
@@ -366,10 +410,10 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 
 	studentSQL = normalizeSmartQuotes(studentSQL)
 	schema := sandboxSchema
-	// ARCH-025: student SQL always executes on the restricted quiz_exec pool,
-	// never on r.pool (the privileged application connection) — see
-	// postgres_student_pool.go. No fallback on error.
-	studentPool, err := r.ensureStudentPool(ctx)
+	// ARCH-022: the DML preview executes on the restricted pool for `role`
+	// (exam_student, or the decoy exam_student_preview) — never on r.pool.
+	// poolForRole never falls back to r.pool — see postgres_student_pool.go.
+	studentPool, err := r.poolForRole(role)
 	if err != nil {
 		return PreviewResult{}, err
 	}
@@ -433,8 +477,11 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 	if queryErr != nil {
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", queryErr)
-		_, _ = tx.Exec(ctx, "RESET ROLE")
+		// ORDER MATTERS (ARCH-021/ARCH-024b): ROLLBACK TO SAVEPOINT before RESET
+		// ROLE, matching the exec-error branch above, so recovery still succeeds
+		// if the failed post-image query left the transaction aborted.
 		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval")
+		_, _ = tx.Exec(ctx, "RESET ROLE")
 		_ = tx.Rollback(ctx)
 		return pr, nil
 	}
@@ -443,8 +490,9 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 	if collectErr != nil {
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", collectErr)
-		_, _ = tx.Exec(ctx, "RESET ROLE")
+		// ORDER MATTERS (ARCH-021/ARCH-024b): ROLLBACK TO SAVEPOINT before RESET ROLE.
 		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval")
+		_, _ = tx.Exec(ctx, "RESET ROLE")
 		_ = tx.Rollback(ctx)
 		return pr, nil
 	}
@@ -460,8 +508,11 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 	}
 	pr.Result.Status = "success"
 
-	_, _ = tx.Exec(ctx, "RESET ROLE")
+	// ORDER MATTERS (ARCH-021/ARCH-024b): ROLLBACK TO SAVEPOINT before RESET
+	// ROLE, uniform with every other branch and with evaluateDML, so no future
+	// reader re-introduces the split. Both succeed on this (non-aborted) path.
 	_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval")
+	_, _ = tx.Exec(ctx, "RESET ROLE")
 	_ = tx.Rollback(ctx)
 	return pr, nil
 }

@@ -9,10 +9,12 @@ import (
 // This file defines the named integer id types that adopt opaque, type-
 // prefixed public tokens on the JSON boundary (see publicid). Each type
 // wraps a persistent PK namespace; MarshalJSON encodes and UnmarshalJSON
-// decodes+validates via the publicid codec. There are exactly 7 types -
+// decodes+validates via the publicid codec. There are exactly 8 types -
 // exam-question ids (app.questions.id) intentionally stay plain int, since
 // they are a student/lecturer-visible ordinal (Q1, Q2, ...), not an
-// enumeration-sensitive surface (see ARCH-015).
+// enumeration-sensitive surface (see ARCH-015). TypeQuestion is the ONLY
+// publicid.Type excluded from the set below; every other defined type,
+// including TypeExamCategory, is used.
 //
 // Student ids reuse UserID (not a separate type): a student is a row in
 // app.system_users, so student id tokens must decode as TypeUser (ARCH-005).
@@ -74,6 +76,26 @@ func (v *CategoryID) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*v = CategoryID(id)
+	return nil
+}
+
+// ExamCategoryID identifies a row in app.exam_categories.
+type ExamCategoryID int
+
+func (v ExamCategoryID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(publicid.Encode(publicid.TypeExamCategory, int(v)))
+}
+
+func (v *ExamCategoryID) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	id, err := publicid.Decode(publicid.TypeExamCategory, s)
+	if err != nil {
+		return err
+	}
+	*v = ExamCategoryID(id)
 	return nil
 }
 

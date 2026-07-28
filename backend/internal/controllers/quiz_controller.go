@@ -122,6 +122,12 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare exam sandbox"})
 		return
 	}
+	// Lazy sandbox preparation for DML questions attached to a category that
+	// owns its own schema (ARCH-028 (4)(d)).
+	if err := ctrl.repo.EnsureExamCategorySchemasReady(c.Request.Context(), examID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare exam category sandboxes"})
+		return
+	}
 	// Broadcast activation if the exam just became active (scheduled lazy trigger)
 	if ctrl.hub != nil {
 		ctrl.hub.Broadcast(examID, buildExamStatusEvent(examID, "active"))
@@ -245,7 +251,7 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 	var result models.ValidationResult
 	evaluate := func(jobCtx context.Context) error {
 		var evalErr error
-		result, evalErr = ctrl.valService.Validate(jobCtx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)))
+		result, evalErr = ctrl.valService.Validate(jobCtx, int(student.ID), question, req.SQLText, repository.ExamGradingSandboxFor(question))
 		return evalErr
 	}
 
@@ -328,17 +334,38 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 	// usable decoy exists, previewSchema stays "" and ValidatePreview falls
 	// back to grading schema B — exactly today's behaviour — and the
 	// fallback is logged server-side. The student is never blocked or told.
+	//
+	// ARCH-028 (4)(c): when the question has a category that owns its schema,
+	// the category's OWN decoy is used instead of the exam-level decoy —
+	// otherwise (no category, or a legacy-adopted category) today's exam-level
+	// branch runs verbatim.
 	previewSchema := ""
+	categoryOwnsSchema := question.CategoryID != nil && repository.ExamCategoryOwnsSchema(int(*question.CategoryID), question.CategorySchema)
 	if question.DualSchema {
-		pc, _ := ctrl.repo.GetExamPreviewCurriculumSchema(ctx, int(*question.ExamID))
-		if pc != "" {
+		if categoryOwnsSchema {
+			catID := int(*question.CategoryID)
 			if question.Type == "QUERY" {
-				if hasTables, _ := ctrl.repo.SchemaHasTables(ctx, pc); hasTables {
-					previewSchema = pc
+				if question.CategoryPreviewSchema != "" {
+					if hasTables, _ := ctrl.repo.SchemaHasTables(ctx, question.CategoryPreviewSchema); hasTables {
+						previewSchema = question.CategoryPreviewSchema
+					}
 				}
 			} else {
-				if err := ctrl.repo.EnsureExamPreviewSandboxReady(ctx, int(*question.ExamID)); err == nil {
-					previewSchema = repository.ExamPreviewSandboxName(int(*question.ExamID))
+				if err := ctrl.repo.EnsureExamCategoryPreviewSandboxReady(ctx, catID); err == nil {
+					previewSchema = repository.ExamCategoryPreviewSandboxName(catID)
+				}
+			}
+		} else {
+			pc, _ := ctrl.repo.GetExamPreviewCurriculumSchema(ctx, int(*question.ExamID))
+			if pc != "" {
+				if question.Type == "QUERY" {
+					if hasTables, _ := ctrl.repo.SchemaHasTables(ctx, pc); hasTables {
+						previewSchema = pc
+					}
+				} else {
+					if err := ctrl.repo.EnsureExamPreviewSandboxReady(ctx, int(*question.ExamID)); err == nil {
+						previewSchema = repository.ExamPreviewSandboxName(int(*question.ExamID))
+					}
 				}
 			}
 		}
@@ -359,7 +386,7 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 
 	preview := func(jobCtx context.Context) error {
 		var e error
-		vResult, vRows, vCols, vCount, vTrunc, e = ctrl.valService.ValidatePreview(jobCtx, int(student.ID), question, req.SQLText, repository.ExamSandboxName(int(*question.ExamID)), previewSchema)
+		vResult, vRows, vCols, vCount, vTrunc, e = ctrl.valService.ValidatePreview(jobCtx, int(student.ID), question, req.SQLText, repository.ExamGradingSandboxFor(question), previewSchema)
 		return e
 	}
 
@@ -434,7 +461,15 @@ func (ctrl *QuizController) GetExamIntroduction(c *gin.Context) {
 		return
 	}
 
-	tables, err := ctrl.repo.GetSchemaTablesWithColumns(ctx, "public")
+	// ARCH-030 (4) bugfix: use the exam's OWN curriculum schema, not a
+	// hardcoded 'public' — an exam with a per-exam curriculum has always
+	// shown students the wrong table list otherwise. Falls back to 'public'
+	// when the exam hasn't had a per-exam import, matching today's behaviour.
+	schema := exam.CurriculumSchema
+	if schema == "" {
+		schema = "public"
+	}
+	tables, err := ctrl.repo.GetSchemaTablesWithColumns(ctx, schema)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

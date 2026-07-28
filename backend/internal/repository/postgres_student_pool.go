@@ -1,165 +1,226 @@
 package repository
 
-// ARCH-025: the restricted execution pool for student-submitted SQL.
+// ARCH-022: the restricted execution pools for student-submitted SQL.
 //
 // WHY THIS EXISTS: `pool` (postgres.go) connects with whatever LOGIN role
 // DATABASE_URL names, and in production that is the Postgres superuser
 // (.env DB_USER=postgres). `SET LOCAL ROLE exam_student*` is not a security
-// boundary on that connection, because PostgreSQL evaluates SET ROLE
-// against session_user, not current_user: a single student statement can
-// undo it outright. Measured on 15.18 against a superuser session_user:
+// boundary on that connection, because a single student statement running as a
+// superuser session_user can `RESET ROLE` / `SET ROLE postgres` back to full
+// privilege and read app.system_users (password hashes) and every correct_sql,
+// or reach `COPY ... TO PROGRAM` (shell exec). Every student statement must
+// therefore run on a connection whose LOGIN role is a non-superuser that owns
+// nothing.
 //
-//	SET ROLE postgres;                                             -- succeeds
-//	SELECT set_config('role', 'postgres', false);                  -- succeeds
-//	DO $$ BEGIN RESET ROLE; INSERT INTO app.system_users ...; END $$;  -- succeeds
-//	COPY (SELECT 1) TO PROGRAM 'id > /tmp/pwned';                  -- succeeds (shell exec)
+// TOPOLOGY — FOUR restricted LOGIN roles, one per privilege class, NOT one
+// shared role. Each login role is a member of EXACTLY ONE sandbox role:
 //
-// Even without any escape at all, a superuser session_user also means
-// `RESET ROLE` alone (no injection needed) lands back on a role that owns
-// every application table, so a student can read app.system_users (password
-// hashes) and every correct_sql.
+//	quiz_exec_ro       -> exam_student_readonly           (graded QUERY; readonly QUERY preview)
+//	quiz_exec_rw       -> exam_student                    (graded DML;   DML preview)
+//	quiz_exec_prev_ro  -> exam_student_preview_readonly   (decoy QUERY preview)
+//	quiz_exec_prev_rw  -> exam_student_preview            (decoy DML preview)
 //
-// THE FIX: run every student statement on a SEPARATE pgxpool.Pool whose
-// LOGIN role is `quiz_exec` — NOSUPERUSER, NOCREATEROLE, NOINHERIT, owns
-// nothing, and has no privileges on the app schema (see
-// scripts/deprivilege_app_db_user.sql, which provisions the role in a real
-// deployment). On that connection every one of the four bypasses above
-// fails outright: `SET ROLE postgres` is rejected because quiz_exec is not a
-// member of role postgres, `COPY ... TO PROGRAM` requires superuser or
-// pg_execute_server_program membership (neither held), and `RESET ROLE` /
-// an aborted transaction land back on quiz_exec itself, which cannot read
-// app.* at all. `SET LOCAL ROLE exam_student*` on top of this connection is
-// kept unchanged (postgres_evaluation.go) as defence in depth and to
-// preserve the existing read-only/read-write role split — it is simply no
-// longer the ONLY thing standing between a student and the superuser.
+// A single login role that was a member of all four (the retired ARCH-025
+// `quiz_exec`) MEASURABLY re-opened two boundaries: it let a preview role
+// `SET ROLE` across into the real grading role (defeating the ARCH-020 decoy
+// isolation) and let a readonly class `SET ROLE` into the read-write class.
+// One membership per login role makes both `permission denied to set role`.
 //
-// KNOWN RESIDUAL (accepted deliberately for this interim ship, see the brief
-// / scripts/deprivilege_app_db_user.sql): quiz_exec is a member of all four
-// exam_student* roles, so a student can `SET ROLE` ACROSS classes (e.g. from
-// a preview role into the real grading role), which defeats the dual-schema
-// decoy isolation. The deferred ARCH-022 design replaces quiz_exec with four
-// per-class LOGIN roles to close that. Do not attempt to fix it here.
+// NOINHERIT is load-bearing: the login role by itself holds nothing, so an
+// idle pooled connection carries zero privilege and every privilege use is an
+// explicit, transaction-scoped `SET LOCAL ROLE`. Forgetting the SET LOCAL ROLE
+// fails LOUDLY (permission denied) instead of silently running privileged.
 //
-// NO FALLBACK, EVER: if the restricted pool cannot be constructed (missing
-// password, role missing, connection refused, ...), every caller below
-// returns a hard error. Nothing in this file ever falls back to executing
-// student SQL against `pool`.
+// NO FALLBACK, EVER: poolForRole returns a hard error for an unknown or
+// unprovisioned role and NEVER returns r.pool. A silent fallback to the
+// privileged application connection would restore the exact escape this file
+// exists to close.
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
-	"os"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// StudentDBPasswordEnv is the environment variable carrying the LOGIN
-// password for the `quiz_exec` role. It is deliberately NOT generated or
-// rotated at boot: the application's own LOGIN role runs NOCREATEROLE in
-// production (scripts/deprivilege_app_db_user.sql), so it has no privilege
-// to ALTER another role's password even if it wanted to. The operator sets
-// this once, out of band, matching quiz_exec's password in Postgres.
-const StudentDBPasswordEnv = "STUDENT_DB_PASSWORD"
-
-// studentPoolUser is the LOGIN role every student statement executes as.
-// It owns nothing and has no privileges on the app schema — see the file
-// header and scripts/deprivilege_app_db_user.sql.
-const studentPoolUser = "quiz_exec"
-
-// Sizing for the student-SQL pool. Deliberately smaller and with no warm
-// minimum: student evaluations are comparatively rare, short (30s hard
-// timeout, see postgres_evaluation.go) and, for DML, already serialised by
-// the single-worker SubmissionQueue — there is no high-concurrency case that
-// needs this pool sized like the main application pool.
+// The four restricted LOGIN roles student SQL authenticates as. See the file
+// header for the one-membership-each topology and why four (not one).
 const (
-	studentPoolMaxConns int32 = 8
-	studentPoolMinConns int32 = 0
+	loginRoleExamStudentReadonly        = "quiz_exec_ro"
+	loginRoleExamStudent                = "quiz_exec_rw"
+	loginRoleExamStudentPreviewReadonly = "quiz_exec_prev_ro"
+	loginRoleExamStudentPreview         = "quiz_exec_prev_rw"
 )
 
-// InitStudentPool eagerly creates and pings the restricted student-SQL pool.
-// cmd/main.go calls this once at boot, right after CreateRestrictedUser, so
-// a missing STUDENT_DB_PASSWORD or an unreachable/misconfigured quiz_exec
-// role fails the deployment immediately (the caller is expected to
-// log.Fatalf on a non-nil error, matching the existing ID_SALT precedent)
-// rather than surfacing as a mysterious first-submission failure — or worse,
-// silently succeeding some other way.
+// studentLoginRoles maps each SANDBOX role name (the role the evaluator SET
+// LOCAL ROLEs into, and the key poolForRole is called with) to the dedicated
+// LOGIN role whose sole membership is that one sandbox role. studentPools is
+// keyed by the same sandbox-role names.
+var studentLoginRoles = map[string]string{
+	"exam_student_readonly":         loginRoleExamStudentReadonly,
+	"exam_student":                  loginRoleExamStudent,
+	"exam_student_preview_readonly": loginRoleExamStudentPreviewReadonly,
+	"exam_student_preview":          loginRoleExamStudentPreview,
+}
+
+// studentPoolMaxConns sizes each class's pool. exam_student_readonly carries
+// graded SELECT (the hot path) so it is the largest; the DML pool is small
+// because graded DML is serialised by the single-worker SubmissionQueue; the
+// two decoy-preview pools are idle in most deployments. Worst case is
+// 20 (privileged r.pool) + 20 (these four) = 40 backends, well within
+// postgres:15-alpine's default max_connections of 100.
+var studentPoolMaxConns = map[string]int32{
+	"exam_student_readonly":         8,
+	"exam_student":                  4,
+	"exam_student_preview":          4,
+	"exam_student_preview_readonly": 4,
+}
+
+// provisionStudentLoginRoles creates (if absent) and re-keys the four LOGIN
+// roles, granting each its single sandbox-role membership, and returns the
+// freshly generated password shared by all four.
 //
-// It is safe to call more than once (idempotent via ensureStudentPool's
-// sync.Once) and safe to never call at all from a given process: every
-// evaluate* call site in postgres_evaluation.go also calls
-// ensureStudentPool, so a test binary that never wires InitStudentPool still
-// gets a correctly-restricted pool on first use, constructed exactly the
-// same way, from the same required environment variable.
-func (r *PostgresRepository) InitStudentPool(ctx context.Context) error {
-	_, err := r.ensureStudentPool(ctx)
-	return err
-}
-
-// ensureStudentPool returns the restricted student-SQL pool, creating it on
-// first call. The pool (or the construction error) is cached for the
-// lifetime of the repository: pgxpool.Pool is safe for concurrent use, and a
-// construction failure is not transient (it is always a configuration
-// problem — missing password or a role/grant that does not exist), so
-// retrying per-call would only mask the failure behind repeated identical
-// errors instead of failing loudly once.
-func (r *PostgresRepository) ensureStudentPool(ctx context.Context) (*pgxpool.Pool, error) {
-	r.studentPoolOnce.Do(func() {
-		r.studentPool, r.studentPoolErr = newStudentPool(ctx, r.pool)
-	})
-	return r.studentPool, r.studentPoolErr
-}
-
-// newStudentPool builds the restricted pool from the existing privileged
-// pool's own config, overriding ONLY the LOGIN user and password so host,
-// port, dbname and sslmode are inherited unchanged — no second DSN is
-// introduced anywhere in the codebase, and the restricted pool always talks
-// to the exact same database the rest of the application does.
-func newStudentPool(ctx context.Context, base *pgxpool.Pool) (*pgxpool.Pool, error) {
-	password := os.Getenv(StudentDBPasswordEnv)
-	if password == "" {
-		return nil, fmt.Errorf(
-			"%s is required: student SQL must execute under the restricted %q login role, "+
-				"never the privileged application connection (ARCH-025)",
-			StudentDBPasswordEnv, studentPoolUser)
+// One password for all four is safe: the password is NOT the boundary between
+// privilege classes — WHICH ROLE YOU AUTHENTICATE AS is — and the db service
+// publishes no port (docker-compose.yml has no `ports:` under `db`), so 5432 is
+// reachable only from the compose network. The password is generated fresh
+// every boot (crypto/rand, hex-encoded) and never logged or written to disk.
+//
+// HEX IS DELIBERATE: CREATE/ALTER ROLE cannot take a bind parameter, so the
+// password is interpolated as a SQL literal; a 64-char hex alphabet contains no
+// quote, backslash or dollar sign, so there is nothing to escape and no
+// injection surface.
+//
+// The CREATE sets the superuser-gated attributes (NOSUPERUSER, NOREPLICATION,
+// NOBYPASSRLS) ONCE; the per-boot ALTER MUST NOT name them, because a
+// non-superuser role holding CREATEROLE is refused those attributes on ALTER
+// but accepts exactly this form. So boot provisioning works whenever the app
+// connection holds CREATEROLE — which is true today (DB_USER=postgres is a
+// superuser).
+//
+// OPEN QUESTION (posture-gated, does NOT affect today's deploy): both the
+// CREATE and the password-rotating ALTER here require the app to hold CREATEROLE
+// (altering another role's password needs CREATEROLE or superuser). But
+// scripts/deprivilege_app_db_user.sql deliberately makes the app NOCREATEROLE to
+// close a separate self-grant RCE. Those two are incompatible: once that script
+// is applied, this boot provisioning would fail (log.Fatal). Generate-at-boot
+// therefore only holds while the app is CREATEROLE/superuser. Moving to the
+// NOCREATEROLE posture requires a design choice — provision the four roles +
+// their password out of band (that script) and read it from env (the retired
+// ARCH-025 approach), OR keep the app CREATEROLE. Do not apply that script with
+// this code without resolving it first.
+func (r *PostgresRepository) provisionStudentLoginRoles(ctx context.Context) (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate student login password: %w", err)
 	}
+	password := hex.EncodeToString(buf) // 64 hex chars, injection-free as a SQL literal
 
-	config := base.Config().Copy()
-	config.ConnConfig.User = studentPoolUser
-	config.ConnConfig.Password = password
-	config.MaxConns = studentPoolMaxConns
-	config.MinConns = studentPoolMinConns
+	// Deterministic order so a boot's role work is reproducible.
+	pairs := []struct{ sandbox, login string }{
+		{"exam_student_readonly", loginRoleExamStudentReadonly},
+		{"exam_student", loginRoleExamStudent},
+		{"exam_student_preview_readonly", loginRoleExamStudentPreviewReadonly},
+		{"exam_student_preview", loginRoleExamStudentPreview},
+	}
+	for _, p := range pairs {
+		createStmt := fmt.Sprintf(
+			"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname='%s') "+
+				"THEN CREATE ROLE %s LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; END IF; END $$",
+			p.login, p.login)
+		if _, err := r.pool.Exec(ctx, createStmt); err != nil {
+			return "", fmt.Errorf("create login role %s: %w", p.login, err)
+		}
+		// Rotate the password every boot. Attribute list is deliberately the
+		// CREATEROLE-safe subset (no NOSUPERUSER/NOREPLICATION/NOBYPASSRLS).
+		alterStmt := fmt.Sprintf(
+			"ALTER ROLE %s LOGIN NOINHERIT NOCREATEDB NOCREATEROLE PASSWORD '%s'",
+			p.login, password)
+		if _, err := r.pool.Exec(ctx, alterStmt); err != nil {
+			return "", fmt.Errorf("set password on login role %s: %w", p.login, err)
+		}
+		// Exactly one membership: this login role can SET ROLE into its own
+		// class and nothing else. Idempotent.
+		if _, err := r.pool.Exec(ctx, fmt.Sprintf("GRANT %s TO %s", p.sandbox, p.login)); err != nil {
+			return "", fmt.Errorf("grant %s to %s: %w", p.sandbox, p.login, err)
+		}
+	}
+	return password, nil
+}
 
-	// Override the inherited DefaultQueryExecMode (base sets
-	// QueryExecModeCacheStatement, see postgres.go). QueryExecModeDescribeExec
-	// still runs over the EXTENDED query protocol — the Parse message still
-	// accepts at most one command, so this does not reopen the multi-statement
-	// bypass ARCH-021 closed (execStudentStatement / evaluateQuery's tx.Query
-	// keep the exact same protection they had before). What it drops is
-	// PER-SQL-TEXT statement/plan caching: every evaluation on this pool runs
-	// student SQL such as the literal text "SELECT * FROM t" against a
-	// DIFFERENT table shape each time (a fresh sandbox schema selected only
-	// via SET LOCAL search_path), and this pool is small (8 conns) and used
-	// for nothing else, so connection reuse across unrelated evaluations is
-	// frequent. QueryExecModeCacheStatement would key its cache on the raw SQL
-	// text alone and can hand back a plan prepared against a PRIOR student's
-	// differently-shaped table, which Postgres then rejects at execution time
-	// with "cached plan must not change result type" - a correctness bug, not
-	// a security one, but one this pool's access pattern provokes far more
-	// often than the general-purpose pool ever did. DescribeExec re-describes
-	// the statement fresh against the CURRENT search_path on every call, which
-	// the pgx documentation states is "safe even when the database schema is
-	// modified concurrently" - exactly this pool's situation on every request.
-	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
-
-	pool, err := pgxpool.NewWithConfig(ctx, config)
+// InitStudentPools provisions the four LOGIN roles and builds one restricted
+// pgxpool per privilege class, keyed by sandbox-role name. cmd/main.go calls
+// this once at boot immediately after CreateRestrictedUser (which creates the
+// sandbox roles the memberships reference) and is expected to log.Fatalf on a
+// non-nil error, matching the ID_SALT precedent — there is NO degraded mode and
+// NEVER a fallback to the privileged pool.
+func (r *PostgresRepository) InitStudentPools(ctx context.Context) error {
+	password, err := r.provisionStudentLoginRoles(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create student SQL pool as %q: %w", studentPoolUser, err)
+		return fmt.Errorf("provision student login roles: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("unable to connect student SQL pool as %q (check %s and that the role exists with matching grants): %w",
-			studentPoolUser, StudentDBPasswordEnv, err)
+
+	pools := make(map[string]*pgxpool.Pool, len(studentLoginRoles))
+	closeAll := func() {
+		for _, p := range pools {
+			p.Close()
+		}
+	}
+	for sandbox, login := range studentLoginRoles {
+		// Derive from the privileged pool's config so host/port/dbname/sslmode
+		// are inherited unchanged — no second DSN anywhere. Override ONLY the
+		// login identity, sizing, and the exec mode.
+		config := r.pool.Config().Copy()
+		config.ConnConfig.User = login
+		config.ConnConfig.Password = password
+		config.MaxConns = studentPoolMaxConns[sandbox]
+		config.MinConns = 0
+		config.MaxConnIdleTime = 5 * time.Minute
+
+		// ARCH-025 finding, PRESERVED (do not revert to CacheStatement): student
+		// SQL runs the SAME text against a DIFFERENT table shape each eval (a
+		// fresh schema selected via SET LOCAL search_path), so
+		// QueryExecModeCacheStatement can hand back a plan prepared against a
+		// prior student's differently-shaped table and Postgres rejects it with
+		// "cached plan must not change result type" — a correctness bug this
+		// pool's access pattern provokes constantly. DescribeExec re-describes on
+		// every call and is safe under concurrent schema change. This overrides
+		// the CacheStatement pin inherited from NewPostgresRepository.
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+
+		pool, err := pgxpool.NewWithConfig(ctx, config)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("create student pool for %s (login %s): %w", sandbox, login, err)
+		}
+		if err := pool.Ping(ctx); err != nil {
+			pool.Close()
+			closeAll()
+			return fmt.Errorf("ping student pool for %s (login %s): %w", sandbox, login, err)
+		}
+		pools[sandbox] = pool
+	}
+	r.studentPools = pools
+	return nil
+}
+
+// poolForRole returns the restricted pool whose LOGIN role is a member of the
+// given sandbox role (the same role the caller will SET LOCAL ROLE into).
+//
+// IT MUST NEVER RETURN r.pool. A silent fallback to the privileged application
+// connection would restore the exact superuser escape this design closes; an
+// unknown or unprovisioned role is a hard error instead.
+func (r *PostgresRepository) poolForRole(role string) (*pgxpool.Pool, error) {
+	if r.studentPools == nil {
+		return nil, fmt.Errorf("student SQL pools not initialised (InitStudentPools was not called)")
+	}
+	pool, ok := r.studentPools[role]
+	if !ok || pool == nil {
+		return nil, fmt.Errorf("no restricted student pool for role %q", role)
 	}
 	return pool, nil
 }

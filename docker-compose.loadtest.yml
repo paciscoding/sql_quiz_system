@@ -1,0 +1,46 @@
+# Load-test override. Compose merges this on top of docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d db backend mailpit
+#
+# What it changes vs prod:
+#   * adds a Mailpit service (catch-all SMTP sink + web UI + REST API)
+#   * points the backend's SMTP sender at Mailpit (these EMAIL_SMTP_* vars are
+#     read by NewSMTPEmailSender but are NOT forwarded by the base compose)
+#   * exposes backend :8080 and db :5432 to the host so the seed + driver
+#     programs (run from the host) can reach them
+#
+# Bring up only db + backend + mailpit to avoid the frontend's health-gated
+# depends_on. Tear the whole stack down with `... down` (add -v to wipe the DB).
+services:
+  # Mailpit shares the backend container's network namespace (network_mode:
+  # service:backend). That is deliberate: Go's net/smtp refuses PlainAuth over a
+  # non-TLS connection UNLESS the server host is localhost. By sharing the
+  # namespace, the backend reaches Mailpit at localhost:1025, which trips that
+  # exemption — so no TLS/cert setup is needed for a throwaway sink. Because the
+  # namespace belongs to the backend, Mailpit publishes NO ports of its own; the
+  # 1025/8025 host mappings live on the backend service below.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: sql-quiz-mailpit
+    restart: unless-stopped
+    network_mode: "service:backend"
+    environment:
+      MP_MAX_MESSAGES: 0          # never auto-prune; keep every message during a run
+      MP_SMTP_AUTH_ACCEPT_ANY: 1  # accept the backend's PlainAuth without checking
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+  backend:
+    environment:
+      # any non-empty EMAIL_SENDER_ADDRESS activates the real SMTP sender path
+      EMAIL_SENDER_ADDRESS: loadtest@example.com
+      EMAIL_SENDER_APP_PASSWORD: unused-by-mailpit
+      EMAIL_SMTP_HOST: localhost   # localhost => net/smtp allows unencrypted auth
+      EMAIL_SMTP_PORT: 1025
+    ports:
+      - "8080:8080"   # backend API
+      - "1025:1025"   # Mailpit SMTP (shares this namespace)
+      - "8025:8025"   # Mailpit web UI + REST API
+
+  db:
+    ports:
+      - "5432:5432"

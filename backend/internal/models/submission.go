@@ -67,6 +67,20 @@ type Question struct {
 	// column). Defaults to 'public' when not set — the pre-curriculum-import
 	// behaviour is unchanged. Omitted from JSON (used internally by the evaluator).
 	CurriculumSchema string `json:"curriculum_schema,omitempty"`
+	// CategoryID is the FK to app.exam_categories, populated by read joins.
+	// Nil means the question has no category and resolves against
+	// CurriculumSchema (the exam-level fallback) exactly as before categories
+	// existed.
+	CategoryID *ExamCategoryID `json:"category_id,omitempty"`
+	// CategoryName is populated by read joins for response convenience; it is
+	// not stored on app.questions.
+	CategoryName string `json:"category_name,omitempty"`
+	// CategorySchema / CategoryPreviewSchema are read-join-only and never
+	// serialised (json:"-"), exactly like PracticeQuestion.CategorySchema /
+	// CategoryPreviewSchema (models/practice.go:41-46). They are consulted by
+	// the evaluator to resolve the grading/preview schema per category.
+	CategorySchema        string `json:"-"`
+	CategoryPreviewSchema string `json:"-"`
 }
 
 type StudentExamResult struct {

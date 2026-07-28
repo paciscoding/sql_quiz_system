@@ -28,6 +28,10 @@ func statusForRepoErr(err error) int {
 		errors.Is(err, repository.ErrCaptureNotReady),
 		errors.Is(err, repository.ErrEmptyExam):
 		return http.StatusConflict
+	case errors.Is(err, repository.ErrExamCategoryMismatch):
+		// ARCH-028 (5): a question's category_id that does not belong to the
+		// same exam is a client input error, not a server fault.
+		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
 	}
@@ -397,14 +401,22 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 	tw := repository.DMLCorrectSQLTargetTableWarning(saved.Type, saved.CorrectSQL, saved.TargetTable)
 
 	// Dual-without-decoy warning (spec §6.1): when dual_schema is on but the
-	// owning exam has no decoy curriculum uploaded yet, tell the lecturer the
+	// owning exam (or, per ARCH-028 (7), the owning category when it owns its
+	// own schema) has no decoy curriculum uploaded yet, tell the lecturer the
 	// preview will fall back to the grading schema until they upload one.
 	// Never blocks the save.
 	dsw := ""
 	if saved.DualSchema && saved.ExamID != nil {
-		pc, _ := ctrl.repo.GetExamPreviewCurriculumSchema(c.Request.Context(), int(*saved.ExamID))
-		if pc == "" {
-			dsw = "Dual schema is enabled but no decoy schema has been uploaded for this category/exam - previews will use the grading schema until you upload one."
+		categoryOwnsSchema := saved.CategoryID != nil && repository.ExamCategoryOwnsSchema(int(*saved.CategoryID), saved.CategorySchema)
+		if categoryOwnsSchema {
+			if saved.CategoryPreviewSchema == "" {
+				dsw = "Dual schema is enabled but no decoy schema has been uploaded for this category/exam - previews will use the grading schema until you upload one."
+			}
+		} else {
+			pc, _ := ctrl.repo.GetExamPreviewCurriculumSchema(c.Request.Context(), int(*saved.ExamID))
+			if pc == "" {
+				dsw = "Dual schema is enabled but no decoy schema has been uploaded for this category/exam - previews will use the grading schema until you upload one."
+			}
 		}
 	}
 
@@ -486,17 +498,23 @@ func (ctrl *LecturerController) DeleteQuestion(c *gin.Context) {
 // exam's curriculum schema instead of 'public'. Absent (or 0) keeps the
 // existing 'public' behaviour byte-for-byte.
 //
+// Optional field category_id: when present (non-zero), ARCH-028 (5): the
+// category's own schema wins over the exam curriculum, scoped to exam_id — a
+// category id that does not belong to that exam is rejected (400) rather than
+// silently falling back to the exam curriculum.
+//
 // Optional field schema: "grading" (default) previews on the real curriculum,
 // matching today's behaviour byte-for-byte; "preview" previews on the exam's
-// decoy curriculum (dual-schema grading) so the lecturer can see exactly what
-// a dual-schema student would see.
+// (or category's) decoy curriculum (dual-schema grading) so the lecturer can
+// see exactly what a dual-schema student would see.
 func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	var req struct {
-		Type        string        `json:"type"`
-		TargetTable string        `json:"target_table"`
-		CorrectSQL  string        `json:"correct_sql"`
-		ExamID      models.ExamID `json:"exam_id"` // optional; 0 = use public schema
-		Schema      string        `json:"schema"`  // optional; "grading" (default) or "preview"
+		Type        string                `json:"type"`
+		TargetTable string                `json:"target_table"`
+		CorrectSQL  string                `json:"correct_sql"`
+		ExamID      models.ExamID         `json:"exam_id"`               // optional; 0 = use public schema
+		CategoryID  models.ExamCategoryID `json:"category_id,omitempty"` // optional; 0 = no category
+		Schema      string                `json:"schema"`                // optional; "grading" (default) or "preview"
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -508,8 +526,12 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	}
 
 	useDecoy := req.Schema == "preview"
-	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), useDecoy)
+	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy)
 	if err != nil {
+		if errors.Is(err, repository.ErrExamCategoryMismatch) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		// Surface engine errors with status='error' so the frontend can render
 		// the message inline (this is expected during authoring).
 		c.JSON(http.StatusOK, gin.H{"status": "error", "error": err.Error()})

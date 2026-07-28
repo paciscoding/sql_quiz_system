@@ -291,6 +291,109 @@ describe('StudentView active-phase question picker labels', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ARCH-030 (5) / TODO-065: the question picker groups contiguous category runs
+// under <optgroup>, with uncategorised questions grouped last under 'Other'.
+// A payload with no category fields on any question must render a flat
+// <option> list with no <optgroup> at all — identical to pre-feature output.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeStudentFetchMockWithQuestions(questions: any[]) {
+  return vi.fn().mockImplementation((url: string) => {
+    if (typeof url === 'string' && url.includes('/exams?include_inactive')) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve([
+          {
+            id: 1,
+            title: 'Exam One',
+            is_active: true,
+            effective_state: 'active',
+            scheduled_start_at: null,
+            scheduled_end_at: null,
+          },
+        ]),
+      })
+    }
+    if (typeof url === 'string' && /\/exams\/\d+\/questions$/.test(url)) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(questions) })
+    }
+    if (typeof url === 'string' && /\/results\/\d+$/.test(url)) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve([]) })
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve([]) })
+  })
+}
+
+describe('StudentView active-phase question picker category grouping (TODO-065)', () => {
+  beforeEach(() => {
+    localStorage.setItem('sql_quiz_token', 'test-token')
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  it('renders one <optgroup> per category, labelled with the category names, with the right questions nested under each', async () => {
+    const CATEGORIZED = [
+      { id: 1, type: 'QUERY', points: 10, requirement: 'a', target_table: 't', category_id: 100, category_name: 'Part A' },
+      { id: 2, type: 'QUERY', points: 10, requirement: 'b', target_table: 't', category_id: 100, category_name: 'Part A' },
+      { id: 3, type: 'DML', points: 5, requirement: 'c', target_table: 't', category_id: 200, category_name: 'Part B' },
+    ]
+    vi.stubGlobal('fetch', makeStudentFetchMockWithQuestions(CATEGORIZED))
+
+    const wrapper = await mountInQuestionsView()
+
+    const optgroups = wrapper.findAll('select optgroup')
+    expect(optgroups).toHaveLength(2)
+    expect(optgroups[0].attributes('label')).toBe('Part A')
+    expect(optgroups[1].attributes('label')).toBe('Part B')
+
+    expect(optgroups[0].findAll('option')).toHaveLength(2)
+    expect(optgroups[1].findAll('option')).toHaveLength(1)
+
+    // Sequential Q-numbering is preserved across group boundaries.
+    const partBLabel = optgroups[1].findAll('option')[0].text().trim()
+    expect(partBLabel).toContain('Q3')
+
+    wrapper.unmount()
+  })
+
+  it('groups questions with no category last under an "Other" optgroup', async () => {
+    const MIXED = [
+      { id: 1, type: 'QUERY', points: 10, requirement: 'a', target_table: 't', category_id: 100, category_name: 'Part A' },
+      { id: 2, type: 'QUERY', points: 10, requirement: 'b', target_table: 't' },
+    ]
+    vi.stubGlobal('fetch', makeStudentFetchMockWithQuestions(MIXED))
+
+    const wrapper = await mountInQuestionsView()
+
+    const optgroups = wrapper.findAll('select optgroup')
+    expect(optgroups).toHaveLength(2)
+    expect(optgroups[0].attributes('label')).toBe('Part A')
+    expect(optgroups[1].attributes('label')).toBe('Other')
+    expect(optgroups[1].findAll('option')).toHaveLength(1)
+
+    wrapper.unmount()
+  })
+
+  it('renders a flat <option> list with no <optgroup> when no question has a category (pre-feature output)', async () => {
+    const FLAT = [
+      { id: 1, type: 'QUERY', points: 10, requirement: 'a', target_table: 't' },
+      { id: 2, type: 'QUERY', points: 10, requirement: 'b', target_table: 't' },
+    ]
+    vi.stubGlobal('fetch', makeStudentFetchMockWithQuestions(FLAT))
+
+    const wrapper = await mountInQuestionsView()
+
+    expect(wrapper.findAll('select optgroup')).toHaveLength(0)
+    // placeholder + 2 questions, flat under <select>
+    expect(wrapper.findAll('select option')).toHaveLength(3)
+
+    wrapper.unmount()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Performance / reduced-motion: the progress-bar fill must be driven by a
 // GPU-friendly transform (scaleX) rather than transitioning `width`, which
 // triggers layout every frame. The inline style on `.qp-fill` must therefore

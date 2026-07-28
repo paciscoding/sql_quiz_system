@@ -94,7 +94,8 @@ func (r *PostgresRepository) reconcilePreviewSchemaGrants(ctx context.Context) e
 		SELECT nspname FROM pg_catalog.pg_namespace
 		WHERE nspname LIKE 'practice\_cat\_%\_preview'
 		   OR nspname LIKE 'curriculum\_exam\_%\_preview'
-		   OR nspname LIKE 'sandbox\_exam\_%\_preview'`)
+		   OR nspname LIKE 'sandbox\_exam\_%\_preview'
+		   OR nspname LIKE 'exam\_cat\_%\_preview'`)
 	if err != nil {
 		return fmt.Errorf("failed to enumerate preview schemas for grant reconciliation: %w", err)
 	}
@@ -404,6 +405,18 @@ func (r *PostgresRepository) ImportSchemaIntoExamCurriculumPreview(ctx context.C
 		`UPDATE app.examinations SET preview_curriculum_schema = $2 WHERE id = $1`,
 		examID, schema); err != nil {
 		return "", fmt.Errorf("failed to update examination preview_curriculum_schema: %w", err)
+	}
+
+	// ARCH-028 (6) legacy-sync: same reasoning as ImportSchemaIntoExamCurriculum
+	// (postgres_schema.go), against preview_schema_name instead. Guarded on
+	// schema_name (not preview_schema_name) so a legacy category is identified
+	// consistently by both sync statements, and is a no-op once the category
+	// owns its own exam_cat_<id> schema.
+	if _, err := r.pool.Exec(ctx,
+		`UPDATE app.exam_categories SET preview_schema_name = $2, updated_at = now()
+		 WHERE exam_id = $1 AND schema_name <> ('exam_cat_' || id::text)`,
+		examID, schema); err != nil {
+		return "", fmt.Errorf("failed to sync exam_categories.preview_schema_name: %w", err)
 	}
 
 	// Audit row (best-effort: failure is logged but does not abort the import).

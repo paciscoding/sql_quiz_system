@@ -39,8 +39,10 @@ func openTestRepo(t *testing.T) *PostgresRepository {
 		ctx := context.Background()
 		for attempt := 0; attempt < 8; attempt++ {
 			if err = repo.CreateRestrictedUser(ctx); err == nil {
-				if err = repo.InitializeSystemTables(ctx); err == nil {
-					break
+				if err = repo.InitStudentPools(ctx); err == nil {
+					if err = repo.InitializeSystemTables(ctx); err == nil {
+						break
+					}
 				}
 			}
 			time.Sleep(time.Duration(attempt+1) * 150 * time.Millisecond)

@@ -61,3 +61,6 @@ work_times.log
 
 # Antigravity CLI jail artifacts (agy-implementor lane)
 .agy/
+
+# Self-signed TLS material — never commit a private key
+certs/

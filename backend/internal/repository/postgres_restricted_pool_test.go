@@ -1,7 +1,8 @@
 package repository
 
-// Tests for ARCH-025 (TODO-043/045: the restricted quiz_exec student-SQL
-// pool) and ARCH-023 (TODO-044: the pg_temp target-table shadowing fix).
+// Tests for ARCH-022 (TODO-043/045: the four restricted per-privilege-class
+// student-SQL pools) and ARCH-023 (TODO-044: the pg_temp target-table
+// shadowing fix).
 //
 // WHY THIS FILE EXISTS, AND WHY IT LOOKS DIFFERENT FROM
 // postgres_student_exec_test.go: two previous attempts at this vulnerability
@@ -20,13 +21,21 @@ package repository
 //     that proves the assertion above is actually falsifiable, not trivially
 //     true because e.g. ValidationDetails is always empty regardless.
 //
+// ARCH-022 replaced the single shared quiz_exec login role with FOUR
+// dedicated LOGIN roles (quiz_exec_ro/quiz_exec_rw/quiz_exec_prev_ro/
+// quiz_exec_prev_rw), one per privilege class, each a member of exactly one
+// sandbox role — see postgres_student_pool.go's file header for why one
+// shared role was itself a boundary violation. The password is generated
+// fresh every boot (crypto/rand) and is never read from the environment, so
+// there is no STUDENT_DB_PASSWORD to unset/restore in these tests anymore.
+//
 // Uses openTestRepo/uniqueUsername/mkPracticeCategory/mkSecretSchema/
 // dropSchema/targetTableCount, shared with postgres_student_exec_test.go /
 // postgres_password_events_test.go / postgres_practice_title_test.go in this
 // package; every test SKIPs cleanly without TEST_DATABASE_URL, so
 // `go test ./...` stays green on a machine with no database.
 //
-// Run: TEST_DATABASE_URL=postgres://... STUDENT_DB_PASSWORD=... \
+// Run: TEST_DATABASE_URL=postgres://... \
 //      go test ./internal/repository/... -run 'StudentPool|PgTempForgery|EscapeVectors|PositiveAssertion' -v
 
 import (
@@ -42,58 +51,53 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TODO-043: the restricted pool itself connects as quiz_exec, and there is no
-// path that falls back to the privileged pool when it cannot.
+// TODO-043: the restricted pools themselves connect as their own dedicated
+// login role, and there is no path that falls back to the privileged pool
+// when a pool cannot be found.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestStudentPool_ConnectsAsRestrictedRole proves the pool
-// postgres_student_pool.go builds really does authenticate as quiz_exec, not
-// as whatever DATABASE_URL/TEST_DATABASE_URL's own user is (postgres, in this
-// project's default .env).
+// TestStudentPool_ConnectsAsRestrictedRole proves each of the four pools
+// postgres_student_pool.go builds really does authenticate as its own
+// dedicated login role, not as whatever DATABASE_URL/TEST_DATABASE_URL's own
+// user is (postgres, in this project's default .env).
 func TestStudentPool_ConnectsAsRestrictedRole(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()
 
-	pool, err := repo.ensureStudentPool(ctx)
-	if err != nil {
-		t.Fatalf("ensureStudentPool: %v", err)
-	}
-	var sessionUser, currentUser string
-	if err := pool.QueryRow(ctx, "SELECT session_user, current_user").Scan(&sessionUser, &currentUser); err != nil {
-		t.Fatalf("query session_user/current_user on the student pool: %v", err)
-	}
-	t.Logf("student pool identity: session_user=%q current_user=%q", sessionUser, currentUser)
-	if sessionUser != studentPoolUser {
-		t.Fatalf("expected the student pool's session_user to be %q, got %q", studentPoolUser, sessionUser)
-	}
-	if sessionUser == "postgres" || currentUser == "postgres" {
-		t.Fatalf("SECURITY REGRESSION: student pool connected as postgres (session_user=%q current_user=%q)", sessionUser, currentUser)
+	for sandbox, login := range studentLoginRoles {
+		t.Run(sandbox, func(t *testing.T) {
+			pool, err := repo.poolForRole(sandbox)
+			if err != nil {
+				t.Fatalf("poolForRole(%q): %v", sandbox, err)
+			}
+			var sessionUser, currentUser string
+			if err := pool.QueryRow(ctx, "SELECT session_user, current_user").Scan(&sessionUser, &currentUser); err != nil {
+				t.Fatalf("query session_user/current_user on the %s pool: %v", sandbox, err)
+			}
+			t.Logf("%s pool identity: session_user=%q current_user=%q", sandbox, sessionUser, currentUser)
+			if sessionUser != login {
+				t.Fatalf("expected the %s pool's session_user to be %q, got %q", sandbox, login, sessionUser)
+			}
+			if sessionUser == "postgres" || currentUser == "postgres" {
+				t.Fatalf("SECURITY REGRESSION: %s pool connected as postgres (session_user=%q current_user=%q)", sandbox, sessionUser, currentUser)
+			}
+		})
 	}
 }
 
-// TestStudentPool_MissingPasswordFailsClosed_NoFallback is the acceptance
-// test for the brief's hardest requirement: "A silent fallback to the
-// privileged pool would restore the exact vulnerability — never do that."
-// With STUDENT_DB_PASSWORD unset, a BRAND NEW repository (its own
-// sync.Once, independent of the package-wide openTestRepo singleton, so this
-// does not disturb any other test) must fail InitStudentPool AND must fail
-// every Evaluate call — never silently execute the student's SQL on the
-// privileged pool instead.
-func TestStudentPool_MissingPasswordFailsClosed_NoFallback(t *testing.T) {
+// TestStudentPool_NoFallbackWhenUninitialised is the acceptance test for the
+// brief's hardest requirement: "A silent fallback to the privileged pool
+// would restore the exact vulnerability — never do that." A BRAND NEW
+// repository (its own sync.Once, independent of the package-wide
+// openTestRepo singleton, so this does not disturb any other test) that has
+// never called InitStudentPools must fail poolForRole AND must fail every
+// Evaluate call — never silently execute the student's SQL on the privileged
+// pool instead.
+func TestStudentPool_NoFallbackWhenUninitialised(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping DB integration test")
 	}
-
-	saved, had := os.LookupEnv(StudentDBPasswordEnv)
-	if err := os.Unsetenv(StudentDBPasswordEnv); err != nil {
-		t.Fatalf("Unsetenv(%s): %v", StudentDBPasswordEnv, err)
-	}
-	defer func() {
-		if had {
-			_ = os.Setenv(StudentDBPasswordEnv, saved)
-		}
-	}()
 
 	repo, err := NewPostgresRepository(dsn)
 	if err != nil {
@@ -101,18 +105,16 @@ func TestStudentPool_MissingPasswordFailsClosed_NoFallback(t *testing.T) {
 	}
 	defer repo.Close()
 
-	initErr := repo.InitStudentPool(context.Background())
-	if initErr == nil {
-		t.Fatal("expected InitStudentPool to fail when STUDENT_DB_PASSWORD is unset, got nil error")
+	// Deliberately do NOT call InitStudentPools.
+	_, poolErr := repo.poolForRole("exam_student_readonly")
+	if poolErr == nil {
+		t.Fatal("expected poolForRole to fail when InitStudentPools was never called, got nil error")
 	}
-	t.Logf("InitStudentPool error (expected): %v", initErr)
-	if !strings.Contains(initErr.Error(), StudentDBPasswordEnv) {
-		t.Fatalf("expected the error to name %s so an operator can diagnose it, got: %v", StudentDBPasswordEnv, initErr)
-	}
+	t.Logf("poolForRole error (expected): %v", poolErr)
 
 	// The real requirement: NOTHING downstream may fall back to r.pool. A
 	// harmless QUERY submission against a real, existing schema must still
-	// fail — proving evaluateQuery bailed out at ensureStudentPool and never
+	// fail — proving evaluateQuery bailed out at poolForRole and never
 	// reached tx.Query on the privileged connection at all.
 	_, evalErr := repo.Evaluate(context.Background(), 0, models.Question{Type: "QUERY"}, "SELECT 1", "public")
 	if evalErr == nil {
@@ -327,8 +329,8 @@ func TestEscapeVectors_QUERY(t *testing.T) {
 
 // TestPositiveAssertion_QuerySessionUserNeverPostgres is the brief's required
 // positive check for the QUERY path: a legitimate "SELECT session_user,
-// current_user" submission must return quiz_exec / exam_student_readonly and
-// NEVER postgres.
+// current_user" submission must return quiz_exec_ro / exam_student_readonly
+// and NEVER postgres.
 func TestPositiveAssertion_QuerySessionUserNeverPostgres(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()
@@ -364,8 +366,8 @@ func TestPositiveAssertion_QuerySessionUserNeverPostgres(t *testing.T) {
 	currentUser, _ := rows[0]["current_user"].(string)
 	t.Logf("QUERY path identity: session_user=%q current_user=%q", sessionUser, currentUser)
 
-	if sessionUser != "quiz_exec" {
-		t.Fatalf("expected session_user=quiz_exec, got %q", sessionUser)
+	if sessionUser != loginRoleExamStudentReadonly {
+		t.Fatalf("expected session_user=%q, got %q", loginRoleExamStudentReadonly, sessionUser)
 	}
 	if currentUser != "exam_student_readonly" {
 		t.Fatalf("expected current_user=exam_student_readonly, got %q", currentUser)
@@ -377,7 +379,7 @@ func TestPositiveAssertion_QuerySessionUserNeverPostgres(t *testing.T) {
 
 // TestPositiveAssertion_DMLPostImageShowsQuizExec is the brief's required
 // positive check for the DML path: a legitimate "INSERT INTO <target>(txt)
-// SELECT session_user" submission must show quiz_exec in the post-image.
+// SELECT session_user" submission must show quiz_exec_rw in the post-image.
 func TestPositiveAssertion_DMLPostImageShowsQuizExec(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()
@@ -402,10 +404,113 @@ func TestPositiveAssertion_DMLPostImageShowsQuizExec(t *testing.T) {
 	if result.Status != "success" {
 		t.Fatalf("expected the legitimate INSERT to succeed, got Status=%q Feedback=%q", result.Status, result.Feedback)
 	}
-	if !strings.Contains(string(result.ValidationDetails), "quiz_exec") {
-		t.Fatalf("expected the post-image to show quiz_exec as session_user, got %s", result.ValidationDetails)
+	if !strings.Contains(string(result.ValidationDetails), loginRoleExamStudent) {
+		t.Fatalf("expected the post-image to show %s as session_user, got %s", loginRoleExamStudent, result.ValidationDetails)
 	}
 	if strings.Contains(string(result.ValidationDetails), "postgres") {
 		t.Fatalf("SECURITY REGRESSION: post-image shows postgres: %s", result.ValidationDetails)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ARCH-022 privilege invariants: the property a single shared quiz_exec role
+// could not provide — one login role's SET ROLE reach is confined to exactly
+// its own sandbox role, and the plpgsql-from-PUBLIC revoke reaches the
+// student roles too.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestStudentPools_CrossClassSetRoleDenied is the load-bearing ARCH-022
+// property the retired single shared quiz_exec role lacked: the readonly
+// login role must not be able to SET ROLE into the read-write class, the
+// preview class, or postgres itself.
+func TestStudentPools_CrossClassSetRoleDenied(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	pool, err := repo.poolForRole("exam_student_readonly")
+	if err != nil {
+		t.Fatalf("poolForRole(exam_student_readonly): %v", err)
+	}
+
+	for _, target := range []string{"exam_student", "exam_student_preview", "postgres"} {
+		t.Run(target, func(t *testing.T) {
+			conn, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("Acquire: %v", err)
+			}
+			defer conn.Release()
+
+			_, err = conn.Exec(ctx, fmt.Sprintf("SET ROLE %s", target))
+			if err == nil {
+				t.Fatalf("SECURITY REGRESSION: exam_student_readonly's login role was able to SET ROLE %s", target)
+			}
+			t.Logf("SET ROLE %s denied (expected): %v", target, err)
+		})
+	}
+}
+
+// TestStudentPools_BootIdempotent proves InitStudentPools can be called
+// repeatedly (as it is every boot) without failing, and that it rotates the
+// password each time while leaving the pools usable afterward.
+func TestStudentPools_BootIdempotent(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping DB integration test")
+	}
+
+	repo, err := NewPostgresRepository(dsn)
+	if err != nil {
+		t.Fatalf("NewPostgresRepository: %v", err)
+	}
+	defer repo.Close()
+
+	if err := repo.CreateRestrictedUser(context.Background()); err != nil {
+		t.Fatalf("CreateRestrictedUser: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := repo.InitStudentPools(ctx); err != nil {
+		t.Fatalf("InitStudentPools (1st call): %v", err)
+	}
+	if err := repo.InitStudentPools(ctx); err != nil {
+		t.Fatalf("InitStudentPools (2nd call, should be idempotent): %v", err)
+	}
+
+	pool, err := repo.poolForRole("exam_student")
+	if err != nil {
+		t.Fatalf("poolForRole(exam_student) after re-init: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("Ping exam_student pool after re-init: %v", err)
+	}
+}
+
+// TestStudentPools_PlpgsqlDeniedToStudent proves the plpgsql-revoked-from-
+// PUBLIC posture reaches the student roles: a student cannot run a DO block
+// at all, closing off the RESET ROLE / RAISE-based exfiltration vector at
+// the language level, not just the role-membership level.
+func TestStudentPools_PlpgsqlDeniedToStudent(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	pool, err := repo.poolForRole("exam_student")
+	if err != nil {
+		t.Fatalf("poolForRole(exam_student): %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student"); err != nil {
+		t.Fatalf("SET LOCAL ROLE exam_student: %v", err)
+	}
+
+	_, err = tx.Exec(ctx, "DO $$ BEGIN PERFORM 1; END $$")
+	if err == nil {
+		t.Fatal("SECURITY REGRESSION: exam_student was able to execute a plpgsql DO block")
+	}
+	t.Logf("DO block denied (expected): %v", err)
 }

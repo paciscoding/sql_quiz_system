@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,6 +53,33 @@ var ErrCategoryEmpty = errors.New("category database is empty; ask your lecturer
 // the target exam curriculum schema already contains tables and the caller did
 // not pass confirm_replace=true. Controllers map this to 409 Conflict.
 var ErrExamCurriculumNotEmpty = errors.New("exam curriculum schema already has tables; confirm replace or use a new import")
+
+// ErrExamCategoryNotFound is returned when an exam category id does not exist
+// (or does not belong to the exam named in the request path). Controllers
+// should map this to HTTP 404 Not Found.
+var ErrExamCategoryNotFound = errors.New("exam category not found")
+
+// ErrExamCategoryNameTaken is returned by CreateExamCategory when the exam
+// already has a category with that name (UNIQUE (exam_id, name)). Controllers
+// map this to 409 Conflict.
+var ErrExamCategoryNameTaken = errors.New("exam category name already in use for this exam")
+
+// ErrExamCategoryHasQuestions is returned by DeleteExamCategory when the
+// category still has one or more attached questions. Per ARCH-036 (overriding
+// ARCH-029's original force-detach rule), there is no force escape hatch:
+// callers must reassign or delete the questions first. Controllers map this
+// to 409 Conflict.
+var ErrExamCategoryHasQuestions = errors.New("exam category still has attached questions")
+
+// ErrExamCategoryNotEmpty is returned by ImportSchemaIntoExamCategory (and its
+// preview twin) when the target category schema already contains tables and
+// the caller did not pass confirm_replace=true. Controllers map this to 409.
+var ErrExamCategoryNotEmpty = errors.New("exam category schema already has tables; confirm replace or use a new category")
+
+// ErrExamCategoryMismatch is returned when a question's category_id refers to
+// a category that does not belong to the question's own exam. Controllers map
+// this to HTTP 400 Bad Request.
+var ErrExamCategoryMismatch = errors.New("exam category does not belong to this examination")
 
 // errCaptureRollback is the sentinel returned by CreateQuestion's capture tx
 // after a successful capture, so WithTransaction rolls back the side effects
@@ -110,21 +136,17 @@ type PreviewResult struct {
 type PostgresRepository struct {
 	pool *pgxpool.Pool
 
-	// studentPool is the restricted connection pool ALL student-submitted SQL
-	// must execute through (ARCH-025). Its LOGIN role is `quiz_exec`, which
-	// owns nothing and has no privileges on the app schema, so `SET ROLE
-	// postgres` / `RESET ROLE` / `SELECT set_config('role','postgres',false)`
-	// issued from inside student SQL land somewhere useless instead of on the
-	// superuser session_user that `pool` connects as. See
+	// studentPools holds one restricted connection pool per privilege class,
+	// keyed by sandbox-role name (ARCH-022): "exam_student_readonly",
+	// "exam_student", "exam_student_preview_readonly", "exam_student_preview".
+	// Each pool's LOGIN role is a non-superuser that owns nothing and is a
+	// member of exactly that one sandbox role, so `SET ROLE postgres` /
+	// `RESET ROLE` issued from inside student SQL land on a zero-privilege role
+	// instead of the superuser session_user that `pool` connects as. Populated
+	// once at boot by InitStudentPools; nil until then. poolForRole reads it and
+	// NEVER falls back to the privileged `pool` above. See
 	// postgres_student_pool.go for the full rationale and construction.
-	// Lazily created (studentPoolOnce) so this file's four evaluate* callers
-	// work whether the pool was already warmed by cmd/main.go's explicit
-	// InitStudentPool boot call or is being created on first use by a test
-	// that never calls it — either way there is exactly one restricted pool,
-	// and NEVER a fallback to the privileged `pool` above.
-	studentPool     *pgxpool.Pool
-	studentPoolOnce sync.Once
-	studentPoolErr  error
+	studentPools map[string]*pgxpool.Pool
 }
 
 func NewPostgresRepository(connString string) (*PostgresRepository, error) {
@@ -148,7 +170,7 @@ func NewPostgresRepository(connString string) (*PostgresRepository, error) {
 	// Pool Tuning for high-concurrency exams
 	config.MaxConns = 20
 	config.MinConns = 10
-	config.MaxConnIdleTime = 30 * 60 // 30 mins
+	config.MaxConnIdleTime = 30 * time.Minute
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -164,8 +186,10 @@ func NewPostgresRepository(connString string) (*PostgresRepository, error) {
 }
 
 func (r *PostgresRepository) Close() {
-	if r.studentPool != nil {
-		r.studentPool.Close()
+	for _, p := range r.studentPools {
+		if p != nil {
+			p.Close()
+		}
 	}
 	r.pool.Close()
 }

@@ -30,6 +30,22 @@ package services
 // discarded (git diff on the production file is empty) and the test was
 // re-run to confirm it passes again. See the TODO-021 fix report for the
 // exact commands and output.
+//
+// This test's meaningfulness is conditional on the fixture question below
+// being created with StrictOrdering: true (models.PracticeQuestion.strict_ordering
+// -> models.Question.StrictMode.Ordering). decideDMLStatus (validation_service.go)
+// is documented to ignore q.StrictMode entirely and always force multiset/
+// key-aware/attribute-strict comparison for DML questions regardless of the
+// stored flags, so StrictOrdering: true has no effect on THIS test's outcome
+// today. It matters only for the counterfactual above: with the DML branch
+// removed, StrictMode.Ordering=true is what makes the QUERY fallback's
+// compareResults path run in ORDERED (index-by-index) mode instead of
+// unordered-set mode. Had the fixture left StrictOrdering at its zero value
+// (false), that same counterfactual edit could have left compareResults
+// comparing the two row sets unordered, which also tolerates heap reordering
+// — so the test would have kept passing even with the DML branch deleted,
+// proving nothing about ARCH-005. StrictOrdering: true on the fixture closes
+// that loophole: it guarantees the counterfactual genuinely fails.
 
 import (
 	"context"
@@ -89,6 +105,12 @@ func TestDMLGrading_D2_CorrectUpdateGradesCorrectDespiteReordering(t *testing.T)
 		Type:        "DML",
 		Requirement: "no-op tag rewrite on ids 1,2,3, in that order (reorders the heap)",
 		Points:      5,
+		// StrictOrdering: true is the test's whole reason for existing (see the
+		// header comment) — decideDMLStatus (ARCH-005) is documented to ignore
+		// q.StrictMode entirely, so this flag must be true here to prove the
+		// multiset comparison, not the order-insensitive QUERY fallback, is what
+		// carries this test.
+		StrictOrdering: true,
 	}
 	if err := repo.CreatePracticeQuestion(ctx, q); err != nil {
 		t.Fatalf("CreatePracticeQuestion: %v", err)

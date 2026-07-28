@@ -57,13 +57,14 @@ func main() {
 		log.Fatalf("Failed to setup restricted database role: %v", err)
 	}
 
-	// ARCH-025: eagerly create and verify the restricted student-SQL pool
-	// (LOGIN role quiz_exec, which owns nothing and has no privileges on the
-	// app schema). Fail fast here, exactly like the ID_SALT check above -
-	// there must be no path where a missing/invalid STUDENT_DB_PASSWORD
-	// silently leaves student SQL executing on the privileged connection.
-	if err := repo.InitStudentPool(ctx); err != nil {
-		log.Fatalf("Failed to initialize restricted student SQL pool: %v", err)
+	// ARCH-022: provision the four restricted student-SQL LOGIN roles (one per
+	// privilege class, each a non-superuser owning nothing) and build one pool
+	// per class. Fail fast here, exactly like the ID_SALT check above — there
+	// must be no path where a provisioning/connection failure silently leaves
+	// student SQL executing on the privileged connection. Must run after
+	// CreateRestrictedUser, which creates the sandbox roles these are members of.
+	if err := repo.InitStudentPools(ctx); err != nil {
+		log.Fatalf("Failed to initialize restricted student SQL pools: %v", err)
 	}
 
 	// Initialize System Tables
@@ -155,6 +156,7 @@ func main() {
 	lecturerCtrl.SetAuthService(authService)
 	userCtrl := controllers.NewUserController(authService, studentImportService)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
+	examCategoryCtrl := controllers.NewExamCategoryController(repo)
 	// Practice is live during exams by default; this gate only blocks practice
 	// when an active exam has its block_practice_during_exam toggle on (OQ-1).
 	practiceFreezeMW := middleware.PracticeFreezeMiddleware(repo)
@@ -206,6 +208,10 @@ func main() {
 				adminUsers.POST("/:id/reset-password", userCtrl.ResetPassword)
 				adminUsers.POST("/:id/resend-credential", userCtrl.ResendCredential)
 				adminUsers.GET("/:id/password-events", userCtrl.GetPasswordEvents)
+				// Bulk password reset (ARCH-031/ARCH-032): admin-only, student-only
+				// targets, generated passwords, never emailed. A static sibling of the
+				// /:id routes above — this group already mixes GET "/all" with PUT "/:id".
+				adminUsers.POST("/bulk-reset-password", userCtrl.BulkResetPassword)
 			}
 		}
 
@@ -230,6 +236,10 @@ func main() {
 			// itself still enforces student enrollment when the caller is a student.
 			quiz.GET("/exams/:id/intro-images", controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer), quizCtrl.ListExamIntroImages)
 			quiz.GET("/exams/:id/intro-images/:imageId", controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer), quizCtrl.GetExamIntroImage)
+			// Exam categories (read-only "category header" view): enrollment-gated,
+			// NOT active-gated, same precedent as intro-images above; staff bypass
+			// the enrollment check inside the handler.
+			quiz.GET("/exams/:id/categories", controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.GetExamCategories)
 			quiz.GET("/results", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetMyResultsSummary)
 		}
 
@@ -261,6 +271,17 @@ func main() {
 			staff.POST("/lecturer/exams/:id/curriculum/import", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportExamCurriculum)
 			// Decoy-schema preview for the curriculum import above (dual-schema grading).
 			staff.POST("/lecturer/exams/:id/curriculum/import-preview", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.ImportExamCurriculumPreview)
+			// Exam category CRUD + per-category database import. Mirrors the practice
+			// category routes below, scoped under the owning exam (ARCH-029).
+			staff.GET("/lecturer/exams/:id/categories", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.ListCategories)
+			staff.POST("/lecturer/exams/:id/categories", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.CreateCategory)
+			staff.PUT("/lecturer/exams/:id/categories/:categoryId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.RenameCategory)
+			staff.DELETE("/lecturer/exams/:id/categories/:categoryId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.DeleteCategory)
+			staff.POST("/lecturer/exams/:id/categories/:categoryId/import", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.ImportCategorySchema)
+			// Decoy-schema preview for the category import above (dual-schema grading).
+			staff.POST("/lecturer/exams/:id/categories/:categoryId/import-preview", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.ImportCategoryPreviewSchema)
+			// Lecturer writes the category description.
+			staff.PUT("/lecturer/exams/:id/categories/:categoryId/introduction", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.SetCategoryIntroduction)
 			staff.GET("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetExamRoster)
 			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)

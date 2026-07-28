@@ -415,6 +415,10 @@ onMounted(() => {
       <div class="card">
         <h2 style="margin: 0 0 var(--space-4) 0;">User Management</h2>
 
+        <router-link to="/admin/bulk-reset" class="btn btn-sm" data-testid="bulk-reset-link" style="display: inline-block; margin-bottom: var(--space-4);">
+          Bulk Reset Passwords
+        </router-link>
+
         <!-- Reset-password reveal -->
         <div v-if="resetReveal" data-testid="reset-password-reveal" class="reveal-panel">
           <p class="reveal-title">New password for <strong>{{ resetReveal.username }}</strong> (shown once):</p>

@@ -25,6 +25,7 @@ var usedTypes = []Type{
 	TypeImage,
 	TypeSubmission,
 	TypeAttempt,
+	TypeExamCategory,
 }
 
 func TestEncodeDecode_RoundTrip_AllUsedTypes(t *testing.T) {

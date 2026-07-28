@@ -82,6 +82,12 @@ func (r *PostgresRepository) SetExaminationActive(ctx context.Context, id int, a
 				return fmt.Errorf("failed to initialize exam sandbox: %w", err)
 			}
 		}
+		// ARCH-027 (3): lazily provision each owning category's DML sandbox too,
+		// so a categorised exam's per-category grading is ready the moment the
+		// exam goes active, not just the exam-level fallback sandbox above.
+		if err := r.EnsureExamCategorySchemasReady(ctx, id); err != nil {
+			return fmt.Errorf("failed to initialize exam category sandboxes: %w", err)
+		}
 	}
 	return nil
 }
@@ -135,6 +141,37 @@ func (r *PostgresRepository) ArchiveExamination(ctx context.Context, id int) err
 		safePreview := pgx.Identifier{previewSchema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safePreview)); err != nil {
 			fmt.Printf("Warning: failed to drop exam preview sandbox %s: %v\n", previewSchema, err)
+		}
+
+		// ARCH-027 (5)(b): drop only each category's two REGENERABLE sandbox
+		// clones — never ExamCategorySchemaName or ExamCategoryPreviewSchemaName,
+		// which are reference databases that archive leaves alone, exactly like
+		// the exam-level curriculum above. Runs before the early-return below
+		// (pure-SELECT exam), for the same reason as the preview-sandbox drop.
+		catRows, err := tx.Query(ctx, "SELECT id FROM app.exam_categories WHERE exam_id = $1", id)
+		if err != nil {
+			return err
+		}
+		var categoryIDs []int
+		for catRows.Next() {
+			var catID int
+			if err := catRows.Scan(&catID); err != nil {
+				catRows.Close()
+				return err
+			}
+			categoryIDs = append(categoryIDs, catID)
+		}
+		catRows.Close()
+		if err := catRows.Err(); err != nil {
+			return err
+		}
+		for _, catID := range categoryIDs {
+			for _, schema := range []string{ExamCategorySandboxName(catID), ExamCategoryPreviewSandboxName(catID)} {
+				safe := pgx.Identifier{schema}.Sanitize()
+				if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safe)); err != nil {
+					fmt.Printf("Warning: failed to drop exam category sandbox %s during archive: %v\n", schema, err)
+				}
+			}
 		}
 
 		var schema string
@@ -289,12 +326,35 @@ func (r *PostgresRepository) UpdateExaminationTitle(ctx context.Context, id int,
 //  5. DROP exam sandbox schema (if present and not already dropped)
 //     5b. DROP per-exam curriculum schema (if not 'public')
 //     5c. DROP decoy preview curriculum + preview sandbox schemas (ARCH-019, unconditional by canonical name)
+//     5d. DROP exam-category schemas (ARCH-027 (5)(a), unconditional by canonical name)
 //  6. app.exam_sandboxes
-//  7. app.examinations
+//  7. app.examinations (app.exam_categories rows cascade-delete here, ON DELETE CASCADE)
 //
 // Returns pgx.ErrNoRows when the exam id does not exist.
 func (r *PostgresRepository) DeleteExamination(ctx context.Context, id int) error {
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
+		// Read the exam's category ids FIRST, before anything below cascade-
+		// deletes the app.exam_categories rows themselves (step 7, via ON DELETE
+		// CASCADE on exam_id) — step 5d below needs them to derive the four
+		// canonical schema names per category.
+		catIDRows, err := tx.Query(ctx, `SELECT id FROM app.exam_categories WHERE exam_id = $1`, id)
+		if err != nil {
+			return err
+		}
+		var categoryIDs []int
+		for catIDRows.Next() {
+			var catID int
+			if err := catIDRows.Scan(&catID); err != nil {
+				catIDRows.Close()
+				return err
+			}
+			categoryIDs = append(categoryIDs, catID)
+		}
+		catIDRows.Close()
+		if err := catIDRows.Err(); err != nil {
+			return err
+		}
+
 		// Verify the exam exists before doing any deletes.
 		var exists bool
 		if err := tx.QueryRow(ctx,
@@ -328,7 +388,7 @@ func (r *PostgresRepository) DeleteExamination(ctx context.Context, id int) erro
 
 		// 5. Sandbox schema: look up the schema name (only live/non-dropped entries).
 		var sandboxSchema string
-		err := tx.QueryRow(ctx,
+		err = tx.QueryRow(ctx,
 			`SELECT schema_name FROM app.exam_sandboxes WHERE exam_id = $1 AND dropped_at IS NULL`, id,
 		).Scan(&sandboxSchema)
 		if err != nil && err != pgx.ErrNoRows {
@@ -371,6 +431,26 @@ func (r *PostgresRepository) DeleteExamination(ctx context.Context, id int) erro
 		safePreviewSandbox := pgx.Identifier{previewSandboxSchema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safePreviewSandbox)); err != nil {
 			fmt.Printf("Warning: failed to drop exam preview sandbox %s during delete: %v\n", previewSandboxSchema, err)
+		}
+
+		// 5d. Exam-category schemas (ARCH-027 (5)(a)): always dropped by
+		// CANONICAL NAME derived from the category id, NEVER by the row's
+		// stored schema_name — a legacy-adopted category's schema_name may
+		// literally be 'public' or the exam's own curriculum_exam_<n>, and
+		// dropping that would destroy data far outside this exam. Warn-and-
+		// continue on every drop, same shape as 5/5b/5c above.
+		for _, catID := range categoryIDs {
+			for _, schema := range []string{
+				ExamCategorySchemaName(catID),
+				ExamCategoryPreviewSchemaName(catID),
+				ExamCategorySandboxName(catID),
+				ExamCategoryPreviewSandboxName(catID),
+			} {
+				safe := pgx.Identifier{schema}.Sanitize()
+				if _, err := tx.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", safe)); err != nil {
+					fmt.Printf("Warning: failed to drop exam category schema %s during delete: %v\n", schema, err)
+				}
+			}
 		}
 
 		// 6. Sandbox bookkeeping row (covers both live and already-dropped entries)

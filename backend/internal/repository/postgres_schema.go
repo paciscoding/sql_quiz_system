@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -31,6 +30,23 @@ func (r *PostgresRepository) CreateRestrictedUser(ctx context.Context) error {
 	// Create roles if they don't exist. We don't give them LOGIN permissions
 	// because we will use SET ROLE from the superuser connection.
 	queries := []string{
+		// ARCH-022 (5): student plpgsql lockdown. ORDER IS LOAD-BEARING — the
+		// GRANT to CURRENT_USER must precede the REVOKE FROM PUBLIC so the app's
+		// own boot DO-blocks (below, and migrateQuestionsIdentity, and the role
+		// provisioning in postgres_student_pool.go) keep working even after
+		// plpgsql is revoked from PUBLIC. Today DB_USER=postgres bypasses the
+		// revoke as superuser; without this paired GRANT the boot would brick
+		// the moment scripts/deprivilege_app_db_user.sql de-privileges the app.
+		// After the revoke a student `DO $$ ... $$` / `CREATE FUNCTION ...
+		// LANGUAGE plpgsql` fails ("permission denied for language plpgsql");
+		// pre-existing lecturer trigger functions still fire (that needs EXECUTE
+		// on the function, not USAGE on the language). The two backend-signal
+		// revokes close same-class pg_terminate_backend/pg_cancel_backend abuse
+		// (measured residual 6.1); the app calls neither.
+		"GRANT USAGE ON LANGUAGE plpgsql TO CURRENT_USER",
+		"REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC",
+		"REVOKE EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint) FROM PUBLIC",
+		"REVOKE EXECUTE ON FUNCTION pg_catalog.pg_cancel_backend(integer) FROM PUBLIC",
 		"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'exam_student') THEN CREATE ROLE exam_student; END IF; END $$",
 		"REVOKE ALL ON SCHEMA public FROM exam_student",
 		"GRANT USAGE ON SCHEMA public TO exam_student",
@@ -57,11 +73,9 @@ func (r *PostgresRepository) CreateRestrictedUser(ctx context.Context) error {
 		}
 	}
 
-	// Provision the quiz_exec LOGIN role (ARCH-025) here too, so a fresh volume
-	// needs no external script and `docker compose up` boots healthy on its own.
-	if err := r.ensureStudentExecRole(ctx); err != nil {
-		return fmt.Errorf("failed to provision quiz_exec role: %w", err)
-	}
+	// The four restricted student-SQL LOGIN roles (ARCH-022) are provisioned
+	// separately by InitStudentPools, called from cmd/main.go immediately after
+	// this function — they depend on the sandbox roles created just above.
 
 	// Boot-time self-heal (ARCH-020): decoy preview schemas created by the
 	// already-merged dual-schema code have no grants for the two roles above.
@@ -69,142 +83,6 @@ func (r *PostgresRepository) CreateRestrictedUser(ctx context.Context) error {
 	// `docker compose down && up` fixes every existing decoy with no migration
 	// file and no manual DBA step.
 	return r.reconcilePreviewSchemaGrants(ctx)
-}
-
-// ensureStudentExecRole provisions the quiz_exec LOGIN role (ARCH-025) at boot
-// so a fresh volume needs no external provisioning script. Student SQL
-// authenticates as this role through the restricted pool
-// (postgres_student_pool.go); its password is the single source of truth in
-// STUDENT_DB_PASSWORD and is resynced every boot so the role and the pool can
-// never drift apart.
-//
-// This requires the app connection to hold CREATEROLE, which is true while
-// DB_USER is a superuser. Once the app role is de-privileged (NOCREATEROLE —
-// the deferred ARCH-022 posture), it can no longer create or alter roles. That
-// is tolerated here: if quiz_exec already exists (provisioned out of band by
-// scripts/deprivilege_app_db_user.sql) a privilege failure is logged, not
-// fatal, and InitStudentPool remains the authoritative gate. A MISSING role we
-// still cannot create is a hard error — the backend genuinely cannot run.
-func (r *PostgresRepository) ensureStudentExecRole(ctx context.Context) error {
-	pw := os.Getenv(StudentDBPasswordEnv)
-	if pw == "" {
-		// Let InitStudentPool emit the one authoritative "required" fatal.
-		return nil
-	}
-	// standard_conforming_strings is on by default: escape only the quote.
-	lit := "'" + strings.ReplaceAll(pw, "'", "''") + "'"
-	const attrs = "LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS"
-
-	var exists bool
-	if err := r.pool.QueryRow(ctx,
-		"SELECT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'quiz_exec')").Scan(&exists); err != nil {
-		return fmt.Errorf("check quiz_exec existence: %w", err)
-	}
-
-	verb := "CREATE ROLE"
-	if exists {
-		verb = "ALTER ROLE"
-	}
-	if _, err := r.pool.Exec(ctx, verb+" quiz_exec "+attrs+" PASSWORD "+lit); err != nil {
-		if exists {
-			// Present but we lack privilege to resync the password (deprivileged
-			// app role). Treat the out-of-band password as authoritative.
-			log.Printf("ARCH-025: quiz_exec present but password not resynced (%v); "+
-				"assuming out-of-band STUDENT_DB_PASSWORD is authoritative", err)
-			return nil
-		}
-		return fmt.Errorf("create quiz_exec role: %w", err)
-	}
-
-	// Membership in the four sandbox roles the evaluator SET LOCAL ROLEs into.
-	// Idempotent; safe every boot. The sandbox roles are created just above.
-	if _, err := r.pool.Exec(ctx,
-		"GRANT exam_student, exam_student_readonly, exam_student_preview, "+
-			"exam_student_preview_readonly TO quiz_exec"); err != nil {
-		return fmt.Errorf("grant sandbox roles to quiz_exec: %w", err)
-	}
-
-	// CONNECT is granted to PUBLIC by default; make it explicit so the role
-	// still connects if CONNECT is ever revoked from PUBLIC (ARCH-022).
-	var dbname string
-	if err := r.pool.QueryRow(ctx, "SELECT current_database()").Scan(&dbname); err == nil {
-		_, _ = r.pool.Exec(ctx, "GRANT CONNECT ON DATABASE "+
-			pgx.Identifier{dbname}.Sanitize()+" TO quiz_exec")
-	}
-	return nil
-}
-
-// ExecStudentSQL executes SQL as the restricted student role
-func (r *PostgresRepository) ExecStudentSQL(ctx context.Context, schema, sql string) error {
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-
-	// 1. Set search path
-	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := conn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", safeSchema)); err != nil {
-		return err
-	}
-
-	// 2. Switch to restricted role
-	if _, err := conn.Exec(ctx, "SET ROLE exam_student"); err != nil {
-		return err
-	}
-
-	// 3. Execute student SQL
-	_, err = conn.Exec(ctx, sql)
-
-	// 4. Always reset role
-	_, _ = conn.Exec(ctx, "RESET ROLE")
-
-	return err
-}
-
-// QueryStudentSQL executes a query as the restricted student role
-func (r *PostgresRepository) QueryStudentSQL(ctx context.Context, schema, sql string) ([]map[string]interface{}, error) {
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-
-	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := conn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", safeSchema)); err != nil {
-		return nil, err
-	}
-
-	if _, err := conn.Exec(ctx, "SET ROLE exam_student"); err != nil {
-		return nil, err
-	}
-
-	rows, err := conn.Query(ctx, sql)
-	if err != nil {
-		_, _ = conn.Exec(ctx, "RESET ROLE")
-		return nil, err
-	}
-	defer rows.Close()
-
-	fieldDescriptions := rows.FieldDescriptions()
-	var results []map[string]interface{}
-
-	for rows.Next() {
-		values, err := rows.Values()
-		if err != nil {
-			_, _ = conn.Exec(ctx, "RESET ROLE")
-			return nil, err
-		}
-
-		rowMap := make(map[string]interface{})
-		for i, fd := range fieldDescriptions {
-			rowMap[string(fd.Name)] = values[i]
-		}
-		results = append(results, rowMap)
-	}
-
-	_, _ = conn.Exec(ctx, "RESET ROLE")
-	return results, rows.Err()
 }
 
 // migrateQuestionsIdentity repairs the legacy app.questions.id column, which was
@@ -359,12 +237,23 @@ func (r *PostgresRepository) ExecuteSchemaScript(ctx context.Context, sql string
 // an object qualified by one of the system/shared schemas or another category's
 // schema. It is applied AFTER string literals and comments are stripped to avoid
 // false positives on data values. This is a denylist (covers public, app, the
-// PostgreSQL system schemas, exam sandboxes and other practice categories); it
-// deliberately does not try to fully parse SQL — category import scripts are
-// expected to use unqualified names that land in the category's own schema.
-// curriculum_exam_[0-9]+ added to prevent imports from escaping into another
-// exam's curriculum schema (same spirit as practice_cat_[0-9]+).
-var schemaQualifiedNameRe = regexp.MustCompile(`(?i)\b(public|app|information_schema|pg_catalog|pg_toast|pg_temp[0-9]*|sandbox_[a-z0-9_]+|practice_cat_[0-9]+|curriculum_exam_[0-9]+)\s*\.`)
+// PostgreSQL system schemas, exam sandboxes, practice categories and exam
+// categories); it deliberately does not try to fully parse SQL — category
+// import scripts are expected to use unqualified names that land in the
+// category's own schema. curriculum_exam_[0-9]+ prevents imports from escaping
+// into another exam's curriculum schema (same spirit as practice_cat_[0-9]+),
+// and exam_cat_[0-9]+ does the same for exam categories.
+//
+// ARCH-036 (OQ-1, user-approved, overrides ARCH-027 (4)'s narrower original
+// text): each of the three cat/curriculum families also rejects its own
+// "_preview" decoy variant — e.g. "practice_cat_3_preview.t" is now rejected,
+// where it previously slipped through because \b does not fire mid-identifier
+// and the old alternative required "\s*\." immediately after the digits. This
+// is a deliberate behaviour change for the two already-shipped families
+// (practice_cat_*, curriculum_exam_*), not just the new exam_cat_* one. The
+// sandbox_[a-z0-9_]+ alternative is untouched: it already matches both
+// sandbox_exam_cat_<n> and sandbox_exam_cat_<n>_preview.
+var schemaQualifiedNameRe = regexp.MustCompile(`(?i)\b(public|app|information_schema|pg_catalog|pg_toast|pg_temp[0-9]*|sandbox_[a-z0-9_]+|(?:practice_cat|curriculum_exam|exam_cat)_[0-9]+(?:_preview)?)\s*\.`)
 
 // Compiled once at package load. Go's RE2 engine has no backreferences, so the
 // dollar-quote stripper handles the common anonymous $$...$$ form only; tagged
@@ -591,6 +480,20 @@ func (r *PostgresRepository) ImportSchemaIntoExamCurriculum(ctx context.Context,
 		`UPDATE app.examinations SET curriculum_schema = $2 WHERE id = $1`,
 		examID, schema); err != nil {
 		return fmt.Errorf("failed to update examination curriculum_schema: %w", err)
+	}
+
+	// ARCH-028 (6) legacy-sync: keep a migrated category's stored schema_name in
+	// lockstep with this exam-level import. A "General" category auto-adopted by
+	// migrateExamCategories stores a COPY of the exam's OLD curriculum_schema
+	// (often literally 'public'); without this, it would keep grading against
+	// that stale schema after the lecturer moves the exam onto a real per-exam
+	// curriculum. The guard makes this a no-op for any category that already
+	// owns its own exam_cat_<id> schema.
+	if _, err := r.pool.Exec(ctx,
+		`UPDATE app.exam_categories SET schema_name = $2, updated_at = now()
+		 WHERE exam_id = $1 AND schema_name <> ('exam_cat_' || id::text)`,
+		examID, schema); err != nil {
+		return fmt.Errorf("failed to sync exam_categories.schema_name: %w", err)
 	}
 
 	// Audit row (best-effort: failure is logged but does not abort the import).
@@ -1037,9 +940,34 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			introduction TEXT NOT NULL DEFAULT '',
 			preview_curriculum_schema TEXT NOT NULL DEFAULT ''
 		);`,
+		// Exam categories: each row owns a schema named exam_cat_<id>, mirroring
+		// app.practice_categories (ARCH-026). Three deliberate divergences from
+		// practice_categories, each load-bearing:
+		//  (a) schema_name/preview_schema_name have NO UNIQUE constraint — the
+		//      boot migration below gives several "General" categories the value
+		//      'public' (every exam still on the default curriculum schema); a
+		//      UNIQUE index would make the migration fail on the second exam.
+		//  (b) name is unique PER EXAM (UNIQUE (exam_id, name)), not globally —
+		//      two different exams may both have a "Part A" category.
+		//  (c) created_by is NULLABLE, because app.examinations.created_by is
+		//      itself nullable and the migration copies it verbatim.
+		`CREATE TABLE IF NOT EXISTS app.exam_categories (
+			id SERIAL PRIMARY KEY,
+			exam_id INTEGER NOT NULL REFERENCES app.examinations(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			schema_name TEXT NOT NULL DEFAULT '',
+			preview_schema_name TEXT NOT NULL DEFAULT '',
+			introduction TEXT NOT NULL DEFAULT '',
+			created_by INTEGER REFERENCES app.system_users(id),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (exam_id, name)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_exam_categories_exam ON app.exam_categories(exam_id);`,
 		`CREATE TABLE IF NOT EXISTS app.questions (
 			id INTEGER PRIMARY KEY,
 			exam_id INTEGER REFERENCES app.examinations(id),
+			category_id INTEGER REFERENCES app.exam_categories(id) ON DELETE SET NULL,
 			target_table TEXT NOT NULL,
 			correct_sql TEXT NOT NULL,
 			question_type TEXT NOT NULL,
@@ -1291,6 +1219,11 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		"ALTER TABLE app.examinations ADD COLUMN IF NOT EXISTS preview_curriculum_schema TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS dual_schema BOOLEAN NOT NULL DEFAULT false",
 		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS dual_schema BOOLEAN NOT NULL DEFAULT false",
+		// Exam categories (ARCH-026): nullable reference so pre-existing
+		// installations (and exam_id IS NULL questions, which can never belong to
+		// an exam category) are unaffected until migrateExamCategories backfills it.
+		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES app.exam_categories(id) ON DELETE SET NULL",
+		"CREATE INDEX IF NOT EXISTS idx_questions_category_id ON app.questions(category_id)",
 	}
 
 	for _, q := range extraMigrations {
@@ -1315,6 +1248,14 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 	// from the legacy free-text category strings, and enforce NOT NULL. Idempotent.
 	if err := r.migratePracticeCategories(ctx); err != nil {
 		return fmt.Errorf("practice category migration failed: %w", err)
+	}
+
+	// Exam-categories migration (ARCH-026): auto-adopt each existing exam's
+	// current curriculum schema into one "General" category and attach that
+	// exam's still-unattached questions to it. Writes app-table rows only —
+	// no schema is created, copied, renamed or dropped. Idempotent.
+	if err := r.migrateExamCategories(ctx); err != nil {
+		return fmt.Errorf("exam category migration failed: %w", err)
 	}
 
 	// Drop orphaned per-student sandbox schemas left over from the pre-2026-05-07

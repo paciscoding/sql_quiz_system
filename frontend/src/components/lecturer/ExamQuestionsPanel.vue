@@ -14,9 +14,21 @@ import { handleApiError } from '../../services/error_handler'
 import { useFormValidation, required } from '../../composables/useFormValidation'
 import { useKeyboardShortcut } from '../../composables/useKeyboardShortcut'
 import { formatSql } from '../../utils/format_sql'
-import { setExamIntroduction, importExamCurriculumPreview } from '../../services/exam'
+import {
+  setExamIntroduction,
+  importExamCurriculumPreview,
+  listExamCategories,
+  createExamCategory,
+  renameExamCategory,
+  deleteExamCategory,
+  importExamCategorySchema,
+  importExamCategoryPreviewSchema,
+  setExamCategoryIntroduction,
+  type ExamCategory
+} from '../../services/exam'
 import { ApiError } from '../../services/practice'
 import { listExamIntroImages, examImageBlobUrl, type IntroImageMetadata } from '../../services/schemaImages'
+import CollapsibleCard from '../CollapsibleCard.vue'
 
 const props = defineProps<{ exam: Examination }>()
 const emit = defineEmits<{ changed: [] }>()
@@ -35,6 +47,7 @@ const examHasDecoy = computed(() => props.exam.has_preview_schema ?? false)
 const blankQuestion = () => ({
   id: null as number | null,
   exam_id: null as string | null,
+  category_id: null as string | null,
   target_table: '',
   correct_sql: '',
   requirement: '',
@@ -111,6 +124,240 @@ const fetchExamQuestions = async () => {
 
 watch(() => props.exam.id, fetchExamQuestions, { immediate: true })
 
+// --- Exam Categories (ARCH-029 / ARCH-034 (3) lower panel) ---
+// Always-rendered "Exam Categories" management panel. Mirrors the category
+// management block in PracticeAuthoring.vue, adapted for exam.ts's two-arg
+// (examId, categoryId, ...) service signatures and ARCH-036's exam-category
+// delete semantics (refuse-if-non-empty, no force/detach retry).
+const categories = ref<ExamCategory[]>([])
+
+const loadCategories = async () => {
+  try {
+    categories.value = await listExamCategories(props.exam.id)
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to load exam categories' })
+  }
+}
+
+watch(() => props.exam.id, loadCategories, { immediate: true })
+
+const newCategoryName = ref('')
+
+const { inFlight: addCategoryLoading, run: addCategory } = useSingleFlight(async () => {
+  const name = newCategoryName.value.trim()
+  if (!name) return
+  try {
+    const cat = await createExamCategory(props.exam.id, name)
+    notify(`Category "${cat.name}" created`, 'success')
+    newCategoryName.value = ''
+    await loadCategories()
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to create category' })
+  }
+})
+
+const doRenameCategory = async (cat: ExamCategory) => {
+  const next = window.prompt('Rename category', cat.name)
+  if (next === null) return
+  const name = next.trim()
+  if (!name || name === cat.name) return
+  try {
+    await renameExamCategory(props.exam.id, cat.id, name)
+    notify('Category renamed', 'success')
+    await loadCategories()
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to rename category' })
+  }
+}
+
+// Mirrors the backend's examCategoryQuestionCountRe
+// (exam_category_controller.go), which wraps the attached-question count into
+// the 409 error text ("N question(s) still attached to this category"). Used
+// to surface the count without needing a new field on the shared ApiError
+// class (which only carries status + message).
+const attachedQuestionCountRe = /(\d+) question\(s\)/
+
+// ARCH-036: exam-category delete has NO force/detach escape hatch. A 409
+// means the category still has questions attached; the lecturer must
+// reassign or delete those questions first — there is no "delete anyway"
+// retry here (unlike PracticeAuthoring's force-delete flow).
+const doDeleteCategory = async (cat: ExamCategory) => {
+  const ok = await confirm({ title: `Delete "${cat.name}"?`, body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
+  if (!ok) return
+  try {
+    await deleteExamCategory(props.exam.id, cat.id)
+    notify('Category deleted', 'success')
+    await loadCategories()
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      const match = attachedQuestionCountRe.exec(err.message)
+      const count = match ? match[1] : null
+      notify(
+        count
+          ? `Cannot delete "${cat.name}": ${count} question(s) are still assigned to it. Reassign or delete those questions first.`
+          : `Cannot delete "${cat.name}": it still has questions assigned. Reassign or delete those questions first.`,
+        'error'
+      )
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to delete category' })
+  }
+}
+
+// --- Category database schema import (grading schema) ---
+const catSchemaImportCategoryId = ref<string | null>(null)
+const catSchemaImportSql = ref('')
+const catSchemaImportFileName = ref('')
+
+const openCatSchemaImport = (cat: ExamCategory) => {
+  catSchemaImportCategoryId.value = cat.id
+  catSchemaImportSql.value = ''
+  catSchemaImportFileName.value = ''
+}
+
+const cancelCatSchemaImport = () => {
+  catSchemaImportCategoryId.value = null
+  catSchemaImportSql.value = ''
+  catSchemaImportFileName.value = ''
+}
+
+const loadCatSchemaImportFile = (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!/\.sql$/i.test(file.name)) {
+    notify('File must be a .sql file', 'error')
+    input.value = ''
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    catSchemaImportSql.value = typeof reader.result === 'string' ? reader.result : ''
+    catSchemaImportFileName.value = file.name
+  }
+  reader.onerror = () => notify('Failed to read the file', 'error')
+  reader.readAsText(file)
+  input.value = '' // reset so re-selecting the same file re-fires @change
+}
+
+const { inFlight: catSchemaImportLoading, run: doCatSchemaImport } = useSingleFlight(async () => {
+  if (catSchemaImportCategoryId.value === null || !catSchemaImportSql.value.trim()) return
+  const id = catSchemaImportCategoryId.value
+  try {
+    await importExamCategorySchema(props.exam.id, id, catSchemaImportSql.value, false)
+    notify('Database imported', 'success')
+    cancelCatSchemaImport()
+    await loadCategories()
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      const ok = await confirm({ title: 'Replace existing database?', body: 'This category already has a database. Importing will drop the existing tables and replace them. Continue?', confirmLabel: 'Replace', danger: true })
+      if (!ok) return
+      try {
+        await importExamCategorySchema(props.exam.id, id, catSchemaImportSql.value, true)
+        notify('Database replaced', 'success')
+        cancelCatSchemaImport()
+        await loadCategories()
+      } catch (err2) {
+        handleApiError(err2, { fallback: 'Failed to import database' })
+      }
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to import database' })
+  }
+})
+
+// --- Category decoy database schema import (preview only) — parallel to the
+// grading-schema import above, same 409-then-confirm-replace flow, targeting
+// importExamCategoryPreviewSchema instead of importExamCategorySchema. ---
+const catDecoyImportCategoryId = ref<string | null>(null)
+const catDecoyImportSql = ref('')
+const catDecoyImportFileName = ref('')
+
+const openCatDecoyImport = (cat: ExamCategory) => {
+  catDecoyImportCategoryId.value = cat.id
+  catDecoyImportSql.value = ''
+  catDecoyImportFileName.value = ''
+}
+
+const cancelCatDecoyImport = () => {
+  catDecoyImportCategoryId.value = null
+  catDecoyImportSql.value = ''
+  catDecoyImportFileName.value = ''
+}
+
+const loadCatDecoyImportFile = (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!/\.sql$/i.test(file.name)) {
+    notify('File must be a .sql file', 'error')
+    input.value = ''
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    catDecoyImportSql.value = typeof reader.result === 'string' ? reader.result : ''
+    catDecoyImportFileName.value = file.name
+  }
+  reader.onerror = () => notify('Failed to read the file', 'error')
+  reader.readAsText(file)
+  input.value = '' // reset so re-selecting the same file re-fires @change
+}
+
+const { inFlight: catDecoyImportLoading, run: doCatDecoyImport } = useSingleFlight(async () => {
+  if (catDecoyImportCategoryId.value === null || !catDecoyImportSql.value.trim()) return
+  const id = catDecoyImportCategoryId.value
+  try {
+    const res = await importExamCategoryPreviewSchema(props.exam.id, id, catDecoyImportSql.value, false)
+    notify('Decoy schema imported', 'success')
+    if (res.parity_warning) notify(res.parity_warning, 'error')
+    cancelCatDecoyImport()
+    await loadCategories()
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      const ok = await confirm({ title: 'Replace existing decoy schema?', body: 'This category already has a decoy schema. Importing will drop the existing tables and replace them. Continue?', confirmLabel: 'Replace', danger: true })
+      if (!ok) return
+      try {
+        const res2 = await importExamCategoryPreviewSchema(props.exam.id, id, catDecoyImportSql.value, true)
+        notify('Decoy schema replaced', 'success')
+        if (res2.parity_warning) notify(res2.parity_warning, 'error')
+        cancelCatDecoyImport()
+        await loadCategories()
+      } catch (err2) {
+        handleApiError(err2, { fallback: 'Failed to import decoy schema' })
+      }
+      return
+    }
+    handleApiError(err, { fallback: 'Failed to import decoy schema' })
+  }
+})
+
+// Per-category introduction editor state (keyed by category id). NO
+// intro-images sub-panel for exam categories (ARCH-026 (6) / ARCH-030 scope
+// them out entirely) — exam-level intro images stay in the upper panel.
+const categoryIntroEdits = ref<Record<string, string>>({})
+const categoryIntroSaving = ref<Record<string, boolean>>({})
+
+watch(categories, (cats) => {
+  cats.forEach(c => {
+    if (!(c.id in categoryIntroEdits.value)) {
+      categoryIntroEdits.value[c.id] = c.introduction ?? ''
+    }
+  })
+})
+
+const saveCategoryIntro = async (cat: ExamCategory) => {
+  categoryIntroSaving.value[cat.id] = true
+  try {
+    await setExamCategoryIntroduction(props.exam.id, cat.id, categoryIntroEdits.value[cat.id] ?? '')
+    notify('Description saved', 'success')
+  } catch (err) {
+    handleApiError(err, { fallback: 'Failed to save description' })
+  } finally {
+    categoryIntroSaving.value[cat.id] = false
+  }
+}
+
 const { inFlight: deleteQuestionLoading, run: deleteQuestion } = useSingleFlight(async (id: number) => {
   const ok = await confirm({ title: 'Delete this question?', body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
   if (!ok) return
@@ -150,6 +397,7 @@ const editQuestion = (q: any) => {
   question.value = {
     id: q.id,
     exam_id: q.exam_id,
+    category_id: q.category_id ?? null,
     target_table: q.target_table || '',
     correct_sql: q.correct_sql || '',
     requirement: q.requirement || '',
@@ -181,6 +429,7 @@ function onQuestionDropdownChange(event: Event) {
     question.value = {
       id: 0,
       exam_id: props.exam.id,
+      category_id: null,
       target_table: '',
       correct_sql: '',
       requirement: '',
@@ -200,6 +449,27 @@ function onQuestionDropdownChange(event: Event) {
 
 useKeyboardShortcut({ combo: 'Ctrl+Enter', whenTyping: true, scope: questionFormRef, handler: () => previewCorrectSQL() })
 
+// Shared request body for both preview variants below (ARCH-028 (5)). Sends
+// category_id only when the form currently has a category selected — "None
+// (exam-level schema)" leaves question.value.category_id null, so the field
+// is omitted entirely and the backend's zero-value CategoryID falls back to
+// the exam curriculum exactly as it did before categories existed. Sending an
+// explicit null instead would fail the category's custom UnmarshalJSON
+// (models.ExamCategoryID expects an opaque id string, not null).
+function previewRequestBody(extra: Record<string, unknown> = {}) {
+  const body: Record<string, unknown> = {
+    exam_id: props.exam.id,
+    type: question.value.type,
+    target_table: question.value.target_table,
+    correct_sql: question.value.correct_sql,
+    ...extra
+  }
+  if (question.value.category_id) {
+    body.category_id = question.value.category_id
+  }
+  return body
+}
+
 const previewCorrectSQL = async () => {
   if (!question.value.correct_sql) {
     notify('Enter the Correct SQL before previewing', 'error')
@@ -218,12 +488,7 @@ const previewCorrectSQL = async () => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
       },
-      body: JSON.stringify({
-        exam_id: props.exam.id,
-        type: question.value.type,
-        target_table: question.value.target_table,
-        correct_sql: question.value.correct_sql
-      })
+      body: JSON.stringify(previewRequestBody())
     })
     const data = await response.json().catch(() => ({} as any))
     if (!response.ok) {
@@ -268,13 +533,7 @@ const previewAsStudent = async () => {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
       },
-      body: JSON.stringify({
-        exam_id: props.exam.id,
-        type: question.value.type,
-        target_table: question.value.target_table,
-        correct_sql: question.value.correct_sql,
-        schema: 'preview'
-      })
+      body: JSON.stringify(previewRequestBody({ schema: 'preview' }))
     })
     const data = await response.json().catch(() => ({} as any))
     if (!response.ok) {
@@ -501,6 +760,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     if (data.mixed_dual_warning) notify(data.mixed_dual_warning, 'error')
 
     fetchExamQuestions()
+    loadCategories() // question_count on the affected category has changed
     localStorage.removeItem(requirementDraftKey.value)
     emit('changed')
 
@@ -517,6 +777,10 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
 
 <template>
   <div>
+    <!-- UPPER section: everything this panel rendered before ARCH-034 (3) —
+         question form, decoy curriculum import, exam description, exam intro
+         images, questions list. Order and behaviour unchanged. -->
+    <section class="authoring-section authoring-section--upper">
     <div ref="questionFormRef">
       <div class="form-grid">
         <div class="input-group">
@@ -536,6 +800,17 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           <select v-model="question.type">
             <option value="QUERY">Query (SELECT)</option>
             <option value="DML">DML (Insert/Update/Delete)</option>
+          </select>
+        </div>
+
+        <!-- ARCH-034 (3)(c): the one behavioural addition to the upper panel —
+             lets a lecturer put a question into an exam category. Without it
+             exam categories would have no authoring entry point. -->
+        <div class="input-group">
+          <label>Category:</label>
+          <select v-model="question.category_id">
+            <option :value="null">None (exam-level schema)</option>
+            <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
           </select>
         </div>
 
@@ -780,6 +1055,120 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         </table>
       </div>
     </div>
+    </section><!-- /authoring-section--upper -->
+
+    <!-- LOWER section: Exam Categories, ALWAYS rendered — no show/hide toggle
+         (ARCH-034 (3)(b)). Each category is a CollapsibleCard driven by the
+         ARCH-029 service wrappers in services/exam.ts. NO intro-images
+         sub-panel here — exam categories don't have them (ARCH-026 (6)). -->
+    <section class="authoring-section authoring-section--lower" aria-labelledby="exam-categories-heading">
+      <div style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">
+        <h2 id="exam-categories-heading" style="margin: 0 0 var(--space-2) 0;">Exam Categories</h2>
+        <p class="muted" style="margin: 0 0 var(--space-3) 0; font-size: 0.85rem;">Each category can own its own database, kept separate from the exam-level schema above. Questions with no category grade against the exam-level schema.</p>
+
+        <!-- New category -->
+        <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">
+          <input v-model="newCategoryName" placeholder="New category name" style="flex: 1;" @keyup.enter="addCategory" />
+          <button class="primary-btn" style="margin-bottom: 0;" :disabled="addCategoryLoading || !newCategoryName.trim()" @click="addCategory">New Category</button>
+        </div>
+
+        <!-- Per-category collapsible cards -->
+        <div v-if="categories.length > 0">
+          <CollapsibleCard v-for="c in categories" :key="c.id" :title="c.name" :test-id="'exam-category-' + c.id">
+            <template #header-meta>
+              <code>{{ c.schema_name }}</code>
+              <span class="muted" style="font-size: 0.8rem;">{{ c.question_count }} question{{ c.question_count === 1 ? '' : 's' }}</span>
+              <span v-if="c.has_preview_schema" class="badge badge-info">decoy</span>
+              <span v-if="!c.owns_schema" class="badge badge-warning">exam-level schema</span>
+            </template>
+            <template #header-actions>
+              <button class="btn-sm" @click="doRenameCategory(c)">Rename</button>
+              <button class="btn-sm btn-danger" @click="doDeleteCategory(c)">Delete</button>
+            </template>
+
+            <!-- Database schema sub-panel -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Database schema</span>
+              <div v-if="catSchemaImportCategoryId === c.id">
+                <h3>Import database into "{{ c.name }}"</h3>
+                <p class="muted">Upload a <code>.sql</code> file or paste a SQL script, using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
+                <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
+                  <label class="btn-sm" style="cursor: pointer; margin: 0;">
+                    Choose .sql file
+                    <input type="file" accept=".sql,text/plain,application/sql" @change="loadCatSchemaImportFile" style="display: none;" />
+                  </label>
+                  <span v-if="catSchemaImportFileName" class="muted">Loaded: <code>{{ catSchemaImportFileName }}</code> — review or edit below, then import.</span>
+                </div>
+                <SqlEditor v-model="catSchemaImportSql" height="200px" />
+                <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+                  <button class="primary-btn" style="margin-bottom: 0;" :disabled="catSchemaImportLoading || !catSchemaImportSql.trim()" @click="doCatSchemaImport">
+                    <Spinner v-if="catSchemaImportLoading" size="sm" inline :invert="true" />{{ catSchemaImportLoading ? 'Importing' : 'Import Database' }}
+                  </button>
+                  <button class="secondary-btn" style="margin-bottom: 0;" @click="cancelCatSchemaImport">Cancel</button>
+                </div>
+              </div>
+              <div v-else style="display: flex; justify-content: space-between; align-items: center; gap: var(--space-2);">
+                <p class="muted" style="margin: 0;">Import a .sql to (re)load this category's database.</p>
+                <button class="btn-sm" @click="openCatSchemaImport(c)">Import Database</button>
+              </div>
+            </div>
+
+            <!-- Decoy database schema sub-panel (preview only — same tables/columns as
+                 the grading schema above, different data; used by dual-schema questions
+                 so the student's preview never leaks the grading data). -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Decoy database schema (preview only)</span>
+              <div v-if="catDecoyImportCategoryId === c.id">
+                <h3>Import decoy database into "{{ c.name }}"</h3>
+                <p class="muted">Upload a <code>.sql</code> file or paste a SQL script with the same tables and columns as the grading database above, but different data. Students previewing a dual-schema question see this data instead of the real grading data.</p>
+                <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
+                  <label class="btn-sm" style="cursor: pointer; margin: 0;">
+                    Choose .sql file
+                    <input type="file" accept=".sql,text/plain,application/sql" @change="loadCatDecoyImportFile" style="display: none;" />
+                  </label>
+                  <span v-if="catDecoyImportFileName" class="muted">Loaded: <code>{{ catDecoyImportFileName }}</code> — review or edit below, then import.</span>
+                </div>
+                <SqlEditor v-model="catDecoyImportSql" height="200px" />
+                <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+                  <button class="primary-btn" style="margin-bottom: 0;" :disabled="catDecoyImportLoading || !catDecoyImportSql.trim()" @click="doCatDecoyImport">
+                    <Spinner v-if="catDecoyImportLoading" size="sm" inline :invert="true" />{{ catDecoyImportLoading ? 'Importing' : 'Import Decoy Schema' }}
+                  </button>
+                  <button class="secondary-btn" style="margin-bottom: 0;" @click="cancelCatDecoyImport">Cancel</button>
+                </div>
+              </div>
+              <div v-else style="display: flex; justify-content: space-between; align-items: center; gap: var(--space-2);">
+                <p class="muted" style="margin: 0;">
+                  {{ c.has_preview_schema ? 'Decoy schema loaded — used for dual-schema question previews.' : 'Import a decoy .sql (same structure, different data) to enable dual-schema previews for this category.' }}
+                </p>
+                <button class="btn-sm" @click="openCatDecoyImport(c)">Import Decoy Schema</button>
+              </div>
+            </div>
+
+            <!-- Description sub-panel -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Description (shown to students on the intro page)</span>
+              <div style="display: flex; gap: var(--space-2); align-items: flex-end;">
+                <textarea
+                  v-model="categoryIntroEdits[c.id]"
+                  rows="3"
+                  style="flex: 1; resize: vertical; min-height: 60px;"
+                  :placeholder="'Write a description for the ' + c.name + ' category...'"
+                ></textarea>
+                <button
+                  class="btn-sm"
+                  :disabled="categoryIntroSaving[c.id]"
+                  @click="saveCategoryIntro(c)"
+                  style="white-space: nowrap;"
+                >{{ categoryIntroSaving[c.id] ? 'Saving...' : 'Save Description' }}</button>
+              </div>
+            </div>
+            <!-- NO intro-images sub-panel here (ARCH-026 (6) / ARCH-030 scope
+                 exam-category intro images out entirely). -->
+          </CollapsibleCard>
+        </div>
+        <p v-else class="muted">No categories yet. Create one above.</p>
+      </div>
+    </section><!-- /authoring-section--lower -->
   </div>
 </template>
 
@@ -946,6 +1335,31 @@ textarea {
 
 .questions-list-section {
   margin-top: 2rem;
+}
+
+/* ARCH-034 (3)(d): two sibling sections, upper then lower, divided by a
+   visible border — the same divider treatment already used between the
+   sub-panels in this file. */
+.authoring-section {
+  display: block;
+}
+.authoring-section--lower {
+  border-top: 2px solid var(--color-border);
+  padding-top: var(--space-4);
+  margin-top: var(--space-4);
+}
+.cat-subpanel {
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  margin-top: var(--space-3);
+}
+.cat-subpanel > .cat-subpanel-label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+  display: block;
 }
 
 /* Inline intro preview panel */

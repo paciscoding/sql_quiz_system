@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -259,6 +260,199 @@ func (ctrl *UserController) ResetPassword(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"generated_password": password, "email_requested": body.EmailPassword})
+}
+
+// bulkResetPasswordRequest is the body for POST
+// /api/v1/users/bulk-reset-password (ARCH-031 (2)). BatchSize is a pointer so
+// an OMITTED field (-> default 100) can be distinguished from an explicit 0
+// (-> clamped to 1); every opaque token field is decoded by the handler, not
+// by JSON binding, so a malformed token yields a clean 400 rather than a
+// bind-time panic/500.
+type bulkResetPasswordRequest struct {
+	Mode        string   `json:"mode"`
+	UserIDs     []string `json:"user_ids"`
+	ExamID      string   `json:"exam_id"`
+	Confirm     string   `json:"confirm"`
+	AfterUserID string   `json:"after_user_id"`
+	BatchSize   *int     `json:"batch_size"`
+}
+
+// BulkResetPassword handles POST /api/v1/users/bulk-reset-password
+// (Admin only — route registration itself is a later wave's cmd/main.go
+// TODO; this handler is complete and ready to be wired in). It resets a
+// batch of STUDENT accounts selected by one of three modes (ARCH-031/032):
+// explicit ids, all_students, or exam_roster. Every validation below runs
+// BEFORE any write, in the order ARCH-031 (2) specifies: the confirmation
+// phrase, the mode enum, mode/field agreement, the user_ids cap, then
+// batch_size clamping. mode=="ids" additionally aborts the WHOLE request
+// before any write when any supplied id does not resolve to a STUDENT
+// (ARCH-031 (3) / ARCH-032 S2) — this is what makes "reset everyone
+// including the admins" impossible through this endpoint: staff and admin
+// accounts (including the actor's own) can only be reset via the existing
+// single-user /users/:id/reset-password route.
+func (ctrl *UserController) BulkResetPassword(c *gin.Context) {
+	userVal, _ := c.Get("user")
+	actor := userVal.(models.User)
+
+	var req bulkResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// S3: the literal confirmation phrase is required on EVERY request,
+	// including continuation batches carrying after_user_id. The server never
+	// trusts the UI's own confirm-gate for this.
+	if req.Confirm != "RESET" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation_required"})
+		return
+	}
+
+	switch req.Mode {
+	case "ids", "all_students", "exam_roster":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown mode"})
+		return
+	}
+
+	// Mode/field agreement: the mode is an explicit enum, never inferred from
+	// which optional field happens to be present (ARCH-031 (1)).
+	switch req.Mode {
+	case "ids":
+		if len(req.UserIDs) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user_ids is required for mode=ids"})
+			return
+		}
+		if req.ExamID != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "exam_id must not be set for mode=ids"})
+			return
+		}
+	case "all_students":
+		if len(req.UserIDs) != 0 || req.ExamID != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user_ids/exam_id must not be set for mode=all_students"})
+			return
+		}
+	case "exam_roster":
+		if req.ExamID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "exam_id is required for mode=exam_roster"})
+			return
+		}
+		if len(req.UserIDs) != 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user_ids must not be set for mode=exam_roster"})
+			return
+		}
+	}
+
+	if len(req.UserIDs) > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too_many_ids"})
+		return
+	}
+
+	// batch_size: default 100, hard clamp [1,200] (ARCH-031 (2)/(6), OQ-4).
+	batchSize := 100
+	if req.BatchSize != nil {
+		batchSize = *req.BatchSize
+	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	if batchSize > 200 {
+		batchSize = 200
+	}
+
+	userIDs := make([]int, 0, len(req.UserIDs))
+	for _, token := range req.UserIDs {
+		id, err := publicid.Decode(publicid.TypeUser, token)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_ids token"})
+			return
+		}
+		userIDs = append(userIDs, id)
+	}
+
+	examID := 0
+	if req.ExamID != "" {
+		id, err := publicid.Decode(publicid.TypeExam, req.ExamID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid exam_id"})
+			return
+		}
+		examID = id
+	}
+
+	afterID := 0
+	if req.AfterUserID != "" {
+		id, err := publicid.Decode(publicid.TypeUser, req.AfterUserID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid after_user_id"})
+			return
+		}
+		afterID = id
+	}
+
+	ctx := c.Request.Context()
+
+	// S2 hard rule: mode=="ids" can never touch a non-STUDENT row. Abort the
+	// WHOLE request before any write when even one supplied id doesn't resolve
+	// to an existing STUDENT.
+	if req.Mode == "ids" {
+		badIDs, err := ctrl.authService.NonStudentUserIDs(ctx, userIDs)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if len(badIDs) > 0 {
+			badTokens := make([]string, len(badIDs))
+			for i, id := range badIDs {
+				badTokens[i] = publicid.Encode(publicid.TypeUser, id)
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": "non_student_target", "user_ids": badTokens})
+			return
+		}
+	}
+
+	targets, repoRemaining, err := ctrl.authService.ResolveBulkResetTargets(ctx, req.Mode, userIDs, examID, afterID, batchSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	results, failures := ctrl.authService.BulkResetPasswords(ctx, actor, targets)
+
+	remaining := repoRemaining - len(targets)
+	if remaining < 0 {
+		remaining = 0
+	}
+	var nextAfterUserID interface{}
+	if remaining > 0 && len(targets) > 0 {
+		nextAfterUserID = publicid.Encode(publicid.TypeUser, targets[len(targets)-1].UserID)
+	}
+
+	// S6: exactly one structured audit line per request, naming the actor,
+	// mode, counts and the internal ids of the affected set. NEVER a
+	// password, a hash, or a ciphertext.
+	affectedIDs := make([]int, len(targets))
+	for i, t := range targets {
+		affectedIDs[i] = t.UserID
+	}
+	log.Printf("audit: bulk_password_reset actor=%q actor_id=%d mode=%s exam_id=%d requested=%d succeeded=%d failed=%d user_ids=%v",
+		actor.Username, actor.ID, req.Mode, examID, len(targets), len(results), len(failures), affectedIDs)
+
+	// S7: POST-only (never GET) and no-store, so a credential dump can never
+	// land in a URL, browser history, proxy access log, or be replayed from
+	// a cache.
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		"mode":               req.Mode,
+		"processed":          len(targets),
+		"succeeded":          len(results),
+		"failed":             len(failures),
+		"remaining":          remaining,
+		"next_after_user_id": nextAfterUserID,
+		"key_configured":     ctrl.authService.KeyConfigured(),
+		"results":            results,
+		"failures":           failures,
+	})
 }
 
 // ResendCredential handles POST /api/v1/users/:id/resend-credential (Admin only).

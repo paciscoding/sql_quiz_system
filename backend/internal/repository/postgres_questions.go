@@ -36,17 +36,40 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 	var expectedResult, expectedCols []byte
 	var expectedRowsAffected *int
 
-	// Resolve the exam's curriculum schema so capture runs against the right
-	// database. Defaults to 'public' for practice questions (ExamID == nil) and
-	// for exam questions that haven't had a per-exam import yet. This preserves
-	// the historic capture behaviour byte-for-byte when curriculum_schema='public'.
+	// Resolve the schema capture runs against. Defaults to 'public' for
+	// practice questions (ExamID == nil) and for exam questions that haven't
+	// had a per-exam import yet. This preserves the historic capture
+	// behaviour byte-for-byte when curriculum_schema='public'.
+	//
+	// ARCH-028 (5): when the question has a category, that category's schema
+	// wins over the exam curriculum — a foreign category id (one that does not
+	// belong to this exam) is REJECTED outright rather than silently falling
+	// back to the exam curriculum, because capturing the model answer against
+	// the wrong database would produce an expected_result the student can
+	// never legitimately reproduce.
 	captureSchema := "public"
 	if q.ExamID != nil {
-		var cs string
-		if err := r.pool.QueryRow(ctx,
-			`SELECT COALESCE(NULLIF(curriculum_schema, ''), 'public')
-			 FROM app.examinations WHERE id = $1`, *q.ExamID).Scan(&cs); err == nil && cs != "" {
-			captureSchema = cs
+		if q.CategoryID != nil {
+			var cs string
+			err := r.pool.QueryRow(ctx,
+				`SELECT schema_name FROM app.exam_categories WHERE id = $1 AND exam_id = $2`,
+				int(*q.CategoryID), int(*q.ExamID)).Scan(&cs)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return 0, ErrExamCategoryMismatch
+				}
+				return 0, err
+			}
+			if cs != "" {
+				captureSchema = cs
+			}
+		} else {
+			var cs string
+			if err := r.pool.QueryRow(ctx,
+				`SELECT COALESCE(NULLIF(curriculum_schema, ''), 'public')
+				 FROM app.examinations WHERE id = $1`, *q.ExamID).Scan(&cs); err == nil && cs != "" {
+				captureSchema = cs
+			}
 		}
 	}
 
@@ -145,23 +168,23 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 			exam_id, target_table, correct_sql, question_type, points, requirement,
 			strict_ordering, strict_attributes, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, updated_at
+			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, category_id, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, $15, $16, NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, $15, $16, $17, NOW())
 		RETURNING id`
 		err = r.pool.QueryRow(ctx, insertQ,
 			q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
 			q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
-			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema).Scan(&newID)
+			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema, q.CategoryID).Scan(&newID)
 	} else {
 		const upsertQ = `
 		INSERT INTO app.questions (
 			id, exam_id, target_table, correct_sql, question_type, points, requirement,
 			strict_ordering, strict_attributes, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, updated_at
+			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, category_id, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15, $16, $17, NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15, $16, $17, $18, NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			exam_id = EXCLUDED.exam_id,
 			target_table = EXCLUDED.target_table,
@@ -179,12 +202,13 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 			capture_error = EXCLUDED.capture_error,
 			expected_rows_affected = EXCLUDED.expected_rows_affected,
 			dual_schema = EXCLUDED.dual_schema,
+			category_id = EXCLUDED.category_id,
 			updated_at = NOW()
 		RETURNING id`
 		err = r.pool.QueryRow(ctx, upsertQ,
 			q.ID, q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
 			q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
-			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema).Scan(&newID)
+			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema, q.CategoryID).Scan(&newID)
 	}
 
 	return newID, err
@@ -195,7 +219,7 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 // this signature; new callers that want per-exam curriculum resolution should
 // call PreviewCorrectSQLInSchema instead.
 func (r *PostgresRepository) PreviewCorrectSQL(ctx context.Context, qType, targetTable, sqlText string) ([]map[string]interface{}, error) {
-	return r.PreviewCorrectSQLInSchema(ctx, qType, targetTable, sqlText, 0, false)
+	return r.PreviewCorrectSQLInSchema(ctx, qType, targetTable, sqlText, 0, 0, false)
 }
 
 // PreviewCorrectSQLInSchema dry-runs the lecturer's correct SQL inside a
@@ -208,14 +232,23 @@ func (r *PostgresRepository) PreviewCorrectSQL(ctx context.Context, qType, targe
 // instead of 'public'. An absent exam_id (legacy / global schema) keeps the
 // existing 'public' behaviour byte-for-byte.
 //
-// useDecoy: when true and examID > 0, previews against the exam's decoy
-// preview_curriculum_schema (dual-schema grading, ARCH-005) instead of the
-// real curriculum_schema — the lecturer's "Preview as student" view. Errors
-// immediately if no decoy has been imported for the exam, rather than falling
-// back to 'public' or the real curriculum (which would leak grading schema B
-// under a "student" preview). When useDecoy is false, behaviour is
-// byte-for-byte identical to before this parameter existed.
-func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qType, targetTable, sqlText string, examID int, useDecoy bool) ([]map[string]interface{}, error) {
+// categoryID: optional exam category id (0 or negative = absent). When
+// present and > 0, ARCH-028 (5): the category's own schema wins over the exam
+// curriculum, with the same (id, exam_id) ownership check CreateQuestion
+// applies — a category id that does not belong to examID returns
+// ErrExamCategoryMismatch rather than silently falling back to the exam
+// curriculum. When categoryID is absent (0), the exam/public resolution below
+// runs byte-for-byte as before this parameter existed.
+//
+// useDecoy: when true and examID > 0 (and no category, or a category whose
+// preview_schema_name is set), previews against the decoy preview curriculum
+// (dual-schema grading, ARCH-005) instead of the real curriculum_schema — the
+// lecturer's "Preview as student" view. Errors immediately if no decoy has
+// been imported for the exam/category, rather than falling back to 'public'
+// or the real curriculum (which would leak grading schema B under a
+// "student" preview). When useDecoy is false, behaviour is byte-for-byte
+// identical to before this parameter existed.
+func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qType, targetTable, sqlText string, examID int, categoryID int, useDecoy bool) ([]map[string]interface{}, error) {
 	if sqlText == "" {
 		return nil, fmt.Errorf("sql text is empty")
 	}
@@ -230,7 +263,26 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 	// Resolve the schema to preview against. Defaults to 'public' when examID
 	// is absent (0) or when the exam hasn't had a per-exam import yet.
 	var previewSchema string
-	if useDecoy && examID > 0 {
+	if categoryID > 0 {
+		var schemaName, previewSchemaName string
+		err := r.pool.QueryRow(ctx,
+			`SELECT schema_name, preview_schema_name FROM app.exam_categories WHERE id = $1 AND exam_id = $2`,
+			categoryID, examID).Scan(&schemaName, &previewSchemaName)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrExamCategoryMismatch
+			}
+			return nil, err
+		}
+		if useDecoy {
+			if previewSchemaName == "" {
+				return nil, fmt.Errorf("no decoy schema uploaded for this category")
+			}
+			previewSchema = previewSchemaName
+		} else {
+			previewSchema = schemaName
+		}
+	} else if useDecoy && examID > 0 {
 		decoy, err := r.GetExamPreviewCurriculumSchema(ctx, examID)
 		if err != nil {
 			return nil, err
@@ -293,16 +345,20 @@ func (r *PostgresRepository) GetQuestion(ctx context.Context, id int) (models.Qu
 	// LEFT JOIN app.examinations to resolve the exam's curriculum_schema. When
 	// the question is a practice question (exam_id IS NULL) or the exam has not
 	// had a per-exam import (curriculum_schema = 'public'), COALESCE returns
-	// 'public' — exactly the pre-feature behaviour.
+	// 'public' — exactly the pre-feature behaviour. LEFT JOIN app.exam_categories
+	// additionally resolves the question's category, when it has one — it stays
+	// the no-category fallback (ARCH-028).
 	query := `
 		SELECT q.id, q.exam_id, q.target_table, q.correct_sql, q.question_type, q.points, q.requirement,
 		       q.strict_ordering, q.strict_attributes, q.strict_column_order,
 		       q.expected_result, q.expected_columns, q.expected_result_status,
 		       q.expected_result_captured_at, q.capture_error, q.expected_rows_affected,
 		       q.created_by, q.created_at, q.updated_at, q.dual_schema,
-		       COALESCE(e.curriculum_schema, 'public') AS curriculum_schema
+		       COALESCE(e.curriculum_schema, 'public') AS curriculum_schema,
+		       q.category_id, COALESCE(ec.name, ''), COALESCE(ec.schema_name, ''), COALESCE(ec.preview_schema_name, '')
 		FROM app.questions q
 		LEFT JOIN app.examinations e ON e.id = q.exam_id
+		LEFT JOIN app.exam_categories ec ON ec.id = q.category_id
 		WHERE q.id = $1`
 
 	var q models.Question
@@ -312,19 +368,29 @@ func (r *PostgresRepository) GetQuestion(ctx context.Context, id int) (models.Qu
 		&q.ExpectedResult, &q.ExpectedColumns, &q.ExpectedResultStatus,
 		&q.ExpectedResultCapturedAt, &q.CaptureError, &q.ExpectedRowsAffected,
 		&q.CreatedBy, &q.CreatedAt, &q.UpdatedAt, &q.DualSchema,
-		&q.CurriculumSchema)
+		&q.CurriculumSchema,
+		&q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.CategoryPreviewSchema)
 
 	return q, err
 }
 
 func (r *PostgresRepository) GetQuestionsByExamID(ctx context.Context, examID int) ([]models.Question, error) {
+	// LEFT JOIN app.exam_categories resolves each question's category for
+	// display (category_id/category_name) and for the evaluator's schema
+	// resolution (category_schema/category_preview_schema, both json:"-").
+	// ORDER BY groups categorised questions contiguously (name ASC), with
+	// uncategorised questions sorted last (ARCH-028 (2)(b) / ARCH-030).
 	query := `
-		SELECT id, exam_id, target_table, correct_sql, question_type, points, requirement,
-		       strict_ordering, strict_attributes, strict_column_order,
-		       expected_result, expected_columns, expected_result_status,
-		       expected_result_captured_at, capture_error, expected_rows_affected,
-		       created_by, created_at, updated_at, dual_schema
-		FROM app.questions WHERE exam_id = $1`
+		SELECT q.id, q.exam_id, q.target_table, q.correct_sql, q.question_type, q.points, q.requirement,
+		       q.strict_ordering, q.strict_attributes, q.strict_column_order,
+		       q.expected_result, q.expected_columns, q.expected_result_status,
+		       q.expected_result_captured_at, q.capture_error, q.expected_rows_affected,
+		       q.created_by, q.created_at, q.updated_at, q.dual_schema,
+		       q.category_id, COALESCE(ec.name, ''), COALESCE(ec.schema_name, ''), COALESCE(ec.preview_schema_name, '')
+		FROM app.questions q
+		LEFT JOIN app.exam_categories ec ON ec.id = q.category_id
+		WHERE q.exam_id = $1
+		ORDER BY (q.category_id IS NULL) ASC, ec.name ASC, q.id ASC`
 
 	rows, err := r.pool.Query(ctx, query, examID)
 	if err != nil {
@@ -340,7 +406,8 @@ func (r *PostgresRepository) GetQuestionsByExamID(ctx context.Context, examID in
 			&q.StrictMode.Ordering, &q.StrictMode.Attributes, &q.StrictMode.ColumnOrder,
 			&q.ExpectedResult, &q.ExpectedColumns, &q.ExpectedResultStatus,
 			&q.ExpectedResultCapturedAt, &q.CaptureError, &q.ExpectedRowsAffected,
-			&q.CreatedBy, &q.CreatedAt, &q.UpdatedAt, &q.DualSchema)
+			&q.CreatedBy, &q.CreatedAt, &q.UpdatedAt, &q.DualSchema,
+			&q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.CategoryPreviewSchema)
 		if err != nil {
 			return nil, err
 		}

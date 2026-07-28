@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch, nextTick } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import {
   lecturerListQuestions,
   upsertQuestion,
@@ -29,6 +29,7 @@ import FieldError from './FieldError.vue'
 import Spinner from './Spinner.vue'
 import { useAutosave } from '../composables/useAutosave'
 import IntroImagesEditor from './IntroImagesEditor.vue'
+import CollapsibleCard from './CollapsibleCard.vue'
 
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
@@ -57,20 +58,7 @@ const previewAsStudentLoading = ref(false)
 const previewAsStudentError = ref('')
 
 // --- Category management panel state ---
-const showCategoryPanel = ref(false)
-const categoryPanelRef = ref<HTMLElement | null>(null)
 const newCategoryName = ref('')
-
-// The panel renders as the last card on the page (below the create/edit form),
-// so on open we scroll it into view — otherwise clicking the button appears to
-// do nothing because the panel opens below the fold.
-const toggleCategoryPanel = async () => {
-  showCategoryPanel.value = !showCategoryPanel.value
-  if (showCategoryPanel.value) {
-    await nextTick()
-    categoryPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }
-}
 const importCategoryId = ref<string | null>(null)
 const importSql = ref('')
 
@@ -483,316 +471,314 @@ onMounted(() => {
       <p class="page-subtitle">Maintain practice categories, import per-category schemas, and author practice questions.</p>
     </div>
     <BackLink to="/lecturer" label="Back to Lecturer Dashboard" />
-    <!-- Section A: Question List -->
-    <div class="card" style="margin-bottom: var(--space-4);">
-      <h2>Practice Questions</h2>
-      <div v-if="questions.length === 0" class="muted">No questions yet.</div>
-      <table v-else class="data-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Title</th>
-            <th>Category</th>
-            <th>Requirement</th>
-            <th>Type</th>
-            <th>Points</th>
-            <th>Status</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="q in questions" :key="q.id">
-            <td>{{ q.id }}</td>
-            <td>{{ q.title || '—' }}</td>
-            <td style="font-weight: 700; font-size: 0.8rem;">{{ q.category_name || categoryNameById[q.category_id] || q.category }}</td>
-            <td>{{ q.requirement }}</td>
-            <td>
-              <span class="badge badge-info">{{ q.question_type }}</span>
-            </td>
-            <td>{{ q.points }}</td>
-            <td>
-              <span 
-                class="badge" 
-                :class="{
-                  'badge-success': q.expected_result_status === 'captured',
-                  'badge-warning': q.expected_result_status === 'pending',
-                  'badge-danger': q.expected_result_status === 'failed'
-                }"
-              >
-                {{ q.expected_result_status }}
-              </span>
-            </td>
-            <td>
-              <div style="display: flex; gap: var(--space-1);">
-                <button class="btn btn-secondary btn-sm" @click="editQuestion(q)">Edit</button>
-                <button class="btn btn-secondary btn-sm" :disabled="deleteQuestionLoading" @click="handleDelete(q.id)">Delete</button>
-              </div>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
 
-
-    <!-- Section B: Manage Categories -->
-    <div v-if="showCategoryPanel" class="card" ref="categoryPanelRef">
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h2 style="margin: 0;">{{ UI_COPY.MANAGE_CATEGORIES }}</h2>
-        <button class="btn btn-secondary btn-sm" @click="showCategoryPanel = false">Close</button>
-      </div>
-      <p class="muted">Each category owns its own database (schema), kept separate from exams. Import a <code>.sql</code> per category.</p>
-
-      <!-- New category -->
-      <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">
-        <input v-model="newCategoryName" class="input" placeholder="New category name" style="flex: 1;" @keyup.enter="addCategory" />
-        <button class="btn btn-primary" :disabled="addCategoryLoading || !newCategoryName.trim()" @click="addCategory">
-          {{ UI_COPY.NEW_CATEGORY }}
-        </button>
+    <!-- UPPER section: Practice Questions list + Create/Edit form. Behaviour unchanged from before the split. -->
+    <section class="authoring-section authoring-section--upper">
+      <!-- Section A: Question List -->
+      <div class="card" style="margin-bottom: var(--space-4);">
+        <h2>Practice Questions</h2>
+        <div v-if="questions.length === 0" class="muted">No questions yet.</div>
+        <table v-else class="data-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Title</th>
+              <th>Category</th>
+              <th>Requirement</th>
+              <th>Type</th>
+              <th>Points</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="q in questions" :key="q.id">
+              <td>{{ q.id }}</td>
+              <td>{{ q.title || '—' }}</td>
+              <td style="font-weight: 700; font-size: 0.8rem;">{{ q.category_name || categoryNameById[q.category_id] || q.category }}</td>
+              <td>{{ q.requirement }}</td>
+              <td>
+                <span class="badge badge-info">{{ q.question_type }}</span>
+              </td>
+              <td>{{ q.points }}</td>
+              <td>
+                <span
+                  class="badge"
+                  :class="{
+                    'badge-success': q.expected_result_status === 'captured',
+                    'badge-warning': q.expected_result_status === 'pending',
+                    'badge-danger': q.expected_result_status === 'failed'
+                  }"
+                >
+                  {{ q.expected_result_status }}
+                </span>
+              </td>
+              <td>
+                <div style="display: flex; gap: var(--space-1);">
+                  <button class="btn btn-secondary btn-sm" @click="editQuestion(q)">Edit</button>
+                  <button class="btn btn-secondary btn-sm" :disabled="deleteQuestionLoading" @click="handleDelete(q.id)">Delete</button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
-      <!-- Per-category card stack -->
-      <div v-if="categories.length > 0">
-        <div v-for="c in categories" :key="c.id" class="category-card">
-          <!-- Card header -->
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <div style="display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap;">
-              <h3 style="margin: 0;">{{ c.name }}</h3>
-              <code>{{ c.schema_name }}</code>
-              <span class="muted" style="font-size: 0.8rem;">{{ c.question_count }} questions</span>
-            </div>
-            <div style="display: flex; gap: var(--space-1); flex-wrap: wrap;">
-              <button class="btn btn-secondary btn-sm" @click="doRenameCategory(c)">{{ UI_COPY.RENAME_CATEGORY }}</button>
-              <button class="btn btn-secondary btn-sm" @click="openImport(c)">{{ UI_COPY.IMPORT_CATEGORY_DB }}</button>
-              <button class="btn btn-secondary btn-sm" @click="openImportPreview(c)">Import Decoy Schema</button>
-              <button class="btn btn-secondary btn-sm" @click="doDeleteCategory(c)" style="border-color: var(--color-danger); color: var(--color-danger);">{{ UI_COPY.DELETE_CATEGORY }}</button>
-            </div>
+      <!-- Section C: Create/Edit Form -->
+      <div class="card" style="margin-bottom: var(--space-4);" ref="formRef">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4);">
+          <div style="display: flex; align-items: center; gap: var(--space-3);">
+            <h2 style="margin: 0;">{{ form.id ? 'Edit' : 'Create' }} Practice Question</h2>
+            <span v-if="form.id" class="badge badge-info" style="font-size: 0.8rem;">Editing #{{ form.id }}</span>
+            <span v-else class="muted" style="font-size: 0.85rem;">New question</span>
           </div>
-
-          <!-- Database schema sub-panel -->
-          <div class="cat-subpanel">
-            <span class="cat-subpanel-label">Database schema</span>
-            <div v-if="importCategoryId === c.id">
-              <h3>Import database into "{{ c.name }}"</h3>
-              <p class="muted">Upload a <code>.sql</code> file or paste a SQL script, using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
-              <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
-                <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
-                  Choose .sql file
-                  <input type="file" accept=".sql,text/plain,application/sql" @change="loadSqlFile" style="display: none;" />
-                </label>
-                <span v-if="importFileName" class="muted">Loaded: <code>{{ importFileName }}</code> — review or edit below, then import.</span>
-              </div>
-              <SqlEditor v-model="importSql" height="200px" />
-              <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
-                <button class="btn btn-primary" :disabled="importLoading || !importSql.trim()" @click="doImport">
-                  <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : UI_COPY.IMPORT_CATEGORY_DB }}
-                </button>
-                <button class="btn btn-secondary" @click="cancelImport">Cancel</button>
-              </div>
-            </div>
-            <p v-else class="muted" style="margin: 0;">Import a .sql to (re)load this category's database.</p>
-          </div>
-
-          <!-- Decoy database schema sub-panel (preview only — same tables/columns as
-               the grading schema above, different data; used by dual-schema questions
-               so the student's preview never leaks the grading data). -->
-          <div class="cat-subpanel">
-            <span class="cat-subpanel-label">Decoy database schema (preview only)</span>
-            <div v-if="importPreviewCategoryId === c.id">
-              <h3>Import decoy database into "{{ c.name }}"</h3>
-              <p class="muted">Upload a <code>.sql</code> file or paste a SQL script with the same tables and columns as the grading database above, but different data. Students previewing a dual-schema question see this data instead of the real grading data.</p>
-              <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
-                <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
-                  Choose .sql file
-                  <input type="file" accept=".sql,text/plain,application/sql" @change="loadPreviewSqlFile" style="display: none;" />
-                </label>
-                <span v-if="importPreviewFileName" class="muted">Loaded: <code>{{ importPreviewFileName }}</code> — review or edit below, then import.</span>
-              </div>
-              <SqlEditor v-model="importPreviewSql" height="200px" />
-              <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
-                <button class="btn btn-primary" :disabled="importPreviewLoading || !importPreviewSql.trim()" @click="doImportPreview">
-                  <Spinner v-if="importPreviewLoading" size="sm" inline :invert="true" />{{ importPreviewLoading ? 'Importing' : 'Import Decoy Schema' }}
-                </button>
-                <button class="btn btn-secondary" @click="cancelImportPreview">Cancel</button>
-              </div>
-            </div>
-            <p v-else class="muted" style="margin: 0;">
-              {{ c.has_preview_schema ? 'Decoy schema loaded — used for dual-schema question previews.' : 'Import a decoy .sql (same structure, different data) to enable dual-schema previews for this category.' }}
-            </p>
-          </div>
-
-          <!-- Description sub-panel -->
-          <div class="cat-subpanel">
-            <span class="cat-subpanel-label">Description (shown to students on the intro page)</span>
-            <div style="display: flex; gap: var(--space-2); align-items: flex-end;">
-              <textarea
-                v-model="categoryIntroEdits[c.id]"
-                class="input"
-                rows="3"
-                style="flex: 1; resize: vertical; min-height: 60px;"
-                :placeholder="'Write a description for the ' + c.name + ' category...'"
-              ></textarea>
-              <button
-                class="btn btn-primary btn-sm"
-                :disabled="categoryIntroSaving[c.id]"
-                @click="saveCategoryIntro(c)"
-                style="white-space: nowrap;"
-              >{{ categoryIntroSaving[c.id] ? 'Saving...' : 'Save Description' }}</button>
-            </div>
-          </div>
-
-          <!-- Introduction images sub-panel -->
-          <div class="cat-subpanel">
-            <span class="cat-subpanel-label">Introduction images</span>
-            <IntroImagesEditor scope="category" :owner-id="c.id" />
+          <div style="display: flex; gap: var(--space-2);">
+            <!-- New Practice Question is disabled when already in create mode (no form.id) -->
+            <button class="btn btn-primary" :disabled="!form.id" @click="newPracticeQuestion">
+              New Practice Question
+            </button>
+            <button class="btn btn-secondary" @click="resetForm">Reset Form</button>
           </div>
         </div>
-      </div>
-      <p v-else class="muted">No categories yet. Create one above.</p>
-    </div>
-    
-    <!-- Section C: Create/Edit Form -->
-    <div class="card" style="margin-bottom: var(--space-4);" ref="formRef">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4);">
-        <div style="display: flex; align-items: center; gap: var(--space-3);">
-          <h2 style="margin: 0;">{{ form.id ? 'Edit' : 'Create' }} Practice Question</h2>
-          <span v-if="form.id" class="badge badge-info" style="font-size: 0.8rem;">Editing #{{ form.id }}</span>
-          <span v-else class="muted" style="font-size: 0.85rem;">New question</span>
-        </div>
-        <div style="display: flex; gap: var(--space-2);">
-          <!-- New Practice Question is disabled when already in create mode (no form.id) -->
-          <button class="btn btn-primary" :disabled="!form.id" @click="newPracticeQuestion">
-            New Practice Question
-          </button>
-          <button class="btn btn-secondary" @click="resetForm">Reset Form</button>
-        </div>
-      </div>
 
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4);">
-        <div class="field">
-          <label>Category</label>
-          <div style="display: flex; gap: var(--space-2); align-items: center;">
-            <select v-model="form.category_id" class="input" style="flex: 1;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4);">
+          <div class="field">
+            <label>Category</label>
+            <select v-model="form.category_id" class="input">
               <option v-if="categories.length === 0" :value="undefined" disabled>No categories — create one</option>
               <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
             </select>
-            <button type="button" class="btn btn-secondary btn-sm" @click="toggleCategoryPanel">
-              {{ UI_COPY.MANAGE_CATEGORIES }}
-            </button>
+          </div>
+          <div class="field">
+            <label>Question Type</label>
+            <select v-model="form.question_type" class="input">
+              <option value="QUERY">QUERY</option>
+              <option value="DML">DML</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Title <span class="muted">(optional — shown to students instead of a category ordinal)</span></label>
+            <input v-model="form.title" class="input" placeholder="e.g. Employees hired after 2020" />
+          </div>
+          <div class="field">
+            <label>Target Table (DML only)</label>
+            <input v-model="form.target_table" class="input" placeholder="e.g. employee" />
+          </div>
+          <div v-if="showDraftBanner" class="draft-banner">
+            A draft from your previous session is available.
+            <button type="button" class="btn btn-sm" @click="acceptDraft">Restore</button>
+            <button type="button" class="btn btn-sm" @click="dismissDraft">Discard</button>
+          </div>
+          <div class="field" style="grid-column: span 2;">
+            <label>Requirement</label>
+            <textarea v-model="form.requirement" class="input" rows="3"
+              :aria-invalid="practiceForm.touched.requirement && !!practiceForm.errors.requirement"
+              aria-describedby="err-practice-req"
+              @blur="practiceForm.markTouched('requirement')"
+            ></textarea>
+            <FieldError :message="practiceForm.touched.requirement ? practiceForm.errors.requirement : ''" id="err-practice-req" />
+          </div>
+          <div class="field">
+            <label>Points</label>
+            <input type="number" v-model.number="form.points" class="input" step="0.1" />
+          </div>
+          <div v-if="form.question_type !== 'DML'" class="field" style="display: flex; flex-direction: row; gap: var(--space-4); align-items: flex-end;">
+            <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
+              <input type="checkbox" v-model="form.strict_ordering" /> Strict Ordering
+            </label>
+            <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
+              <input type="checkbox" v-model="form.strict_attrs" /> Strict Attrs
+            </label>
+            <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
+              <input type="checkbox" v-model="form.strict_column_order" /> Strict Column Order
+            </label>
+          </div>
+          <div v-else class="field muted" style="align-self: flex-end;">
+            DML answers are graded on the final table contents as an unordered set of rows, matched by column name. Ordering and column-order options do not apply.
+          </div>
+          <!-- Dual schema applies to both QUERY and DML, so it lives outside the
+               question_type v-if/v-else pair above. -->
+          <div class="field" style="display: flex; flex-direction: column; gap: var(--space-1); align-self: flex-end;">
+            <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
+              <input type="checkbox" v-model="form.dual_schema" /> Dual schema (hidden grading)
+            </label>
+            <!-- Independent, client-only validation (spec §6.1): no network round-trip,
+                 purely reactive to form.dual_schema + selectedCategoryHasDecoy. -->
+            <span v-if="form.dual_schema && !selectedCategoryHasDecoy" class="badge badge-warning" style="display: inline-block; font-weight: 600;">
+              Dual schema is enabled but this category has no decoy schema yet - previews will use the grading schema until you upload one.
+            </span>
           </div>
         </div>
-        <div class="field">
-          <label>Question Type</label>
-          <select v-model="form.question_type" class="input">
-            <option value="QUERY">QUERY</option>
-            <option value="DML">DML</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Title <span class="muted">(optional — shown to students instead of a category ordinal)</span></label>
-          <input v-model="form.title" class="input" placeholder="e.g. Employees hired after 2020" />
-        </div>
-        <div class="field">
-          <label>Target Table (DML only)</label>
-          <input v-model="form.target_table" class="input" placeholder="e.g. employee" />
-        </div>
-        <div v-if="showDraftBanner" class="draft-banner">
-          A draft from your previous session is available.
-          <button type="button" class="btn btn-sm" @click="acceptDraft">Restore</button>
-          <button type="button" class="btn btn-sm" @click="dismissDraft">Discard</button>
-        </div>
-        <div class="field" style="grid-column: span 2;">
-          <label>Requirement</label>
-          <textarea v-model="form.requirement" class="input" rows="3"
-            :aria-invalid="practiceForm.touched.requirement && !!practiceForm.errors.requirement"
-            aria-describedby="err-practice-req"
-            @blur="practiceForm.markTouched('requirement')"
-          ></textarea>
-          <FieldError :message="practiceForm.touched.requirement ? practiceForm.errors.requirement : ''" id="err-practice-req" />
-        </div>
-        <div class="field">
-          <label>Points</label>
-          <input type="number" v-model.number="form.points" class="input" step="0.1" />
-        </div>
-        <div v-if="form.question_type !== 'DML'" class="field" style="display: flex; flex-direction: row; gap: var(--space-4); align-items: flex-end;">
-          <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
-            <input type="checkbox" v-model="form.strict_ordering" /> Strict Ordering
-          </label>
-          <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
-            <input type="checkbox" v-model="form.strict_attrs" /> Strict Attrs
-          </label>
-          <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
-            <input type="checkbox" v-model="form.strict_column_order" /> Strict Column Order
-          </label>
-        </div>
-        <div v-else class="field muted" style="align-self: flex-end;">
-          DML answers are graded on the final table contents as an unordered set of rows, matched by column name. Ordering and column-order options do not apply.
-        </div>
-        <!-- Dual schema applies to both QUERY and DML, so it lives outside the
-             question_type v-if/v-else pair above. -->
-        <div class="field" style="display: flex; flex-direction: column; gap: var(--space-1); align-self: flex-end;">
-          <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
-            <input type="checkbox" v-model="form.dual_schema" /> Dual schema (hidden grading)
-          </label>
-          <!-- Independent, client-only validation (spec §6.1): no network round-trip,
-               purely reactive to form.dual_schema + selectedCategoryHasDecoy. -->
-          <span v-if="form.dual_schema && !selectedCategoryHasDecoy" class="badge badge-warning" style="display: inline-block; font-weight: 600;">
-            Dual schema is enabled but this category has no decoy schema yet - previews will use the grading schema until you upload one.
-          </span>
-        </div>
-      </div>
 
-      <div class="field" style="margin-top: var(--space-4);">
-        <label>Correct SQL</label>
-        <SqlEditor 
-          :modelValue="form.correct_sql ?? ''" 
-          @update:modelValue="form.correct_sql = $event" 
-          height="200px" 
-        />
-        <FieldError id="practice-correct-sql-error" :message="practiceForm.touched.correct_sql ? practiceForm.errors.correct_sql : ''" />
-      </div>
+        <div class="field" style="margin-top: var(--space-4);">
+          <label>Correct SQL</label>
+          <SqlEditor
+            :modelValue="form.correct_sql ?? ''"
+            @update:modelValue="form.correct_sql = $event"
+            height="200px"
+          />
+          <FieldError id="practice-correct-sql-error" :message="practiceForm.touched.correct_sql ? practiceForm.errors.correct_sql : ''" />
+        </div>
 
-      <div style="display: flex; gap: var(--space-2); margin-top: var(--space-4);">
-        <button 
-          class="btn btn-primary" 
-          @click="saveQuestion" 
-          :disabled="saveQuestionLoading"
-        >
-          <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : 'Save Question' }}
-        </button>
-        <button
-          class="btn btn-secondary"
-          @click="handlePreview"
-          :disabled="previewLoading"
-        >
-          {{ previewLoading ? 'Running...' : 'Preview' }}
-        </button>
-        <button
-          class="btn btn-secondary"
-          @click="handlePreviewAsStudent"
-          :disabled="previewAsStudentLoading"
-        >
-          {{ previewAsStudentLoading ? 'Running...' : 'Preview as Student' }}
-        </button>
-      </div>
+        <div style="display: flex; gap: var(--space-2); margin-top: var(--space-4);">
+          <button
+            class="btn btn-primary"
+            @click="saveQuestion"
+            :disabled="saveQuestionLoading"
+          >
+            <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : 'Save Question' }}
+          </button>
+          <button
+            class="btn btn-secondary"
+            @click="handlePreview"
+            :disabled="previewLoading"
+          >
+            {{ previewLoading ? 'Running...' : 'Preview' }}
+          </button>
+          <button
+            class="btn btn-secondary"
+            @click="handlePreviewAsStudent"
+            :disabled="previewAsStudentLoading"
+          >
+            {{ previewAsStudentLoading ? 'Running...' : 'Preview as Student' }}
+          </button>
+        </div>
 
-      <!-- Preview Results (grading schema B — same as the student's submit-time verdict source) -->
-      <div v-if="previewError" class="badge badge-danger" style="margin-top: var(--space-4); display: block; padding: var(--space-2); font-family: monospace;">
-        {{ previewError }}
-      </div>
-      <div v-if="previewRows.length > 0" style="margin-top: var(--space-4);">
-        <h3>Preview Results</h3>
-        <ResultTable :rows="previewRows" :columns="previewCols" />
-      </div>
+        <!-- Preview Results (grading schema B — same as the student's submit-time verdict source) -->
+        <div v-if="previewError" class="badge badge-danger" style="margin-top: var(--space-4); display: block; padding: var(--space-2); font-family: monospace;">
+          {{ previewError }}
+        </div>
+        <div v-if="previewRows.length > 0" style="margin-top: var(--space-4);">
+          <h3>Preview Results</h3>
+          <ResultTable :rows="previewRows" :columns="previewCols" />
+        </div>
 
-      <!-- Preview-as-student Results (decoy schema A — what the student actually sees for a dual-schema question) -->
-      <div v-if="previewAsStudentError" class="badge badge-danger" style="margin-top: var(--space-4); display: block; padding: var(--space-2); font-family: monospace;">
-        {{ previewAsStudentError }}
+        <!-- Preview-as-student Results (decoy schema A — what the student actually sees for a dual-schema question) -->
+        <div v-if="previewAsStudentError" class="badge badge-danger" style="margin-top: var(--space-4); display: block; padding: var(--space-2); font-family: monospace;">
+          {{ previewAsStudentError }}
+        </div>
+        <div v-if="previewAsStudentRows.length > 0" style="margin-top: var(--space-4);">
+          <h3>Preview Results (as student sees — decoy schema)</h3>
+          <ResultTable :rows="previewAsStudentRows" :columns="previewAsStudentCols" />
+        </div>
       </div>
-      <div v-if="previewAsStudentRows.length > 0" style="margin-top: var(--space-4);">
-        <h3>Preview Results (as student sees — decoy schema)</h3>
-        <ResultTable :rows="previewAsStudentRows" :columns="previewAsStudentCols" />
+    </section>
+
+    <!-- LOWER section: Categories Management. Always rendered — no show/hide toggle. -->
+    <section class="authoring-section authoring-section--lower" aria-labelledby="practice-categories-heading">
+      <div class="card">
+        <h2 id="practice-categories-heading">{{ UI_COPY.MANAGE_CATEGORIES }}</h2>
+        <p class="muted">Each category owns its own database (schema), kept separate from exams. Import a <code>.sql</code> per category.</p>
+
+        <!-- New category -->
+        <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">
+          <input v-model="newCategoryName" class="input" placeholder="New category name" style="flex: 1;" @keyup.enter="addCategory" />
+          <button class="btn btn-primary" :disabled="addCategoryLoading || !newCategoryName.trim()" @click="addCategory">
+            {{ UI_COPY.NEW_CATEGORY }}
+          </button>
+        </div>
+
+        <!-- Per-category collapsible cards -->
+        <div v-if="categories.length > 0">
+          <CollapsibleCard v-for="c in categories" :key="c.id" :title="c.name" :test-id="'category-' + c.id">
+            <template #header-meta>
+              <code>{{ c.schema_name }}</code>
+              <span class="muted" style="font-size: 0.8rem;">{{ c.question_count }} questions</span>
+              <span v-if="c.has_preview_schema" class="badge badge-info">decoy</span>
+            </template>
+            <template #header-actions>
+              <button class="btn btn-secondary btn-sm" @click="doRenameCategory(c)">{{ UI_COPY.RENAME_CATEGORY }}</button>
+              <button class="btn btn-secondary btn-sm" @click="doDeleteCategory(c)" style="border-color: var(--color-danger); color: var(--color-danger);">{{ UI_COPY.DELETE_CATEGORY }}</button>
+            </template>
+
+            <!-- Database schema sub-panel -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Database schema</span>
+              <div v-if="importCategoryId === c.id">
+                <h3>Import database into "{{ c.name }}"</h3>
+                <p class="muted">Upload a <code>.sql</code> file or paste a SQL script, using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
+                <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
+                  <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
+                    Choose .sql file
+                    <input type="file" accept=".sql,text/plain,application/sql" @change="loadSqlFile" style="display: none;" />
+                  </label>
+                  <span v-if="importFileName" class="muted">Loaded: <code>{{ importFileName }}</code> — review or edit below, then import.</span>
+                </div>
+                <SqlEditor v-model="importSql" height="200px" />
+                <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+                  <button class="btn btn-primary" :disabled="importLoading || !importSql.trim()" @click="doImport">
+                    <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : UI_COPY.IMPORT_CATEGORY_DB }}
+                  </button>
+                  <button class="btn btn-secondary" @click="cancelImport">Cancel</button>
+                </div>
+              </div>
+              <div v-else style="display: flex; justify-content: space-between; align-items: center; gap: var(--space-2);">
+                <p class="muted" style="margin: 0;">Import a .sql to (re)load this category's database.</p>
+                <button class="btn btn-secondary btn-sm" @click="openImport(c)">{{ UI_COPY.IMPORT_CATEGORY_DB }}</button>
+              </div>
+            </div>
+
+            <!-- Decoy database schema sub-panel (preview only — same tables/columns as
+                 the grading schema above, different data; used by dual-schema questions
+                 so the student's preview never leaks the grading data). -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Decoy database schema (preview only)</span>
+              <div v-if="importPreviewCategoryId === c.id">
+                <h3>Import decoy database into "{{ c.name }}"</h3>
+                <p class="muted">Upload a <code>.sql</code> file or paste a SQL script with the same tables and columns as the grading database above, but different data. Students previewing a dual-schema question see this data instead of the real grading data.</p>
+                <div style="display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2);">
+                  <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
+                    Choose .sql file
+                    <input type="file" accept=".sql,text/plain,application/sql" @change="loadPreviewSqlFile" style="display: none;" />
+                  </label>
+                  <span v-if="importPreviewFileName" class="muted">Loaded: <code>{{ importPreviewFileName }}</code> — review or edit below, then import.</span>
+                </div>
+                <SqlEditor v-model="importPreviewSql" height="200px" />
+                <div style="display: flex; gap: var(--space-2); margin-top: var(--space-2);">
+                  <button class="btn btn-primary" :disabled="importPreviewLoading || !importPreviewSql.trim()" @click="doImportPreview">
+                    <Spinner v-if="importPreviewLoading" size="sm" inline :invert="true" />{{ importPreviewLoading ? 'Importing' : 'Import Decoy Schema' }}
+                  </button>
+                  <button class="btn btn-secondary" @click="cancelImportPreview">Cancel</button>
+                </div>
+              </div>
+              <div v-else style="display: flex; justify-content: space-between; align-items: center; gap: var(--space-2);">
+                <p class="muted" style="margin: 0;">
+                  {{ c.has_preview_schema ? 'Decoy schema loaded — used for dual-schema question previews.' : 'Import a decoy .sql (same structure, different data) to enable dual-schema previews for this category.' }}
+                </p>
+                <button class="btn btn-secondary btn-sm" @click="openImportPreview(c)">Import Decoy Schema</button>
+              </div>
+            </div>
+
+            <!-- Description sub-panel -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Description (shown to students on the intro page)</span>
+              <div style="display: flex; gap: var(--space-2); align-items: flex-end;">
+                <textarea
+                  v-model="categoryIntroEdits[c.id]"
+                  class="input"
+                  rows="3"
+                  style="flex: 1; resize: vertical; min-height: 60px;"
+                  :placeholder="'Write a description for the ' + c.name + ' category...'"
+                ></textarea>
+                <button
+                  class="btn btn-primary btn-sm"
+                  :disabled="categoryIntroSaving[c.id]"
+                  @click="saveCategoryIntro(c)"
+                  style="white-space: nowrap;"
+                >{{ categoryIntroSaving[c.id] ? 'Saving...' : 'Save Description' }}</button>
+              </div>
+            </div>
+
+            <!-- Introduction images sub-panel -->
+            <div class="cat-subpanel">
+              <span class="cat-subpanel-label">Introduction images</span>
+              <IntroImagesEditor scope="category" :owner-id="c.id" />
+            </div>
+          </CollapsibleCard>
+        </div>
+        <p v-else class="muted">No categories yet. Create one above.</p>
       </div>
-    </div>
+    </section>
   </div>
 </template>
 
@@ -873,15 +859,13 @@ h3 {
   grid-column: span 2;
 }
 
-.category-card {
-  border: 2px solid var(--color-border);
-  border-left: 4px solid var(--color-primary);
-  padding: var(--space-4);
-  margin-bottom: var(--space-4);
-  background: var(--color-surface);
+.authoring-section {
+  display: block;
 }
-.category-card:nth-of-type(even) {
-  background: var(--color-surface-muted);
+.authoring-section--lower {
+  border-top: 2px solid var(--color-border);
+  padding-top: var(--space-4);
+  margin-top: var(--space-4);
 }
 .cat-subpanel {
   border: 1px solid var(--color-border-soft);

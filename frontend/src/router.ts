@@ -77,6 +77,12 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true, allowedRoles: ['ADMIN', 'LECTURER'] }
   },
   {
+    path: '/admin/bulk-reset',
+    name: 'admin-bulk-reset',
+    component: () => import('./components/BulkPasswordReset.vue'),
+    meta: { requiresAuth: true, allowedRoles: ['ADMIN'] }
+  },
+  {
     path: '/dashboard',
     name: 'dashboard',
     redirect: () => {
