@@ -761,6 +761,101 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   .cms-brand .brand-sub { display: none; }
 }
 
+/* ---------- Authoring layout: rail / stacked ----------------------------- */
+/* The lecturer authoring pages need their Categories Management panel visible
+   at any scroll position. The shell scrolls the *document* (.cms-shell is
+   min-height:100dvh and nothing sets an inner overflow), so there is no scroll
+   container to dock a bottom bar against and `position: sticky; bottom: 0`
+   would be a no-op on a last child. A side rail is the only layout that can
+   follow the scroll here — the same trick .cms-sidebar already uses above.
+   Design: docs/superpowers/specs/2026-07-30-sticky-categories-panel-design.md
+   These rules are global (not <style scoped>) so exam authoring can adopt the
+   same layout without a third copy of them. */
+
+.authoring-layout-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+  font-size: 0.85rem;
+}
+.authoring-layout-bar .authoring-layout-label {
+  color: var(--color-text-muted);
+  font-weight: 700;
+}
+.authoring-layout-switch {
+  display: inline-flex;
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.authoring-layout-switch button {
+  border: none;
+  border-radius: 0;
+  padding: 4px 10px;
+  font: inherit;
+  font-weight: 700;
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.authoring-layout-switch button + button {
+  border-left: 2px solid var(--color-border);
+}
+.authoring-layout-switch button:hover:not([aria-pressed='true']) {
+  background: var(--color-surface-muted);
+}
+.authoring-layout-switch button[aria-pressed='true'] {
+  background: var(--color-primary);
+  color: #fff;
+}
+.authoring-layout-switch button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -4px;
+}
+
+/* --- stacked: the original single-column flow, questions above categories -- */
+.authoring-layout--stacked {
+  display: block;
+}
+.authoring-layout--stacked > .authoring-section--lower {
+  border-top: 2px solid var(--color-border);
+  padding-top: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+/* --- rail: questions left, sticky categories right ----------------------- */
+.authoring-layout--rail {
+  display: grid;
+  /* 60/40, not 50/50: the question form is itself a two-column grid plus a
+     200px SqlEditor, so a literal half squeezes both of its cells to ~200px.
+     minmax(0, …) on the left track is load-bearing — without it the wide
+     .data-table and SqlEditor push the track past the container and the whole
+     page scrolls sideways. The 320px rail floor is what AUTHORING_RAIL_MEDIA_QUERY
+     in useAuthoringLayout.ts derives its 1280px threshold from; changing one
+     without the other reintroduces the squeezed-form case. */
+  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
+  gap: var(--space-5);
+  align-items: start;
+}
+.authoring-layout--rail > .authoring-section--upper {
+  min-width: 0;
+}
+.authoring-layout--rail > .authoring-section--lower {
+  min-width: 0;
+  align-self: start;          /* a stretched grid item has no slack to stick in */
+  position: sticky;
+  top: calc(var(--layout-header-h) + var(--space-5));
+  /* Cap to the viewport and scroll internally. A sticky element taller than the
+     viewport simply scrolls with the page until its bottom edge arrives, which
+     would defeat the entire purpose once a few categories are expanded. */
+  max-height: calc(100vh - var(--layout-header-h) - var(--space-5) * 2);
+  max-height: calc(100dvh - var(--layout-header-h) - var(--space-5) * 2);
+  overflow-y: auto;
+  overscroll-behavior: contain;  /* don't chain to the page at the rail's ends */
+  scrollbar-gutter: stable;      /* no width jump when the scrollbar appears */
+}
+
 /* ---------- Subtask collapsible (CMS detail drawer) ---------------------- */
 .subtask {
   border: 1px solid var(--color-border-soft);

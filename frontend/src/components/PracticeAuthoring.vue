@@ -30,9 +30,18 @@ import Spinner from './Spinner.vue'
 import { useAutosave } from '../composables/useAutosave'
 import IntroImagesEditor from './IntroImagesEditor.vue'
 import CollapsibleCard from './CollapsibleCard.vue'
+import { useAuthoringLayout } from '../composables/useAuthoringLayout'
 
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
+
+// Layout preference for the Categories Management panel: 'rail' makes it a
+// sticky right-hand column that follows the page scroll, 'stacked' keeps the
+// original questions-above-categories flow. Persisted per lecturer; forced to
+// 'stacked' below 1024px where a second split has no room.
+// Geometry lives in the global .authoring-layout* rules in style.css.
+const { mode: layoutMode, canUseRail, effectiveMode: layoutEffectiveMode, setMode: setLayoutMode } =
+  useAuthoringLayout('practice')
 
 const questions = ref<PracticeQuestion[]>([])
 const categories = ref<PracticeCategory[]>([])
@@ -472,13 +481,43 @@ onMounted(() => {
     </div>
     <BackLink to="/lecturer" label="Back to Lecturer Dashboard" />
 
+    <!-- Layout switch. Hidden below 1024px, where canUseRail is false and the
+         stacked layout is the only one that fits — showing a control that
+         cannot change anything would be worse than showing none. -->
+    <div v-if="canUseRail" class="authoring-layout-bar">
+      <span class="authoring-layout-label" id="practice-layout-switch-label">Categories panel</span>
+      <span class="authoring-layout-switch" role="group" aria-labelledby="practice-layout-switch-label">
+        <button
+          type="button"
+          data-testid="layout-mode-rail"
+          :aria-pressed="layoutMode === 'rail'"
+          @click="setLayoutMode('rail')"
+        >Side rail</button>
+        <button
+          type="button"
+          data-testid="layout-mode-stacked"
+          :aria-pressed="layoutMode === 'stacked'"
+          @click="setLayoutMode('stacked')"
+        >Stacked</button>
+      </span>
+      <span class="muted">{{ layoutEffectiveMode === 'rail' ? 'Pinned beside the form — follows the page scroll.' : 'Below the form.' }}</span>
+    </div>
+
+    <!-- Both sections stay mounted in both modes and keep their DOM order; only
+         the wrapper class changes, so switching layouts never unmounts a
+         half-filled import editor or collapses an open category card. -->
+    <div class="authoring-layout" :class="`authoring-layout--${layoutEffectiveMode}`">
     <!-- UPPER section: Practice Questions list + Create/Edit form. Behaviour unchanged from before the split. -->
     <section class="authoring-section authoring-section--upper">
       <!-- Section A: Question List -->
       <div class="card" style="margin-bottom: var(--space-4);">
         <h2>Practice Questions</h2>
         <div v-if="questions.length === 0" class="muted">No questions yet.</div>
-        <table v-else class="data-table">
+        <!-- The rail layout narrows this column, and an 8-column table has a
+             min-content width wider than it. Without this wrapper the table
+             overflows its card and the whole page scrolls sideways. -->
+        <div v-else class="responsive-table-wrap">
+        <table class="data-table">
           <thead>
             <tr>
               <th>ID</th>
@@ -522,6 +561,7 @@ onMounted(() => {
             </tr>
           </tbody>
         </table>
+        </div>
       </div>
 
       <!-- Section C: Create/Edit Form -->
@@ -553,15 +593,15 @@ onMounted(() => {
             <label>Question Type</label>
             <select v-model="form.question_type" class="input">
               <option value="QUERY">QUERY</option>
-              <option value="DML">DML</option>
+              <option value="DML">INSERT/UPDATE/DELETE</option>
             </select>
           </div>
           <div class="field">
             <label>Title <span class="muted">(optional — shown to students instead of a category ordinal)</span></label>
             <input v-model="form.title" class="input" placeholder="e.g. Employees hired after 2020" />
           </div>
-          <div class="field">
-            <label>Target Table (DML only)</label>
+          <div class="field" v-if="form.question_type == 'DML'">
+            <label>Target Table (INSERT/UPDATE/DELETE only)</label>
             <input v-model="form.target_table" class="input" placeholder="e.g. employee" />
           </div>
           <div v-if="showDraftBanner" class="draft-banner">
@@ -779,6 +819,7 @@ onMounted(() => {
         <p v-else class="muted">No categories yet. Create one above.</p>
       </div>
     </section>
+    </div><!-- /.authoring-layout -->
   </div>
 </template>
 
@@ -859,13 +900,12 @@ h3 {
   grid-column: span 2;
 }
 
+/* .authoring-layout / .authoring-section--upper / --lower geometry now lives in
+   the global .authoring-layout* rules in style.css — a scoped copy here would
+   carry the same specificity as those rules and win or lose by stylesheet
+   injection order, which is not something to depend on. */
 .authoring-section {
   display: block;
-}
-.authoring-section--lower {
-  border-top: 2px solid var(--color-border);
-  padding-top: var(--space-4);
-  margin-top: var(--space-4);
 }
 .cat-subpanel {
   border: 1px solid var(--color-border-soft);

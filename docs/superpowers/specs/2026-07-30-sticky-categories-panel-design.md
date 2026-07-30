@@ -27,7 +27,7 @@ Three reasons, in order of weight:
 
 **(b) A bottom dock has to pay viewport rent forever.** Category cards contain two `SqlEditor` instances (200px each), a 3-row textarea, and `IntroImagesEditor`. A dock that shows anything useful needs ~40% of the viewport height, permanently, on a page whose main job is a tall form plus a SQL editor. A rail spends horizontal space instead, which this page has: `.cms-body` caps at `--layout-max-w` and the form is already a two-column grid, so the wide desktop layout has slack to give.
 
-**(c) A stacked mode has to exist anyway.** Below the `.cms-sidebar` breakpoint (1023.98px) the shell drops to a single column, and a rail there would squeeze both the form and the categories to unusable widths. So the stacked layout is required as the narrow-viewport fallback. Given it must exist, exposing it as a user-selectable mode on wide screens costs one button.
+**(c) A stacked mode has to exist anyway.** On narrower viewports a rail squeezes both the form and the categories to unusable widths (§3.3 does the arithmetic), so the stacked layout is required as the fallback. Given it must exist, exposing it as a user-selectable mode on wide screens costs one button.
 
 ## 3. Design
 
@@ -40,7 +40,9 @@ Three reasons, in order of weight:
 
 `rail` is the default for a lecturer who has never chosen. Categories go on the **right** — the user's original brief put the assignments on the left, and `.cms-sidebar` already occupies the page's left edge, so a second left rail would produce two adjacent rails.
 
-Column ratio is **60/40, not 50/50**: `grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr)`. A literal half would leave each cell of the form's inner two-column grid around 200px wide, which breaks the Requirement textarea and the Correct SQL editor. `minmax(0, …)` on the left column is required, not decorative: without it the `data-table` and `SqlEditor` force the grid track wider than the container and the page scrolls sideways.
+Column ratio is **60/40, not 50/50**: `grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr)`. A literal half would leave each cell of the form's inner two-column grid around 200px wide, which breaks the Requirement textarea and the Correct SQL editor. `minmax(0, …)` on the left column is required, not decorative: without it the `data-table` and `SqlEditor` force the grid track wider than the container and the page scrolls sideways.
+
+For the same reason the questions table gets wrapped in the existing global `.responsive-table-wrap` utility. It is an 8-column table whose min-content width exceeds the narrowed left column; unwrapped, it overflows its card and the page scrolls sideways in rail mode. This is the one content change the layout forces.
 
 ### 3.2 The rail must be its own scroll container
 
@@ -77,7 +79,9 @@ export function useAuthoringLayout(scope: string): {
 ```
 
 - `mode` is read once on setup from `localStorage['authoring-layout:' + scope]`, defaulting to `'rail'`. Any value other than the two literals is treated as absent.
-- `canUseRail` tracks `window.matchMedia('(min-width: 1024px)')`, seeded on setup and updated via a `change` listener that is removed on `onScopeDispose`. `1024px` is chosen to line up with the existing `@media (max-width: 1023.98px)` rule that collapses `.cms-sidebar`.
+- `canUseRail` tracks `window.matchMedia('(min-width: 1280px)')`, seeded on setup and updated via a `change` listener that is removed on `onScopeDispose`.
+
+  The threshold is derived, not picked. At viewport width `W` the authoring content receives `W - 48` (`.cms-body` padding) `- 260` (`--layout-sidebar-w`) `- 24` (shell grid gap) `- 64` (`.cms-main` padding) `= W - 396`. Take off the rail's 24px gap and its 320px floor and the question column is left with `W - 740`. At 1024px that is ~284px — the rail would win the split and leave the two-column form unusable, so the obvious "match the `.cms-sidebar` breakpoint" answer is wrong. 1280px leaves the form ~540px, which is where both halves work. One column of chrome fits long before two do.
 - `effectiveMode` is `mode === 'rail' && canUseRail ? 'rail' : 'stacked'`. The persisted preference is never overwritten by a narrow viewport — resizing back up restores the rail.
 - Every `localStorage` access is wrapped in `try/catch` and the composable degrades to in-memory state, matching `utils/schemaWindowState.ts`. `window`/`matchMedia` absence is handled so SSR and bare jsdom cannot throw; when `matchMedia` is missing, `canUseRail` is `true` (the rail is the design intent; a test environment should exercise it).
 
