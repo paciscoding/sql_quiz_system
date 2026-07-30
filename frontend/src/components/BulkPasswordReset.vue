@@ -17,6 +17,7 @@ import EmptyState from './EmptyState.vue'
 import FieldError from './FieldError.vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
 import { handleApiError } from '../services/error_handler'
+import { useConfirm } from '../services/confirm_service'
 import { toCsv, downloadCsv } from '../utils/csv'
 import {
   bulkResetPasswords,
@@ -157,7 +158,18 @@ const { inFlight: resetRunning, run: runReset } = useSingleFlight(async () => {
   }
 })
 
-function clearResults() {
+const { confirm } = useConfirm()
+
+async function clearResults() {
+  if (hasHeldResults.value) {
+    const ok = await confirm({
+      title: 'Clear generated passwords?',
+      body: 'These passwords are shown only once and cannot be re-viewed after this. Make sure they have been downloaded, printed, or delivered to students first.',
+      confirmLabel: 'Clear',
+      danger: true,
+    })
+    if (!ok) return
+  }
   results.value = []
   failures.value = []
   runError.value = ''

@@ -35,6 +35,13 @@ import { downloadCsv } from '../../utils/csv'
 import router from '../../router'
 import { useAuth, type AuthUser } from '../../services/auth'
 
+// "Clear results" now gates on useConfirm (a lecturer can no longer discard
+// unviewed passwords with a single misclick). ConfirmDialogHost isn't mounted
+// here, so auto-approve every confirm() the same way AdminView.test.ts does.
+vi.mock('../../services/confirm_service', () => ({
+  useConfirm: () => ({ confirm: vi.fn().mockResolvedValue(true) }),
+}))
+
 function jsonResponse(data: unknown, ok = true) {
   return Promise.resolve({
     ok,

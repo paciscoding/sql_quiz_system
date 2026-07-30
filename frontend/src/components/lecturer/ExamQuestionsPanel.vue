@@ -37,11 +37,15 @@ const emit = defineEmits<{ changed: [] }>()
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
 
-// Same rail/stacked layout as PracticeAuthoring.vue, under its own 'exam' key so
+// Same side/bottom dock as PracticeAuthoring.vue, under its own 'exam' key so
 // the two authoring pages keep independent preferences. Geometry lives in the
-// global .authoring-layout* rules in style.css.
-const { mode: layoutMode, canUseRail, effectiveMode: layoutEffectiveMode, setMode: setLayoutMode } =
-  useAuthoringLayout('exam')
+// global .authoring-* rules in style.css.
+const {
+  mode: layoutMode,
+  collapsed: categoriesPanelCollapsed,
+  setMode: setLayoutMode,
+  toggleCollapsed: toggleCategoriesPanel,
+} = useAuthoringLayout('exam')
 
 // Independent client-side check (dual-schema spec §6.1): dual_schema on an
 // exam with no decoy curriculum is allowed (grading falls back to schema B)
@@ -69,6 +73,22 @@ const blankQuestion = () => ({
 })
 
 const question = ref(blankQuestion())
+
+// Dirty-check guard (TODO-061): mirrors PracticeAuthoring.vue so switching to
+// another question or starting a new one warns before silently discarding
+// in-progress edits.
+const loadedQuestionSnapshot = ref(JSON.stringify(question.value))
+const isQuestionFormDirty = computed(() => JSON.stringify(question.value) !== loadedQuestionSnapshot.value)
+
+async function confirmDiscardQuestionIfDirty(): Promise<boolean> {
+  if (!isQuestionFormDirty.value) return true
+  return confirm({
+    title: 'Discard unsaved changes?',
+    body: 'This question has edits that have not been saved yet. Switching now will lose them.',
+    confirmLabel: 'Discard',
+    danger: true,
+  })
+}
 
 // Form validation for question fields
 const questionValidation = useFormValidation({
@@ -121,9 +141,10 @@ const fetchExamQuestions = async () => {
     const response = await fetch(`/api/v1/lecturer/exams/${props.exam.id}/questions`, {
       headers: { 'Authorization': `Bearer ${token}` }
     })
-    if (response.ok) {
-      examQuestions.value = await response.json()
+    if (!response.ok) {
+      throw new Error(`Failed to load exam questions (${response.status})`)
     }
+    examQuestions.value = await response.json()
   } catch (err) {
     handleApiError(err, { fallback: 'Failed to load exam questions' })
   }
@@ -189,7 +210,7 @@ const attachedQuestionCountRe = /(\d+) question\(s\)/
 // reassign or delete those questions first — there is no "delete anyway"
 // retry here (unlike PracticeAuthoring's force-delete flow).
 const doDeleteCategory = async (cat: ExamCategory) => {
-  const ok = await confirm({ title: `Delete "${cat.name}"?`, body: 'This cannot be undone.', confirmLabel: 'Delete', danger: true })
+  const ok = await confirm({ title: `Delete "${cat.name}"?`, body: 'The category and its imported database schema will be removed. This cannot be undone.', confirmLabel: 'Delete', danger: true })
   if (!ok) return
   try {
     await deleteExamCategory(props.exam.id, cat.id)
@@ -399,7 +420,8 @@ const questionFormRef = ref<HTMLElement | null>(null)
 const previewAsStudentResult = ref<PreviewResult>({ status: '', rows: [], columns: [], error: '' })
 const previewAsStudentLoading = ref(false)
 
-const editQuestion = (q: any) => {
+const editQuestion = async (q: any) => {
+  if (!(await confirmDiscardQuestionIfDirty())) return
   isEditMode.value = true
   question.value = {
     id: q.id,
@@ -417,6 +439,7 @@ const editQuestion = (q: any) => {
       column_order: q.strict_mode?.column_order || false
     }
   }
+  loadedQuestionSnapshot.value = JSON.stringify(question.value)
   lastCapture.value = {
     status: q.expected_result_status || '',
     error: q.capture_error || '',
@@ -427,9 +450,10 @@ const editQuestion = (q: any) => {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
-function onQuestionDropdownChange(event: Event) {
+async function onQuestionDropdownChange(event: Event) {
   const val = (event.target as HTMLSelectElement).value
   if (val === '') {
+    if (!(await confirmDiscardQuestionIfDirty())) return
     // Create new question — id=0 tells the backend to auto-assign the PK on
     // insert (repository/postgres_questions.go UpsertQuestion: q.ID==0 => INSERT).
     isEditMode.value = false
@@ -445,12 +469,13 @@ function onQuestionDropdownChange(event: Event) {
       dual_schema: false,
       strict_mode: { ordering: false, attributes: false, column_order: false }
     }
+    loadedQuestionSnapshot.value = JSON.stringify(question.value)
     lastCapture.value = { status: '', error: '', capturedAt: null }
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
     previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   } else {
     const q = examQuestions.value.find((q: any) => q.id === Number(val))
-    if (q) editQuestion(q)
+    if (q) await editQuestion(q)
   }
 }
 
@@ -774,6 +799,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     // Reset for the next question to avoid silent ON CONFLICT overwrites.
     question.value = blankQuestion()
     question.value.exam_id = props.exam.id
+    loadedQuestionSnapshot.value = JSON.stringify(question.value)
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
     previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   } catch (err) {
@@ -784,31 +810,10 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
 
 <template>
   <div>
-    <!-- Layout switch. Hidden below the rail's minimum width, where canUseRail
-         is false and stacked is the only layout that fits. -->
-    <div v-if="canUseRail" class="authoring-layout-bar">
-      <span class="authoring-layout-label" id="exam-layout-switch-label">Categories panel</span>
-      <span class="authoring-layout-switch" role="group" aria-labelledby="exam-layout-switch-label">
-        <button
-          type="button"
-          data-testid="layout-mode-rail"
-          :aria-pressed="layoutMode === 'rail'"
-          @click="setLayoutMode('rail')"
-        >Side rail</button>
-        <button
-          type="button"
-          data-testid="layout-mode-stacked"
-          :aria-pressed="layoutMode === 'stacked'"
-          @click="setLayoutMode('stacked')"
-        >Stacked</button>
-      </span>
-      <span class="muted">{{ layoutEffectiveMode === 'rail' ? 'Pinned beside the form — follows the page scroll.' : 'Below the form.' }}</span>
-    </div>
-
     <!-- Both sections stay mounted in both modes and keep their DOM order; only
          the wrapper class changes, so switching layouts never unmounts a
          half-filled import editor or collapses an open category card. -->
-    <div class="authoring-layout" :class="`authoring-layout--${layoutEffectiveMode}`">
+    <div class="authoring-layout" :class="`authoring-layout--${layoutMode}`">
     <!-- UPPER section: everything this panel rendered before ARCH-034 (3) —
          question form, decoy curriculum import, exam description, exam intro
          images, questions list. Order and behaviour unchanged. -->
@@ -816,8 +821,8 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     <div ref="questionFormRef">
       <div class="form-grid">
         <div class="input-group">
-          <label>Question ID:</label>
-          <select @change="onQuestionDropdownChange" :value="isEditMode ? question.id : ''">
+          <label for="exam-question-select">Question ID:</label>
+          <select id="exam-question-select" @change="onQuestionDropdownChange" :value="isEditMode ? question.id : ''">
             <option value="">Create new question</option>
             <option v-for="q in examQuestions" :key="q.id" :value="q.id">
               Q{{ q.id }} — {{ (q.requirement || '').slice(0, 50) }}
@@ -828,8 +833,8 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         </div>
 
         <div class="input-group">
-          <label>Type:</label>
-          <select v-model="question.type">
+          <label for="exam-question-type">Type:</label>
+          <select id="exam-question-type" v-model="question.type">
             <option value="QUERY">Query (SELECT)</option>
             <option value="DML">DML (Insert/Update/Delete)</option>
           </select>
@@ -839,21 +844,22 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
              lets a lecturer put a question into an exam category. Without it
              exam categories would have no authoring entry point. -->
         <div class="input-group">
-          <label>Category:</label>
-          <select v-model="question.category_id">
+          <label for="exam-question-category">Category:</label>
+          <select id="exam-question-category" v-model="question.category_id">
             <option :value="null">None (exam-level schema)</option>
             <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
           </select>
         </div>
 
         <div class="input-group" v-if="question.type === 'DML'">
-          <label>Target Table:</label>
-          <input type="text" v-model="question.target_table" placeholder="e.g. employee" />
+          <label for="exam-question-target-table">Target Table:</label>
+          <input id="exam-question-target-table" type="text" v-model="question.target_table" placeholder="e.g. employee" />
         </div>
 
         <div class="input-group">
-          <label>Points:</label>
+          <label for="exam-question-points">Points:</label>
           <input
+            id="exam-question-points"
             type="number"
             v-model.number="question.points"
             :aria-invalid="questionValidation.touched.points && !!questionValidation.errors.points"
@@ -1092,19 +1098,54 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     <!-- LOWER section: Exam Categories, ALWAYS rendered — no show/hide toggle
          (ARCH-034 (3)(b)). Each category is a CollapsibleCard driven by the
          ARCH-029 service wrappers in services/exam.ts. NO intro-images
-         sub-panel here — exam categories don't have them (ARCH-026 (6)). -->
-    <section class="authoring-section authoring-section--lower" aria-labelledby="exam-categories-heading">
+         sub-panel here — exam categories don't have them (ARCH-026 (6)).
+         A `position: fixed` overlay in BOTH modes (see
+         .authoring-section--lower.is-docked in style.css) — 'side' docks it
+         to the right edge at full viewport height, 'bottom' to the bottom
+         edge at full viewport width — with the orientation switch docked
+         onto the panel itself and minimize available in either mode. -->
+    <section
+      class="authoring-section authoring-section--lower is-docked"
+      :class="[`dock-${layoutMode}`, { 'is-collapsed': categoriesPanelCollapsed }]"
+      aria-labelledby="exam-categories-heading"
+    >
+      <div class="authoring-panel-shell" :class="`authoring-panel-shell--${layoutMode}`">
+        <span class="authoring-layout-switch" role="group" aria-label="Categories panel dock">
+          <button
+            type="button"
+            data-testid="layout-mode-side"
+            title="Dock to the right edge"
+            :aria-pressed="layoutMode === 'side'"
+            @click="setLayoutMode('side')"
+          >Side</button>
+          <button
+            type="button"
+            data-testid="layout-mode-bottom"
+            title="Dock to the bottom edge"
+            :aria-pressed="layoutMode === 'bottom'"
+            @click="setLayoutMode('bottom')"
+          >Btm</button>
+        </span>
+
       <!-- No inline divider here: inline styles beat every stylesheet, so one
-           would draw a rule down the side of the rail. The separator comes from
-           the mode-aware .authoring-layout--stacked rule in style.css, which
-           also removes the double divider this used to render. -->
-      <div>
-        <h2 id="exam-categories-heading" style="margin: 0 0 var(--space-2) 0;">Exam Categories</h2>
+           would draw a stray rule across the docked panel. The panel's own
+           border comes from the .is-docked / .dock-* rules in style.css. -->
+      <div class="authoring-panel-content">
+        <div class="authoring-floating-panel-header">
+          <h2 id="exam-categories-heading" style="margin: 0 0 var(--space-2) 0;">Exam Categories</h2>
+          <button
+            type="button"
+            class="btn-sm"
+            data-testid="floating-categories-minimize"
+            aria-label="Minimize categories panel"
+            @click="toggleCategoriesPanel"
+          >Minimize</button>
+        </div>
         <p class="muted" style="margin: 0 0 var(--space-3) 0; font-size: 0.85rem;">Each category can own its own database, kept separate from the exam-level schema above. Questions with no category grade against the exam-level schema.</p>
 
         <!-- New category -->
         <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">
-          <input v-model="newCategoryName" placeholder="New category name" style="flex: 1;" @keyup.enter="addCategory" />
+          <input v-model="newCategoryName" placeholder="New category name" aria-label="New category name" style="flex: 1;" @keyup.enter="addCategory" />
           <button class="primary-btn" style="margin-bottom: 0;" :disabled="addCategoryLoading || !newCategoryName.trim()" @click="addCategory">New Category</button>
         </div>
 
@@ -1189,6 +1230,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
                   rows="3"
                   style="flex: 1; resize: vertical; min-height: 60px;"
                   :placeholder="'Write a description for the ' + c.name + ' category...'"
+                  :aria-label="'Description for the ' + c.name + ' category'"
                 ></textarea>
                 <button
                   class="btn-sm"
@@ -1204,8 +1246,20 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         </div>
         <p v-else class="muted">No categories yet. Create one above.</p>
       </div>
+      </div><!-- /.authoring-panel-shell -->
     </section><!-- /authoring-section--lower -->
     </div><!-- /.authoring-layout -->
+
+    <!-- Reopen tab: shown while the panel is minimized, in either dock. It
+         sits on the edge the panel will return to. -->
+    <button
+      v-if="categoriesPanelCollapsed"
+      type="button"
+      class="authoring-floating-tab"
+      :class="`authoring-floating-tab--${layoutMode}`"
+      data-testid="floating-categories-reopen"
+      @click="toggleCategoriesPanel"
+    >Exam Categories</button>
   </div>
 </template>
 
@@ -1375,12 +1429,15 @@ textarea {
 }
 
 /* ARCH-034 (3)(d): two sibling sections, upper then lower. The divider and the
-   rail/stacked geometry now come from the global .authoring-layout* rules in
-   style.css — a scoped copy here carries the same specificity as those rules
-   and would win or lose by stylesheet injection order. */
-.authoring-section {
-  display: block;
-}
+   side/bottom dock geometry come from the global .authoring-* rules in
+   style.css. Do NOT add a scoped rule for those selectors here: scoped styles
+   compile to `.foo[data-v-x]` (specificity 0,2,0) and are injected AFTER
+   style.css, so even a single-class scoped rule ties the global two-class
+   rules and wins on order. A scoped `.authoring-section { display: block }`
+   used to live here and silently beat both `.is-docked { display: flex }`
+   (breaking the flex chain the panel's internal scrolling depends on) and
+   `.is-collapsed { display: none }` (making Minimize a no-op). It was also
+   redundant — <section> is already display:block per the UA stylesheet. */
 .cat-subpanel {
   border: 1px solid var(--color-border-soft);
   border-radius: var(--radius);

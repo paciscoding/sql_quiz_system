@@ -1,51 +1,52 @@
-import { computed, onScopeDispose, ref, type ComputedRef, type Ref } from 'vue'
+import { ref, type Ref } from 'vue'
 
 /**
- * Layout preference for the lecturer authoring pages, where the Categories
- * Management panel has to stay visible at any scroll position.
+ * Dock orientation for the lecturer authoring pages' Categories Management
+ * panel, which has to stay visible at any scroll position and any viewport
+ * width.
  *
- *  - 'rail'    two columns; the categories panel is a `position: sticky` right
- *              rail with its own scrollbar, so it follows the page scroll.
- *  - 'stacked' the original single-column layout, questions above categories.
+ * BOTH orientations are `position: fixed` overlays — this is an orientation
+ * toggle, not a float-vs-in-flow toggle:
+ *
+ *  - 'side'   docked to the right edge, full viewport height, with the
+ *             orientation switch as a vertical strip on the panel's inner edge.
+ *  - 'bottom' docked to the bottom edge, full viewport width, with the
+ *             orientation switch as a horizontal strip along the panel's top.
  *
  * Design: docs/superpowers/specs/2026-07-30-sticky-categories-panel-design.md
+ * (superseded twice — first the 1280px-gated `position: sticky` rail, then a
+ * 'floating'/'stacked' pair where only one of the two actually floated. Both
+ * are gone: a gate that silently degrades and a mode that silently stops
+ * floating read identically to the user as "the panel doesn't work".)
  */
-export type AuthoringLayoutMode = 'rail' | 'stacked'
+export type AuthoringLayoutMode = 'side' | 'bottom'
 
 export const AUTHORING_LAYOUT_STORAGE_PREFIX = 'authoring-layout:'
+export const AUTHORING_LAYOUT_COLLAPSED_STORAGE_PREFIX = 'authoring-layout-collapsed:'
+
+const DEFAULT_MODE: AuthoringLayoutMode = 'side'
 
 /**
- * The rail is only offered at or above this width, which is derived from the
- * shell's own chrome rather than picked as a round number. At viewport width W
- * the authoring content gets:
- *
- *   W - 48 (.cms-body padding) - 260 (--layout-sidebar-w) - 24 (grid gap)
- *     - 64 (.cms-main padding) = W - 396
- *
- * Subtract the rail's 24px gap and its 320px minimum and the question column is
- * left with W - 740. At 1024px that is ~284px — narrower than the two-column
- * question form can use, so the rail would win the split and make the form
- * unusable. 1280px leaves the form ~540px, which is the point where both halves
- * are workable. (Note this is deliberately *not* the 1023.98px breakpoint that
- * collapses .cms-sidebar: one column of chrome fits long before two do.)
+ * Carries prior preferences forward instead of silently resetting them:
+ * 'rail'/'floating' were the right-hand-column modes this 'side' dock
+ * replaced, 'stacked' was the below-the-form mode 'bottom' replaced.
  */
-export const AUTHORING_RAIL_MEDIA_QUERY = '(min-width: 1280px)'
-
-const DEFAULT_MODE: AuthoringLayoutMode = 'rail'
-
-function isMode(v: unknown): v is AuthoringLayoutMode {
-  return v === 'rail' || v === 'stacked'
+function normalizeStoredMode(v: unknown): AuthoringLayoutMode | null {
+  if (v === 'side' || v === 'bottom') return v
+  if (v === 'rail' || v === 'floating') return 'side'
+  if (v === 'stacked') return 'bottom'
+  return null
 }
 
 export interface UseAuthoringLayoutReturn {
-  /** What the user picked. Persisted; never overwritten by a narrow viewport. */
+  /** Which edge the panel is docked to. Persisted. */
   mode: Ref<AuthoringLayoutMode>
-  /** Whether the viewport is wide enough for the rail to make sense. */
-  canUseRail: Ref<boolean>
-  /** What actually renders — 'stacked' whenever the rail is unavailable. */
-  effectiveMode: ComputedRef<AuthoringLayoutMode>
+  /** Whether the panel is minimized to its reopen tab. Persisted. */
+  collapsed: Ref<boolean>
   setMode: (m: AuthoringLayoutMode) => void
   toggleMode: () => void
+  setCollapsed: (v: boolean) => void
+  toggleCollapsed: () => void
 }
 
 /**
@@ -54,52 +55,47 @@ export interface UseAuthoringLayoutReturn {
  */
 export function useAuthoringLayout(scope: string): UseAuthoringLayoutReturn {
   const storageKey = `${AUTHORING_LAYOUT_STORAGE_PREFIX}${scope}`
+  const collapsedKey = `${AUTHORING_LAYOUT_COLLAPSED_STORAGE_PREFIX}${scope}`
 
   // Storage may be unavailable (private browsing, disabled cookies) or throw on
   // read as well as write — same posture as utils/schemaWindowState.ts. Failing
   // to persist a layout preference must never break the page.
-  let stored: string | null = null
-  try {
-    stored = typeof window !== 'undefined' ? window.localStorage.getItem(storageKey) : null
-  } catch {
-    stored = null
-  }
-
-  const mode = ref<AuthoringLayoutMode>(isMode(stored) ? stored : DEFAULT_MODE)
-
-  // Absent matchMedia (non-browser or very old environment) is treated as
-  // "wide enough": the rail is the design intent, and silently downgrading
-  // everyone to stacked would hide the feature rather than degrade it.
-  const mql: MediaQueryList | null =
-    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
-      ? window.matchMedia(AUTHORING_RAIL_MEDIA_QUERY)
-      : null
-
-  const canUseRail = ref(mql ? mql.matches : true)
-
-  if (mql) {
-    const onChange = () => { canUseRail.value = mql.matches }
-    mql.addEventListener('change', onChange)
-    onScopeDispose(() => mql.removeEventListener('change', onChange))
-  }
-
-  const effectiveMode = computed<AuthoringLayoutMode>(() =>
-    mode.value === 'rail' && canUseRail.value ? 'rail' : 'stacked'
-  )
-
-  function setMode(m: AuthoringLayoutMode) {
-    mode.value = m
+  function readStorage(key: string): string | null {
     try {
-      window.localStorage.setItem(storageKey, m)
+      return typeof window !== 'undefined' ? window.localStorage.getItem(key) : null
+    } catch {
+      return null
+    }
+  }
+  function writeStorage(key: string, value: string) {
+    try {
+      window.localStorage.setItem(key, value)
     } catch {
       // Quota or disabled storage — the in-memory preference still applies for
       // this session.
     }
   }
 
-  function toggleMode() {
-    setMode(mode.value === 'rail' ? 'stacked' : 'rail')
+  const mode = ref<AuthoringLayoutMode>(normalizeStoredMode(readStorage(storageKey)) ?? DEFAULT_MODE)
+  const collapsed = ref<boolean>(readStorage(collapsedKey) === '1')
+
+  function setMode(m: AuthoringLayoutMode) {
+    mode.value = m
+    writeStorage(storageKey, m)
   }
 
-  return { mode, canUseRail, effectiveMode, setMode, toggleMode }
+  function toggleMode() {
+    setMode(mode.value === 'side' ? 'bottom' : 'side')
+  }
+
+  function setCollapsed(v: boolean) {
+    collapsed.value = v
+    writeStorage(collapsedKey, v ? '1' : '0')
+  }
+
+  function toggleCollapsed() {
+    setCollapsed(!collapsed.value)
+  }
+
+  return { mode, collapsed, setMode, toggleMode, setCollapsed, toggleCollapsed }
 }

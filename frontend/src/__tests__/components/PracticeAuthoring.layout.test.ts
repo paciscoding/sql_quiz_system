@@ -1,16 +1,19 @@
 /**
- * Tests for the sticky Categories Management panel on PracticeAuthoring.vue
- * (docs/superpowers/specs/2026-07-30-sticky-categories-panel-design.md).
+ * Tests for the docked Categories Management panel on PracticeAuthoring.vue
+ * (docs/superpowers/specs/2026-07-30-sticky-categories-panel-design.md,
+ * superseded by the side/bottom dock redesign — see useAuthoringLayout.ts).
  *
  * What is asserted here is the *class contract* plus the state machine, not CSS
- * geometry: happy-dom has no layout engine, so `position: sticky`, the rail's
- * max-height and the grid track sizes cannot be observed from a unit test.
- * They are reviewed visually. What a unit test CAN protect is the part that
- * silently rots:
- *   - the wrapper class the global rules in style.css hang off,
+ * geometry: happy-dom has no layout engine, so `position: fixed` and the
+ * panel's height cannot be observed from a unit test. They are reviewed
+ * visually. What a unit test CAN protect is the part that silently rots:
+ *   - the wrapper/dock classes the global rules in style.css hang off,
  *   - the panel being genuinely always-rendered (never behind a v-if) in BOTH
  *     modes, so a mode switch cannot unmount a half-filled import editor,
- *   - the persisted preference and the narrow-viewport fallback.
+ *   - BOTH modes staying docked overlays (one used to rejoin the page flow and
+ *     scroll away) and minimize working in both (it used to be gated on one),
+ *   - the persisted dock + minimize preference (no viewport gate anymore —
+ *     a fixed overlay works at any width).
  *
  * Mocking conventions follow exam_categories_panel.test.ts: SqlEditor is a bare
  * textarea (CodeMirror needs a real browser), notification_service is a spy,
@@ -19,7 +22,10 @@
 
 import { mount, flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AUTHORING_LAYOUT_STORAGE_PREFIX } from '../../composables/useAuthoringLayout'
+import {
+  AUTHORING_LAYOUT_STORAGE_PREFIX,
+  AUTHORING_LAYOUT_COLLAPSED_STORAGE_PREFIX,
+} from '../../composables/useAuthoringLayout'
 import type { PracticeCategory, PracticeQuestion } from '../../services/practice'
 
 vi.mock('../../components/SqlEditor.vue', () => ({
@@ -59,6 +65,7 @@ import PracticeAuthoring from '../../components/PracticeAuthoring.vue'
 import { lecturerListQuestions, listCategories } from '../../services/practice'
 
 const KEY = `${AUTHORING_LAYOUT_STORAGE_PREFIX}practice`
+const COLLAPSED_KEY = `${AUTHORING_LAYOUT_COLLAPSED_STORAGE_PREFIX}practice`
 
 function makeCategory(overrides: Partial<PracticeCategory> = {}): PracticeCategory {
   return {
@@ -73,26 +80,6 @@ function makeCategory(overrides: Partial<PracticeCategory> = {}): PracticeCatego
   } as PracticeCategory
 }
 
-/** Controllable window.matchMedia; happy-dom's own is not drivable per-test. */
-function installMatchMedia(matches: boolean) {
-  const listeners = new Set<() => void>()
-  const mql = {
-    matches,
-    media: '',
-    addEventListener: (_t: string, cb: () => void) => { listeners.add(cb) },
-    removeEventListener: (_t: string, cb: () => void) => { listeners.delete(cb) },
-  }
-  const fn = vi.fn(() => mql as unknown as MediaQueryList)
-  vi.stubGlobal('matchMedia', fn)
-  ;(window as unknown as { matchMedia: unknown }).matchMedia = fn
-  return {
-    set(v: boolean) {
-      mql.matches = v
-      listeners.forEach(cb => cb())
-    },
-  }
-}
-
 async function mountPage() {
   const wrapper = mount(PracticeAuthoring, {
     global: { stubs: { BackLink: true, RouterLink: true } },
@@ -101,7 +88,7 @@ async function mountPage() {
   return wrapper
 }
 
-describe('PracticeAuthoring — sticky Categories Management layout', () => {
+describe('PracticeAuthoring — docked Categories Management panel', () => {
   beforeEach(() => {
     vi.mocked(lecturerListQuestions).mockReset().mockResolvedValue([] as PracticeQuestion[])
     vi.mocked(listCategories).mockReset().mockResolvedValue([makeCategory()])
@@ -115,23 +102,52 @@ describe('PracticeAuthoring — sticky Categories Management layout', () => {
     localStorage.clear()
   })
 
-  it('defaults to the rail layout on a wide viewport', async () => {
-    installMatchMedia(true)
+  it('defaults to the side dock', async () => {
     const wrapper = await mountPage()
 
     const layout = wrapper.find('.authoring-layout')
     expect(layout.exists()).toBe(true)
-    expect(layout.classes()).toContain('authoring-layout--rail')
-    expect(layout.classes()).not.toContain('authoring-layout--stacked')
+    expect(layout.classes()).toContain('authoring-layout--side')
+    expect(layout.classes()).not.toContain('authoring-layout--bottom')
+  })
+
+  it('shows the dock switch on the panel regardless of viewport (no breakpoint gate)', async () => {
+    const wrapper = await mountPage()
+    expect(wrapper.find('.authoring-layout-switch').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="layout-mode-side"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="layout-mode-bottom"]').exists()).toBe(true)
+  })
+
+  it('keeps the panel docked (fixed overlay) in BOTH orientations', async () => {
+    // The regression this pins: one of the two modes used to drop out of the
+    // overlay entirely and rejoin the page flow, so it scrolled away — the
+    // exact failure this whole feature exists to prevent.
+    const wrapper = await mountPage()
+    expect(wrapper.find('.authoring-section--lower').classes()).toContain('is-docked')
+    expect(wrapper.find('.authoring-section--lower').classes()).toContain('dock-side')
+
+    await wrapper.find('[data-testid="layout-mode-bottom"]').trigger('click')
+    expect(wrapper.find('.authoring-section--lower').classes()).toContain('is-docked')
+    expect(wrapper.find('.authoring-section--lower').classes()).toContain('dock-bottom')
+  })
+
+  it('docks the switch strip on the panel shell and flips orientation with the mode', async () => {
+    // side: full-height column on the panel's inner edge. bottom: full-width
+    // row along the panel's top. Both live on .authoring-panel-shell so the
+    // switch is physically part of the panel, not a separate page-level bar.
+    const wrapper = await mountPage()
+    expect(wrapper.find('.authoring-panel-shell').classes()).toContain('authoring-panel-shell--side')
+
+    await wrapper.find('[data-testid="layout-mode-bottom"]').trigger('click')
+    expect(wrapper.find('.authoring-panel-shell').classes()).toContain('authoring-panel-shell--bottom')
   })
 
   it('keeps both sections mounted, upper before lower, in BOTH modes', async () => {
-    installMatchMedia(true)
     const wrapper = await mountPage()
 
-    for (const expected of ['authoring-layout--rail', 'authoring-layout--stacked']) {
-      if (expected === 'authoring-layout--stacked') {
-        await wrapper.find('[data-testid="layout-mode-stacked"]').trigger('click')
+    for (const expected of ['authoring-layout--side', 'authoring-layout--bottom']) {
+      if (expected === 'authoring-layout--bottom') {
+        await wrapper.find('[data-testid="layout-mode-bottom"]').trigger('click')
         await flushPromises()
       }
       const layout = wrapper.find('.authoring-layout')
@@ -150,74 +166,84 @@ describe('PracticeAuthoring — sticky Categories Management layout', () => {
     }
   })
 
-  it('renders the categories panel content in rail mode (not behind a v-if)', async () => {
-    installMatchMedia(true)
+  it('renders the categories panel content in the docked panel (not behind a v-if)', async () => {
     const wrapper = await mountPage()
 
     const lower = wrapper.find('.authoring-section--lower')
+    expect(lower.classes()).toContain('is-docked')
     expect(lower.find('#practice-categories-heading').exists()).toBe(true)
     expect(lower.text()).toContain('Joins')
     expect(lower.find('[data-testid="category-cat-1"]').exists()).toBe(true)
   })
 
-  it('renders the empty state inside the rail when there are no categories', async () => {
-    installMatchMedia(true)
+  it('renders the empty state inside the docked panel when there are no categories', async () => {
     vi.mocked(listCategories).mockResolvedValue([])
     const wrapper = await mountPage()
 
     expect(wrapper.find('.authoring-section--lower').text()).toContain('No categories yet')
   })
 
-  it('switching to stacked persists the preference', async () => {
-    installMatchMedia(true)
+  it('switching the dock persists the preference', async () => {
     const wrapper = await mountPage()
 
-    await wrapper.find('[data-testid="layout-mode-stacked"]').trigger('click')
-    expect(localStorage.getItem(KEY)).toBe('stacked')
-    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--stacked')
+    await wrapper.find('[data-testid="layout-mode-bottom"]').trigger('click')
+    expect(localStorage.getItem(KEY)).toBe('bottom')
+    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--bottom')
 
-    await wrapper.find('[data-testid="layout-mode-rail"]').trigger('click')
-    expect(localStorage.getItem(KEY)).toBe('rail')
-    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--rail')
+    await wrapper.find('[data-testid="layout-mode-side"]').trigger('click')
+    expect(localStorage.getItem(KEY)).toBe('side')
+    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--side')
   })
 
-  it('restores a persisted stacked preference on mount', async () => {
-    installMatchMedia(true)
-    localStorage.setItem(KEY, 'stacked')
+  it('restores a persisted bottom-dock preference on mount', async () => {
+    localStorage.setItem(KEY, 'bottom')
     const wrapper = await mountPage()
 
-    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--stacked')
-    expect(wrapper.find('[data-testid="layout-mode-stacked"]').attributes('aria-pressed')).toBe('true')
-    expect(wrapper.find('[data-testid="layout-mode-rail"]').attributes('aria-pressed')).toBe('false')
+    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--bottom')
+    expect(wrapper.find('[data-testid="layout-mode-bottom"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.find('[data-testid="layout-mode-side"]').attributes('aria-pressed')).toBe('false')
   })
 
-  it('falls back to stacked and hides the switch on a narrow viewport', async () => {
-    installMatchMedia(false)
+  it('migrates a legacy "rail" preference to the side dock', async () => {
+    localStorage.setItem(KEY, 'rail')
     const wrapper = await mountPage()
 
-    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--stacked')
-    expect(wrapper.find('.authoring-layout-bar').exists()).toBe(false)
-    // The categories panel is still there — narrow just means stacked, not gone.
-    expect(wrapper.find('#practice-categories-heading').exists()).toBe(true)
+    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--side')
   })
 
-  it('reveals the switch and the rail when the viewport widens', async () => {
-    const mm = installMatchMedia(false)
+  it('minimizing hides the panel and shows a reopen tab; persists', async () => {
     const wrapper = await mountPage()
-    expect(wrapper.find('.authoring-layout-bar').exists()).toBe(false)
 
-    mm.set(true)
-    await flushPromises()
+    expect(wrapper.find('[data-testid="floating-categories-reopen"]').exists()).toBe(false)
+    await wrapper.find('[data-testid="floating-categories-minimize"]').trigger('click')
 
-    expect(wrapper.find('.authoring-layout-bar').exists()).toBe(true)
-    expect(wrapper.find('.authoring-layout').classes()).toContain('authoring-layout--rail')
+    expect(wrapper.find('.authoring-section--lower').classes()).toContain('is-collapsed')
+    expect(wrapper.find('[data-testid="floating-categories-reopen"]').exists()).toBe(true)
+    expect(localStorage.getItem(COLLAPSED_KEY)).toBe('1')
+
+    await wrapper.find('[data-testid="floating-categories-reopen"]').trigger('click')
+    expect(wrapper.find('.authoring-section--lower').classes()).not.toContain('is-collapsed')
+    expect(wrapper.find('[data-testid="floating-categories-reopen"]').exists()).toBe(false)
+    expect(localStorage.getItem(COLLAPSED_KEY)).toBe('0')
+  })
+
+  it('offers minimize + reopen in BOTH docks', async () => {
+    // Regression: minimize was gated on one mode, leaving the other dock as a
+    // permanent overlay the lecturer could not dismiss.
+    const wrapper = await mountPage()
+    await wrapper.find('[data-testid="layout-mode-bottom"]').trigger('click')
+
+    expect(wrapper.find('[data-testid="floating-categories-minimize"]').exists()).toBe(true)
+    await wrapper.find('[data-testid="floating-categories-minimize"]').trigger('click')
+
+    expect(wrapper.find('.authoring-section--lower').classes()).toContain('is-collapsed')
+    const tab = wrapper.find('[data-testid="floating-categories-reopen"]')
+    expect(tab.exists()).toBe(true)
+    // The tab sits on the edge the panel will return to.
+    expect(tab.classes()).toContain('authoring-floating-tab--bottom')
   })
 
   it('keeps the questions table inside a horizontal-scroll wrapper', async () => {
-    // The rail narrows the left column below the 8-column table's min-content
-    // width. Unwrapped, the table overflows its card and the whole page gains a
-    // horizontal scrollbar — the regression this wrapper exists to prevent.
-    installMatchMedia(true)
     vi.mocked(lecturerListQuestions).mockResolvedValue([
       {
         id: 'q-1',
@@ -242,7 +268,6 @@ describe('PracticeAuthoring — sticky Categories Management layout', () => {
   it('does not drop the old "Manage Categories" show/hide toggle back in', async () => {
     // ARCH-034: the panel is always rendered. A regression that reintroduces a
     // visibility toggle would silently undo the whole point of this layout.
-    installMatchMedia(true)
     const wrapper = await mountPage()
     const labels = wrapper.findAll('button').map(b => b.text())
     expect(labels.some(t => /hide categories/i.test(t))).toBe(false)

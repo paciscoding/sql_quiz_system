@@ -761,45 +761,137 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   .cms-brand .brand-sub { display: none; }
 }
 
-/* ---------- Authoring layout: rail / stacked ----------------------------- */
+/* ---------- Authoring layout: side / bottom dock ------------------------- */
 /* The lecturer authoring pages need their Categories Management panel visible
-   at any scroll position. The shell scrolls the *document* (.cms-shell is
-   min-height:100dvh and nothing sets an inner overflow), so there is no scroll
-   container to dock a bottom bar against and `position: sticky; bottom: 0`
-   would be a no-op on a last child. A side rail is the only layout that can
-   follow the scroll here — the same trick .cms-sidebar already uses above.
+   at any scroll position and any viewport width. BOTH modes are
+   `position: fixed` overlays (the chat-widget / ad-popup pattern) — this is an
+   ORIENTATION toggle, not float-vs-in-flow:
+     - side:   right edge, full viewport height, vertical switch strip.
+     - bottom: bottom edge, full viewport width, horizontal switch strip.
    Design: docs/superpowers/specs/2026-07-30-sticky-categories-panel-design.md
+   (superseded twice: first a `position: sticky` rail gated behind a 1280px
+   breakpoint, then a 'floating'/'stacked' pair in which only one of the two
+   actually floated. Both degraded silently into a panel that scrolled away,
+   which is exactly the failure this feature exists to prevent.)
    These rules are global (not <style scoped>) so exam authoring can adopt the
    same layout without a third copy of them. */
 
-.authoring-layout-bar {
+/* Neither dock takes the page's flow, so the question form always gets the
+   full content width in both modes. */
+.authoring-layout--side,
+.authoring-layout--bottom {
+  display: block;
+}
+.authoring-layout--side > .authoring-section--upper,
+.authoring-layout--bottom > .authoring-section--upper {
+  width: 100%;
+}
+
+/* --- the docked panel box, shared by both orientations ------------------- */
+/* Every rule below is qualified with the `.authoring-layout >` ancestor on
+   purpose. Vue scoped styles compile to `.foo[data-v-x]` — specificity
+   (0,2,0) — and are injected AFTER this stylesheet, so a single-class scoped
+   rule TIES an unqualified two-class rule here and wins on order. Both
+   authoring components used to carry a scoped `.authoring-section
+   { display: block }` that beat `.is-docked`'s `display: flex` (killing the
+   flex chain the panel's internal scrolling depends on) and `.is-collapsed`'s
+   `display: none` (making Minimize a silent no-op). The scoped rules are
+   gone; the extra ancestor here is what stops an equivalent one from
+   reintroducing either bug. */
+.authoring-layout > .authoring-section--lower.is-docked {
+  position: fixed;
+  z-index: 200;                  /* above .cms-header (z-index: 50) */
+  display: flex;                 /* hosts .authoring-panel-shell */
+  overflow: hidden;              /* the content scrolls, not this box */
+  margin: 0;
+  padding: 0;
+  border: none;                  /* each dock draws only its exposed edge */
+  background: var(--color-surface);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+}
+
+/* top AND bottom pinned — that pair is what makes the height genuinely the
+   full viewport, so the switch strip inside can stretch to match it. An
+   earlier version set only `bottom` plus a `max-height`, which left the box's
+   used height as shrink-to-content and collapsed every height chained off it. */
+.authoring-layout > .authoring-section--lower.dock-side {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  /* Wide enough for the category cards' own content — schema name, question
+     count, badges and the rename/delete buttons — to stay on readable lines
+     once the 56px switch strip and the content padding are subtracted. */
+  width: min(560px, 92vw);
+  border-left: 2px solid var(--color-border);
+}
+
+.authoring-layout > .authoring-section--lower.dock-bottom {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: min(45vh, 460px);
+  height: min(45dvh, 460px);
+  border-top: 2px solid var(--color-border);
+}
+
+.authoring-layout > .authoring-section--lower.is-collapsed {
+  display: none;
+}
+
+/* --- shell: switch strip + scrolling content ---------------------------- */
+/* flex:1 rather than height:100% — the shell is a flex item of the docked box,
+   so it fills it without depending on a percentage-height chain. */
+.authoring-layout .authoring-panel-shell {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-4);
-  font-size: 0.85rem;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
-.authoring-layout-bar .authoring-layout-label {
-  color: var(--color-text-muted);
-  font-weight: 700;
+.authoring-panel-shell--side {
+  flex-direction: row;
 }
+.authoring-panel-shell--bottom {
+  flex-direction: column;
+}
+
+/* No border-radius/shadow/overflow of its own: the switch is an internal strip
+   of the SAME docked box as the content (one shared border, one shared
+   shadow), separated from it by a single divider line — not a second nested
+   box, which would read as two panels stuck together instead of one. Default
+   `align-self: stretch` is what gives it the panel's full cross-axis size. */
 .authoring-layout-switch {
-  display: inline-flex;
-  border: 2px solid var(--color-border);
-  border-radius: var(--radius);
-  overflow: hidden;
+  display: flex;
+  flex: none;
+}
+.authoring-panel-shell--side .authoring-layout-switch {
+  flex-direction: column;
+  width: 56px;   /* wider than a normal button, and the panel's full height */
+  border-right: 2px solid var(--color-border);
+}
+.authoring-panel-shell--bottom .authoring-layout-switch {
+  flex-direction: row;
+  height: 44px;  /* taller than a normal button, and the panel's full width */
+  border-bottom: 2px solid var(--color-border);
 }
 .authoring-layout-switch button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   border-radius: 0;
-  padding: 4px 10px;
+  padding: 4px 6px;
   font: inherit;
   font-weight: 700;
+  font-size: 0.78rem;
   background: var(--color-surface);
   color: var(--color-text);
   cursor: pointer;
 }
-.authoring-layout-switch button + button {
+.authoring-panel-shell--side .authoring-layout-switch button + button {
+  border-top: 2px solid var(--color-border);
+}
+.authoring-panel-shell--bottom .authoring-layout-switch button + button {
   border-left: 2px solid var(--color-border);
 }
 .authoring-layout-switch button:hover:not([aria-pressed='true']) {
@@ -814,46 +906,61 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   outline-offset: -4px;
 }
 
-/* --- stacked: the original single-column flow, questions above categories -- */
-.authoring-layout--stacked {
-  display: block;
+/* Ancestor-qualified for the same reason as the dock rules above: this is the
+   element that actually scrolls, and PracticeAuthoring.vue's scoped `.card`
+   rule (0,2,0) would otherwise tie and win on injection order. */
+.authoring-layout .authoring-panel-content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;  /* don't chain to the page at the panel's ends */
+  scrollbar-gutter: stable;      /* no width jump when the scrollbar appears */
+  padding: var(--space-4);
 }
-.authoring-layout--stacked > .authoring-section--lower {
-  border-top: 2px solid var(--color-border);
-  padding-top: var(--space-4);
-  margin-top: var(--space-4);
+/* PracticeAuthoring.vue wraps its content in a .card — undo its border/shadow
+   so the docked panel itself is the only visible box, not a card-in-a-box. */
+.authoring-layout .authoring-panel-content.card {
+  border: none;
+  box-shadow: none;
+  background: transparent;
 }
 
-/* --- rail: questions left, sticky categories right ----------------------- */
-.authoring-layout--rail {
-  display: grid;
-  /* 60/40, not 50/50: the question form is itself a two-column grid plus a
-     200px SqlEditor, so a literal half squeezes both of its cells to ~200px.
-     minmax(0, …) on the left track is load-bearing — without it the wide
-     .data-table and SqlEditor push the track past the container and the whole
-     page scrolls sideways. The 320px rail floor is what AUTHORING_RAIL_MEDIA_QUERY
-     in useAuthoringLayout.ts derives its 1280px threshold from; changing one
-     without the other reintroduces the squeezed-form case. */
-  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
-  gap: var(--space-5);
-  align-items: start;
+.authoring-floating-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
 }
-.authoring-layout--rail > .authoring-section--upper {
-  min-width: 0;
+
+/* --- reopen tab, shown while the panel is minimized ---------------------- */
+.authoring-floating-tab {
+  position: fixed;
+  z-index: 200;
+  padding: 10px 18px;
+  border: 2px solid var(--color-border);
+  background: var(--color-primary);
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
 }
-.authoring-layout--rail > .authoring-section--lower {
-  min-width: 0;
-  align-self: start;          /* a stretched grid item has no slack to stick in */
-  position: sticky;
-  top: calc(var(--layout-header-h) + var(--space-5));
-  /* Cap to the viewport and scroll internally. A sticky element taller than the
-     viewport simply scrolls with the page until its bottom edge arrives, which
-     would defeat the entire purpose once a few categories are expanded. */
-  max-height: calc(100vh - var(--layout-header-h) - var(--space-5) * 2);
-  max-height: calc(100dvh - var(--layout-header-h) - var(--space-5) * 2);
-  overflow-y: auto;
-  overscroll-behavior: contain;  /* don't chain to the page at the rail's ends */
-  scrollbar-gutter: stable;      /* no width jump when the scrollbar appears */
+/* Each tab sits on the edge its panel will return to. */
+.authoring-floating-tab--side {
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  border-right: none;
+  border-radius: 999px 0 0 999px;
+}
+.authoring-floating-tab--bottom {
+  right: var(--space-5);
+  bottom: 0;
+  border-bottom: none;
+  border-radius: 999px 999px 0 0;
+}
+.authoring-floating-tab:hover {
+  filter: brightness(1.05);
 }
 
 /* ---------- Subtask collapsible (CMS detail drawer) ---------------------- */

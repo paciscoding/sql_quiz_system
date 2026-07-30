@@ -35,13 +35,18 @@ import { useAuthoringLayout } from '../composables/useAuthoringLayout'
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
 
-// Layout preference for the Categories Management panel: 'rail' makes it a
-// sticky right-hand column that follows the page scroll, 'stacked' keeps the
-// original questions-above-categories flow. Persisted per lecturer; forced to
-// 'stacked' below 1024px where a second split has no room.
-// Geometry lives in the global .authoring-layout* rules in style.css.
-const { mode: layoutMode, canUseRail, effectiveMode: layoutEffectiveMode, setMode: setLayoutMode } =
-  useAuthoringLayout('practice')
+// Dock orientation for the Categories Management panel. BOTH modes are
+// `position: fixed` overlays that never scroll away, at any viewport width —
+// 'side' pins it to the right edge at full viewport height, 'bottom' to the
+// bottom edge at full viewport width. Persisted per lecturer, along with the
+// minimize state. Geometry lives in the global .authoring-* rules in
+// style.css.
+const {
+  mode: layoutMode,
+  collapsed: categoriesPanelCollapsed,
+  setMode: setLayoutMode,
+  toggleCollapsed: toggleCategoriesPanel,
+} = useAuthoringLayout('practice')
 
 const questions = ref<PracticeQuestion[]>([])
 const categories = ref<PracticeCategory[]>([])
@@ -158,8 +163,27 @@ const loadQuestions = async () => {
   }
 }
 
-const editQuestion = (q: PracticeQuestion) => {
+// Dirty-check guard (TODO-061): loadedFormSnapshot pins the form's shape at
+// the moment it was last loaded/reset; isFormDirty compares against it so
+// switching to another question or starting a new one can warn before
+// silently discarding in-progress edits (e.g. a half-written correct_sql).
+const loadedFormSnapshot = ref(JSON.stringify(form.value))
+const isFormDirty = computed(() => JSON.stringify(form.value) !== loadedFormSnapshot.value)
+
+async function confirmDiscardIfDirty(): Promise<boolean> {
+  if (!isFormDirty.value) return true
+  return confirm({
+    title: 'Discard unsaved changes?',
+    body: 'This question has edits that have not been saved yet. Switching now will lose them.',
+    confirmLabel: 'Discard',
+    danger: true,
+  })
+}
+
+const editQuestion = async (q: PracticeQuestion) => {
+  if (!(await confirmDiscardIfDirty())) return
   form.value = { ...q }
+  loadedFormSnapshot.value = JSON.stringify(form.value)
 }
 
 const formRef = ref<HTMLElement | null>(null)
@@ -180,9 +204,11 @@ const resetForm = () => {
   previewAsStudentRows.value = []
   previewAsStudentCols.value = []
   previewAsStudentError.value = ''
+  loadedFormSnapshot.value = JSON.stringify(form.value)
 }
 
-function newPracticeQuestion() {
+async function newPracticeQuestion() {
+  if (!(await confirmDiscardIfDirty())) return
   resetForm()
   formRef.value?.scrollIntoView({ behavior: 'smooth' })
 }
@@ -481,41 +507,19 @@ onMounted(() => {
     </div>
     <BackLink to="/lecturer" label="Back to Lecturer Dashboard" />
 
-    <!-- Layout switch. Hidden below 1024px, where canUseRail is false and the
-         stacked layout is the only one that fits — showing a control that
-         cannot change anything would be worse than showing none. -->
-    <div v-if="canUseRail" class="authoring-layout-bar">
-      <span class="authoring-layout-label" id="practice-layout-switch-label">Categories panel</span>
-      <span class="authoring-layout-switch" role="group" aria-labelledby="practice-layout-switch-label">
-        <button
-          type="button"
-          data-testid="layout-mode-rail"
-          :aria-pressed="layoutMode === 'rail'"
-          @click="setLayoutMode('rail')"
-        >Side rail</button>
-        <button
-          type="button"
-          data-testid="layout-mode-stacked"
-          :aria-pressed="layoutMode === 'stacked'"
-          @click="setLayoutMode('stacked')"
-        >Stacked</button>
-      </span>
-      <span class="muted">{{ layoutEffectiveMode === 'rail' ? 'Pinned beside the form — follows the page scroll.' : 'Below the form.' }}</span>
-    </div>
-
     <!-- Both sections stay mounted in both modes and keep their DOM order; only
          the wrapper class changes, so switching layouts never unmounts a
          half-filled import editor or collapses an open category card. -->
-    <div class="authoring-layout" :class="`authoring-layout--${layoutEffectiveMode}`">
+    <div class="authoring-layout" :class="`authoring-layout--${layoutMode}`">
     <!-- UPPER section: Practice Questions list + Create/Edit form. Behaviour unchanged from before the split. -->
     <section class="authoring-section authoring-section--upper">
       <!-- Section A: Question List -->
       <div class="card" style="margin-bottom: var(--space-4);">
         <h2>Practice Questions</h2>
         <div v-if="questions.length === 0" class="muted">No questions yet.</div>
-        <!-- The rail layout narrows this column, and an 8-column table has a
-             min-content width wider than it. Without this wrapper the table
-             overflows its card and the whole page scrolls sideways. -->
+        <!-- An 8-column table has a min-content width wider than a narrow
+             viewport. Without this wrapper the table overflows its card and
+             the whole page scrolls sideways. -->
         <div v-else class="responsive-table-wrap">
         <table class="data-table">
           <thead>
@@ -704,15 +708,53 @@ onMounted(() => {
       </div>
     </section>
 
-    <!-- LOWER section: Categories Management. Always rendered — no show/hide toggle. -->
-    <section class="authoring-section authoring-section--lower" aria-labelledby="practice-categories-heading">
-      <div class="card">
-        <h2 id="practice-categories-heading">{{ UI_COPY.MANAGE_CATEGORIES }}</h2>
+    <!-- LOWER section: Categories Management. A `position: fixed` overlay in
+         BOTH modes (see .authoring-section--lower.is-docked in style.css) —
+         'side' docks it to the right edge at full viewport height, 'bottom'
+         to the bottom edge at full viewport width. The orientation switch is
+         docked onto the panel itself (not a separate page-level bar) as a
+         vertical or horizontal strip to match. Minimize is available in both
+         modes: gating it on one mode left the other with no way to get the
+         overlay out of the way. -->
+    <section
+      class="authoring-section authoring-section--lower is-docked"
+      :class="[`dock-${layoutMode}`, { 'is-collapsed': categoriesPanelCollapsed }]"
+      aria-labelledby="practice-categories-heading"
+    >
+      <div class="authoring-panel-shell" :class="`authoring-panel-shell--${layoutMode}`">
+        <span class="authoring-layout-switch" role="group" aria-label="Categories panel dock">
+          <button
+            type="button"
+            data-testid="layout-mode-side"
+            title="Dock to the right edge"
+            :aria-pressed="layoutMode === 'side'"
+            @click="setLayoutMode('side')"
+          >Side</button>
+          <button
+            type="button"
+            data-testid="layout-mode-bottom"
+            title="Dock to the bottom edge"
+            :aria-pressed="layoutMode === 'bottom'"
+            @click="setLayoutMode('bottom')"
+          >Btm</button>
+        </span>
+
+      <div class="card authoring-panel-content">
+        <div class="authoring-floating-panel-header">
+          <h2 id="practice-categories-heading">{{ UI_COPY.MANAGE_CATEGORIES }}</h2>
+          <button
+            type="button"
+            class="btn btn-sm btn-secondary"
+            data-testid="floating-categories-minimize"
+            aria-label="Minimize categories panel"
+            @click="toggleCategoriesPanel"
+          >Minimize</button>
+        </div>
         <p class="muted">Each category owns its own database (schema), kept separate from exams. Import a <code>.sql</code> per category.</p>
 
         <!-- New category -->
         <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">
-          <input v-model="newCategoryName" class="input" placeholder="New category name" style="flex: 1;" @keyup.enter="addCategory" />
+          <input v-model="newCategoryName" class="input" placeholder="New category name" aria-label="New category name" style="flex: 1;" @keyup.enter="addCategory" />
           <button class="btn btn-primary" :disabled="addCategoryLoading || !newCategoryName.trim()" @click="addCategory">
             {{ UI_COPY.NEW_CATEGORY }}
           </button>
@@ -799,6 +841,7 @@ onMounted(() => {
                   rows="3"
                   style="flex: 1; resize: vertical; min-height: 60px;"
                   :placeholder="'Write a description for the ' + c.name + ' category...'"
+                  :aria-label="'Description for the ' + c.name + ' category'"
                 ></textarea>
                 <button
                   class="btn btn-primary btn-sm"
@@ -818,8 +861,20 @@ onMounted(() => {
         </div>
         <p v-else class="muted">No categories yet. Create one above.</p>
       </div>
+      </div><!-- /.authoring-panel-shell -->
     </section>
     </div><!-- /.authoring-layout -->
+
+    <!-- Reopen tab: shown while the panel is minimized, in either dock. It
+         sits on the edge the panel will return to. -->
+    <button
+      v-if="categoriesPanelCollapsed"
+      type="button"
+      class="authoring-floating-tab"
+      :class="`authoring-floating-tab--${layoutMode}`"
+      data-testid="floating-categories-reopen"
+      @click="toggleCategoriesPanel"
+    >{{ UI_COPY.MANAGE_CATEGORIES }}</button>
   </div>
 </template>
 
@@ -900,13 +955,16 @@ h3 {
   grid-column: span 2;
 }
 
-/* .authoring-layout / .authoring-section--upper / --lower geometry now lives in
-   the global .authoring-layout* rules in style.css — a scoped copy here would
-   carry the same specificity as those rules and win or lose by stylesheet
-   injection order, which is not something to depend on. */
-.authoring-section {
-  display: block;
-}
+/* .authoring-layout / .authoring-section--upper / --lower geometry lives in the
+   global .authoring-* rules in style.css. Do NOT add a scoped rule for those
+   selectors here: scoped styles compile to `.foo[data-v-x]` (specificity
+   0,2,0) and are injected AFTER style.css, so even a single-class scoped rule
+   ties the global two-class rules and wins on order. A scoped
+   `.authoring-section { display: block }` used to live here and silently beat
+   both `.is-docked { display: flex }` (breaking the flex chain the panel's
+   internal scrolling depends on) and `.is-collapsed { display: none }`
+   (making Minimize a no-op). It was also redundant — <section> is already
+   display:block per the UA stylesheet. */
 .cat-subpanel {
   border: 1px solid var(--color-border-soft);
   padding: var(--space-3);

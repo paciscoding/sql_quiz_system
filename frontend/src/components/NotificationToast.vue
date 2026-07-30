@@ -5,17 +5,18 @@ const { notifications, remove } = useNotifications()
 </script>
 
 <template>
-  <div class="notification-container">
+  <div class="notification-container" aria-live="polite" role="status">
     <TransitionGroup name="toast">
-      <div 
-        v-for="n in notifications" 
-        :key="n.id" 
-        class="toast" 
+      <div
+        v-for="n in notifications"
+        :key="n.id"
+        class="toast"
         :class="n.type"
+        :role="n.type === 'error' ? 'alert' : undefined"
         @click="remove(n.id)"
       >
         <div class="toast-content">{{ n.message }}</div>
-        <button class="close-btn">&times;</button>
+        <button class="close-btn" aria-label="Dismiss notification" @click.stop="remove(n.id)">&times;</button>
       </div>
     </TransitionGroup>
   </div>
