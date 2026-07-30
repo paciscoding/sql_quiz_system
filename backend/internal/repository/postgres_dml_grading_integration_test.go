@@ -143,7 +143,6 @@ func TestDMLGrading_D3_ZeroRowModelAnswerHardBlocked(t *testing.T) {
 // import-with-replace takes the schema's exclusive rebuild lock and therefore
 // blocks while a practice DML evaluation holds the shared lock against that
 // same category schema, unblocking only once the evaluation finishes.
-// Mirrors TestResetPracticeSandbox_BlocksOnInFlightEval's pattern.
 func TestDMLGrading_ARCH013_ImportReplaceBlocksOnInFlightEval(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()

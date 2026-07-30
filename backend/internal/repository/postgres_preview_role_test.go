@@ -109,11 +109,10 @@ func TestPreviewRoles_ExistAndIdempotent(t *testing.T) {
 }
 
 // TestPreviewRoles_HardInvariant_NoUsageOnRealSchemas proves neither new role
-// ever holds USAGE on any real schema: public/app-adjacent shared schemas,
-// the practice sandbox, a real practice category schema, a real exam
-// curriculum schema, and a real exam DML sandbox. This is the hard invariant
-// ARCH-020 requires — the new roles' only privileges must come from decoy
-// grants.
+// ever holds USAGE on any real schema: public/app-adjacent shared schemas, a
+// real practice category schema, a real exam curriculum schema, and a real
+// exam DML sandbox. This is the hard invariant ARCH-020 requires — the new
+// roles' only privileges must come from decoy grants.
 func TestPreviewRoles_HardInvariant_NoUsageOnRealSchemas(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()
@@ -139,11 +138,7 @@ func TestPreviewRoles_HardInvariant_NoUsageOnRealSchemas(t *testing.T) {
 	}
 	realExamSandbox := ExamSandboxName(examID)
 
-	if err := repo.InitializePracticeSandbox(ctx); err != nil {
-		t.Fatalf("InitializePracticeSandbox: %v", err)
-	}
-
-	realSchemas := []string{"app", practiceSandboxSchema, realCatSchema, realExamCurriculum, realExamSandbox}
+	realSchemas := []string{"app", realCatSchema, realExamCurriculum, realExamSandbox}
 	for _, role := range []string{rolePreviewStudent, rolePreviewStudentReadonly} {
 		for _, schema := range realSchemas {
 			if hasSchemaUsage(t, repo, ctx, role, schema) {

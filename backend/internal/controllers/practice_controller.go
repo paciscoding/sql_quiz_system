@@ -366,17 +366,6 @@ func (ctrl *PracticeController) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Practice question deleted"})
 }
 
-// ResetSandbox (POST /lecturer/practice/reset-sandbox)
-func (ctrl *PracticeController) ResetSandbox(c *gin.Context) {
-	resetAt, err := ctrl.repo.ResetPracticeSandbox(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"reset_at": resetAt})
-}
-
 // LecturerPreview (POST /lecturer/practice/preview)
 func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 	var req struct {

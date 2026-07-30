@@ -72,11 +72,6 @@ func main() {
 		log.Fatalf("Failed to initialize system tables: %v", err)
 	}
 
-	// Initialize Practice Sandbox
-	if err := repo.InitializePracticeSandbox(ctx); err != nil {
-		log.Fatalf("Failed to initialize practice sandbox: %v", err)
-	}
-
 	// Initialize SSE hub for real-time exam status push
 	hub := services.NewHub()
 	defer hub.Close()

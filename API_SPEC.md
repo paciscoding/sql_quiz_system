@@ -103,7 +103,6 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Practice (lecturer) | GET | `/lecturer/practice/questions` | Admin/Lecturer |
 | Practice (lecturer) | DELETE | `/lecturer/practice/question/:id` | Admin/Lecturer |
 | Practice (lecturer) | POST | `/lecturer/practice/preview` | Admin/Lecturer |
-| Practice (lecturer) | POST | `/lecturer/practice/reset-sandbox` | ⚠ handler exists but **no route is registered** — see below |
 | Practice (lecturer) | GET | `/lecturer/practice/results` | Admin/Lecturer |
 | Practice (lecturer) | GET | `/lecturer/practice/categories` | Admin/Lecturer |
 | Practice (lecturer) | POST | `/lecturer/practice/categories` | Admin/Lecturer |
@@ -461,8 +460,6 @@ Student practice endpoints return **423 Locked** (`{"error": "practice_unavailab
 - `GET /lecturer/practice/questions` → **200:** full array (sensitive fields intact).
 - `DELETE /lecturer/practice/question/:id` → **200:** `{"message": "Practice question deleted"}`.
 - `POST /lecturer/practice/preview` — **Payload:** `{"type", "target_table", "correct_sql"}` (no `exam_id`). **200 (ok):** `{"status": "ok", "rows", "columns"}`; **200 (engine error):** `{"status": "error", "error"}`.
-- `POST /lecturer/practice/reset-sandbox` → **200:** `{"reset_at": <timestamp>}`. Rebuilds practice schemas.
-  - ⚠ **Currently unreachable — returns 404.** `PracticeController.ResetSandbox` (`practice_controller.go`) and `PostgresRepository.ResetPracticeSandbox` (`postgres_schema.go`) both exist and are tested, but no route is registered for them in `cmd/main.go`. Either the registration was dropped in a refactor or the endpoint was retired without removing the handler. Resolve by registering the route or deleting the handler — do not assume this endpoint works.
 - `GET /lecturer/practice/categories` → **200:** array of categories.
 - `POST /lecturer/practice/categories` — **Payload:** `{"name": "..."}` → **201:** created category.
 - `PUT /lecturer/practice/categories/:id` — **Payload:** `{"name": "..."}` → **200:** `{"message": "Category renamed"}`. **404:** not found.

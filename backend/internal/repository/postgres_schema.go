@@ -7,15 +7,10 @@ import (
 	"log"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
-
-// practiceSandboxSchema is the single shared schema that every practice
-// evaluation runs against and that ResetPracticeSandbox rebuilds.
-const practiceSandboxSchema = "sandbox_practice"
 
 // fnv1a64Signed hashes s with FNV-1a (64-bit) and reinterprets the bits as an
 // int64 so it fits Postgres advisory-lock's bigint key argument.
@@ -783,120 +778,6 @@ func (r *PostgresRepository) InitializeExamSandbox(ctx context.Context, examID i
 	return err
 }
 
-// InitializePracticeSandbox creates the shared practice sandbox schema and
-// clones every public table into it once. The call is idempotent: if the
-// schema already exists, it returns nil immediately without issuing any DDL.
-// Permissions are granted to both exam_student (full DML) and
-// exam_student_readonly (SELECT only) so that practice evaluations can run.
-func (r *PostgresRepository) InitializePracticeSandbox(ctx context.Context) error {
-	const schema = "sandbox_practice"
-
-	// Idempotency check: if the schema already exists, do nothing.
-	var exists bool
-	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
-		schema).Scan(&exists); err != nil {
-		return fmt.Errorf("failed to check practice sandbox existence: %w", err)
-	}
-	if exists {
-		return nil
-	}
-
-	if err := r.EnsureSchema(ctx, schema); err != nil {
-		return err
-	}
-	// Grant before cloning so ALTER DEFAULT PRIVILEGES applies to the new tables.
-	if err := r.GrantSchemaPermissions(ctx, schema); err != nil {
-		return err
-	}
-	// Grant read-only access to exam_student_readonly.
-	safeSchema := pgx.Identifier{schema}.Sanitize()
-	readonlyQueries := []string{
-		fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO exam_student_readonly", safeSchema),
-		fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA %s TO exam_student_readonly", safeSchema),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT ON TABLES TO exam_student_readonly", safeSchema),
-	}
-	for _, q := range readonlyQueries {
-		if _, err := r.pool.Exec(ctx, q); err != nil {
-			return fmt.Errorf("failed to grant readonly permissions on %s: %w", schema, err)
-		}
-	}
-	// Practice sandbox always clones from public (unchanged behaviour).
-	if err := r.ensureTablesInSchema(ctx, schema, "public"); err != nil {
-		return err
-	}
-
-	_, err := r.pool.Exec(ctx,
-		`UPDATE app.practice_sandbox_state SET created_at = NOW() WHERE id = 1`)
-	return err
-}
-
-// ResetPracticeSandbox drops the practice sandbox schema and recreates it from
-// scratch, re-cloning every public table with fresh data. It stamps
-// last_reset_at in app.practice_sandbox_state and returns that timestamp so
-// the caller can include it in API responses.
-func (r *PostgresRepository) ResetPracticeSandbox(ctx context.Context) (time.Time, error) {
-	const schema = practiceSandboxSchema
-	lockKey := schemaRebuildLockKey(schema)
-
-	// Serialise the whole rebuild against in-flight practice evaluations. We
-	// hold a dedicated connection and take the advisory lock EXCLUSIVELY at the
-	// SESSION level: pg_advisory_lock blocks until every shared holder (each an
-	// in-flight eval, see evaluate*/acquireSchemaEvalLock) has released, then
-	// keeps new evals waiting until we unlock. Advisory locks are cooperative
-	// and cross-connection, so the DDL below may keep using the pool — only the
-	// lock discipline matters.
-	lockConn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to acquire lock connection for practice reset: %w", err)
-	}
-	defer lockConn.Release()
-	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
-		return time.Time{}, fmt.Errorf("failed to acquire practice reset lock: %w", err)
-	}
-	// Best-effort explicit unlock. Releasing the connection would also drop the
-	// session lock, but unlocking eagerly frees waiting evals a moment sooner.
-	defer func() {
-		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", lockKey)
-	}()
-
-	// Drop and recreate for a clean slate.
-	if _, err := r.pool.Exec(ctx, "DROP SCHEMA IF EXISTS sandbox_practice CASCADE"); err != nil {
-		return time.Time{}, fmt.Errorf("failed to drop practice sandbox schema: %w", err)
-	}
-	if err := r.EnsureSchema(ctx, schema); err != nil {
-		return time.Time{}, err
-	}
-	// Grant before cloning so ALTER DEFAULT PRIVILEGES applies to the new tables.
-	if err := r.GrantSchemaPermissions(ctx, schema); err != nil {
-		return time.Time{}, err
-	}
-	// Grant read-only access to exam_student_readonly.
-	safeSchema := pgx.Identifier{schema}.Sanitize()
-	readonlyQueries := []string{
-		fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO exam_student_readonly", safeSchema),
-		fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA %s TO exam_student_readonly", safeSchema),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT ON TABLES TO exam_student_readonly", safeSchema),
-	}
-	for _, q := range readonlyQueries {
-		if _, err := r.pool.Exec(ctx, q); err != nil {
-			return time.Time{}, fmt.Errorf("failed to grant readonly permissions on %s: %w", schema, err)
-		}
-	}
-	// Reset always clones from public (unchanged behaviour).
-	if err := r.ensureTablesInSchema(ctx, schema, "public"); err != nil {
-		return time.Time{}, err
-	}
-
-	var resetAt time.Time
-	if err := r.pool.QueryRow(ctx,
-		`UPDATE app.practice_sandbox_state SET last_reset_at = NOW() WHERE id = 1 RETURNING last_reset_at`,
-	).Scan(&resetAt); err != nil {
-		return time.Time{}, fmt.Errorf("failed to update practice_sandbox_state: %w", err)
-	}
-	return resetAt, nil
-}
-
 // examHasDMLQuestions reports whether `examID` has at least one DML question.
 // Used by SetExaminationActive to decide whether to spend the cost of cloning
 // public.* into the exam sandbox — pure-SELECT exams skip cloning entirely.
@@ -1048,13 +929,6 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			submitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_practice_attempts_student ON app.practice_attempts(student_id, submitted_at DESC);`,
-		`CREATE TABLE IF NOT EXISTS app.practice_sandbox_state (
-			id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-			schema_name TEXT NOT NULL DEFAULT 'sandbox_practice',
-			created_at TIMESTAMPTZ,
-			last_reset_at TIMESTAMPTZ
-		);`,
-		`INSERT INTO app.practice_sandbox_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;`,
 		// Practice categories: each row owns a schema named practice_cat_<id>.
 		// schema_name is filled in after INSERT (the SERIAL id is needed to derive
 		// it) by CreatePracticeCategory / the backfill migration.
