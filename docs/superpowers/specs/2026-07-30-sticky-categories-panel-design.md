@@ -112,7 +112,7 @@ In `--stacked` the wrapper is `display: block` and `--lower` keeps its existing 
 
 The grid, rail and stacked rules go into `frontend/src/style.css` as global `.authoring-layout*` classes, next to the existing shell rules. `PracticeAuthoring.vue`'s `<style scoped>` cannot express them anyway once exam authoring wants the same treatment, and the existing `.authoring-section` rules are already duplicated verbatim between `PracticeAuthoring.vue` and `ExamQuestionsPanel.vue`. Putting the new rules in one global place stops a third copy from being born.
 
-Extending `ExamQuestionsPanel.vue` to use the rail is **out of scope for this change** — the user named Practice Authoring. The composable and the CSS are written so that doing it later is a template-wrapper change and nothing more.
+`ExamQuestionsPanel.vue` was initially out of scope — the user named Practice Authoring — and was then adopted in a follow-up on the user's go-ahead, under the `'exam'` scope key so the two pages keep independent preferences. It needed one extra fix the practice page did not: its lower section carried an **inline** `border-top`/`padding-top` divider on top of the scoped one. Inline styles beat every stylesheet, so left in place it would have drawn a horizontal rule down the side of the rail. Removing it also fixes the double divider that inline rule had been rendering in the stacked layout all along.
 
 ## 4. Testing
 
@@ -134,7 +134,9 @@ New: `frontend/src/__tests__/components/PracticeAuthoring.layout.test.ts`
 - narrow viewport → wrapper is `--stacked` and the toggle bar is absent
 - the Categories heading and the "No categories yet" empty state still render in rail mode (i.e. the panel is genuinely always rendered, not `v-if`-ed)
 
-Mocking: the component's `services/practice` module is mocked the way `exam_categories_panel.test.ts` mocks `services/exam`; `matchMedia` is installed on `window` per-test since jsdom does not provide it.
+New: `frontend/src/__tests__/components/ExamQuestionsPanel.layout.test.ts` — the same contract for exam authoring, plus one assertion specific to it: the lower section's first child must carry no inline `border-top`/`padding-top`.
+
+Mocking: the component's `services/practice` module is mocked the way `exam_categories_panel.test.ts` mocks `services/exam`; `matchMedia` is installed on `window` per-test with a drivable fake, so a narrow→wide transition can be exercised rather than just one sampled width.
 
 CSS geometry (sticky offsets, max-height) is not unit-testable in jsdom and is not asserted — the tests cover the class contract and the composable's state machine, and the geometry is reviewed visually.
 

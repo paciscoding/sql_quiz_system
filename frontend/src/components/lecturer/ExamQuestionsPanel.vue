@@ -29,12 +29,19 @@ import {
 import { ApiError } from '../../services/practice'
 import { listExamIntroImages, examImageBlobUrl, type IntroImageMetadata } from '../../services/schemaImages'
 import CollapsibleCard from '../CollapsibleCard.vue'
+import { useAuthoringLayout } from '../../composables/useAuthoringLayout'
 
 const props = defineProps<{ exam: Examination }>()
 const emit = defineEmits<{ changed: [] }>()
 
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
+
+// Same rail/stacked layout as PracticeAuthoring.vue, under its own 'exam' key so
+// the two authoring pages keep independent preferences. Geometry lives in the
+// global .authoring-layout* rules in style.css.
+const { mode: layoutMode, canUseRail, effectiveMode: layoutEffectiveMode, setMode: setLayoutMode } =
+  useAuthoringLayout('exam')
 
 // Independent client-side check (dual-schema spec §6.1): dual_schema on an
 // exam with no decoy curriculum is allowed (grading falls back to schema B)
@@ -777,6 +784,31 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
 
 <template>
   <div>
+    <!-- Layout switch. Hidden below the rail's minimum width, where canUseRail
+         is false and stacked is the only layout that fits. -->
+    <div v-if="canUseRail" class="authoring-layout-bar">
+      <span class="authoring-layout-label" id="exam-layout-switch-label">Categories panel</span>
+      <span class="authoring-layout-switch" role="group" aria-labelledby="exam-layout-switch-label">
+        <button
+          type="button"
+          data-testid="layout-mode-rail"
+          :aria-pressed="layoutMode === 'rail'"
+          @click="setLayoutMode('rail')"
+        >Side rail</button>
+        <button
+          type="button"
+          data-testid="layout-mode-stacked"
+          :aria-pressed="layoutMode === 'stacked'"
+          @click="setLayoutMode('stacked')"
+        >Stacked</button>
+      </span>
+      <span class="muted">{{ layoutEffectiveMode === 'rail' ? 'Pinned beside the form — follows the page scroll.' : 'Below the form.' }}</span>
+    </div>
+
+    <!-- Both sections stay mounted in both modes and keep their DOM order; only
+         the wrapper class changes, so switching layouts never unmounts a
+         half-filled import editor or collapses an open category card. -->
+    <div class="authoring-layout" :class="`authoring-layout--${layoutEffectiveMode}`">
     <!-- UPPER section: everything this panel rendered before ARCH-034 (3) —
          question form, decoy curriculum import, exam description, exam intro
          images, questions list. Order and behaviour unchanged. -->
@@ -1062,7 +1094,11 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
          ARCH-029 service wrappers in services/exam.ts. NO intro-images
          sub-panel here — exam categories don't have them (ARCH-026 (6)). -->
     <section class="authoring-section authoring-section--lower" aria-labelledby="exam-categories-heading">
-      <div style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">
+      <!-- No inline divider here: inline styles beat every stylesheet, so one
+           would draw a rule down the side of the rail. The separator comes from
+           the mode-aware .authoring-layout--stacked rule in style.css, which
+           also removes the double divider this used to render. -->
+      <div>
         <h2 id="exam-categories-heading" style="margin: 0 0 var(--space-2) 0;">Exam Categories</h2>
         <p class="muted" style="margin: 0 0 var(--space-3) 0; font-size: 0.85rem;">Each category can own its own database, kept separate from the exam-level schema above. Questions with no category grade against the exam-level schema.</p>
 
@@ -1169,6 +1205,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         <p v-else class="muted">No categories yet. Create one above.</p>
       </div>
     </section><!-- /authoring-section--lower -->
+    </div><!-- /.authoring-layout -->
   </div>
 </template>
 
@@ -1337,16 +1374,12 @@ textarea {
   margin-top: 2rem;
 }
 
-/* ARCH-034 (3)(d): two sibling sections, upper then lower, divided by a
-   visible border — the same divider treatment already used between the
-   sub-panels in this file. */
+/* ARCH-034 (3)(d): two sibling sections, upper then lower. The divider and the
+   rail/stacked geometry now come from the global .authoring-layout* rules in
+   style.css — a scoped copy here carries the same specificity as those rules
+   and would win or lose by stylesheet injection order. */
 .authoring-section {
   display: block;
-}
-.authoring-section--lower {
-  border-top: 2px solid var(--color-border);
-  padding-top: var(--space-4);
-  margin-top: var(--space-4);
 }
 .cat-subpanel {
   border: 1px solid var(--color-border-soft);
