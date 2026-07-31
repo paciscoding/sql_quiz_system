@@ -125,6 +125,14 @@ describe('ExamQuestionsPanel — docked Exam Categories panel', () => {
     expect(wrapper.find('[data-testid="layout-mode-bottom"]').exists()).toBe(true)
   })
 
+  it('places the dock switch beside Minimize in the panel header', async () => {
+    const wrapper = await mountPanel()
+    const actions = wrapper.find('.authoring-floating-panel-header .authoring-floating-panel-header-actions')
+    expect(actions.exists()).toBe(true)
+    expect(actions.find('.authoring-layout-switch').exists()).toBe(true)
+    expect(actions.find('[data-testid="floating-categories-minimize"]').exists()).toBe(true)
+  })
+
   it('keeps the panel docked (fixed overlay) in BOTH orientations', async () => {
     const wrapper = await mountPanel()
     expect(wrapper.find('.authoring-section--lower').classes()).toContain('is-docked')

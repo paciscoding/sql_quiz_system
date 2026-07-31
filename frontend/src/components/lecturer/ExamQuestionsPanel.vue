@@ -1102,44 +1102,45 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
          A `position: fixed` overlay in BOTH modes (see
          .authoring-section--lower.is-docked in style.css) — 'side' docks it
          to the right edge at full viewport height, 'bottom' to the bottom
-         edge at full viewport width — with the orientation switch docked
-         onto the panel itself and minimize available in either mode. -->
+         edge at full viewport width — with the dock switch in the panel
+         header beside Minimize, available in either mode. -->
     <section
       class="authoring-section authoring-section--lower is-docked"
       :class="[`dock-${layoutMode}`, { 'is-collapsed': categoriesPanelCollapsed }]"
       aria-labelledby="exam-categories-heading"
     >
       <div class="authoring-panel-shell" :class="`authoring-panel-shell--${layoutMode}`">
-        <span class="authoring-layout-switch" role="group" aria-label="Categories panel dock">
-          <button
-            type="button"
-            data-testid="layout-mode-side"
-            title="Dock to the right edge"
-            :aria-pressed="layoutMode === 'side'"
-            @click="setLayoutMode('side')"
-          >Side</button>
-          <button
-            type="button"
-            data-testid="layout-mode-bottom"
-            title="Dock to the bottom edge"
-            :aria-pressed="layoutMode === 'bottom'"
-            @click="setLayoutMode('bottom')"
-          >Btm</button>
-        </span>
-
       <!-- No inline divider here: inline styles beat every stylesheet, so one
            would draw a stray rule across the docked panel. The panel's own
            border comes from the .is-docked / .dock-* rules in style.css. -->
       <div class="authoring-panel-content">
         <div class="authoring-floating-panel-header">
           <h2 id="exam-categories-heading" style="margin: 0 0 var(--space-2) 0;">Exam Categories</h2>
-          <button
-            type="button"
-            class="btn-sm"
-            data-testid="floating-categories-minimize"
-            aria-label="Minimize categories panel"
-            @click="toggleCategoriesPanel"
-          >Minimize</button>
+          <span class="authoring-floating-panel-header-actions">
+            <span class="authoring-layout-switch" role="group" aria-label="Categories panel dock">
+              <button
+                type="button"
+                data-testid="layout-mode-side"
+                title="Dock to the right edge"
+                :aria-pressed="layoutMode === 'side'"
+                @click="setLayoutMode('side')"
+              >Side</button>
+              <button
+                type="button"
+                data-testid="layout-mode-bottom"
+                title="Dock to the bottom edge"
+                :aria-pressed="layoutMode === 'bottom'"
+                @click="setLayoutMode('bottom')"
+              >Btm</button>
+            </span>
+            <button
+              type="button"
+              class="btn-sm"
+              data-testid="floating-categories-minimize"
+              aria-label="Minimize categories panel"
+              @click="toggleCategoriesPanel"
+            >Minimize</button>
+          </span>
         </div>
         <p class="muted" style="margin: 0 0 var(--space-3) 0; font-size: 0.85rem;">Each category can own its own database, kept separate from the exam-level schema above. Questions with no category grade against the exam-level schema.</p>
 

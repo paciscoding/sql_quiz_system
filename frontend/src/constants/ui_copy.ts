@@ -43,8 +43,8 @@ export const UI_COPY = {
   REPLACE_EXAM_SCHEMA_CONFIRM: 'This exam already has a curriculum schema. Importing will drop the existing tables and replace them with the new data. An active exam cannot be re-imported. Continue?',
 
   // Practice categories
-  MANAGE_CATEGORIES: 'Manage Categories',
-  NEW_CATEGORY: 'New Category',
+  MANAGE_CATEGORIES: 'Practices',
+  NEW_CATEGORY: 'New Practice',
   RENAME_CATEGORY: 'Rename',
   DELETE_CATEGORY: 'Delete',
   IMPORT_CATEGORY_DB: 'Import Database',

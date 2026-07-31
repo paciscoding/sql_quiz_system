@@ -820,7 +820,7 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   bottom: 0;
   /* Wide enough for the category cards' own content — schema name, question
      count, badges and the rename/delete buttons — to stay on readable lines
-     once the 56px switch strip and the content padding are subtracted. */
+     once the content padding is subtracted. */
   width: min(560px, 92vw);
   border-left: 2px solid var(--color-border);
 }
@@ -854,44 +854,39 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   flex-direction: column;
 }
 
-/* No border-radius/shadow/overflow of its own: the switch is an internal strip
-   of the SAME docked box as the content (one shared border, one shared
-   shadow), separated from it by a single divider line — not a second nested
-   box, which would read as two panels stuck together instead of one. Default
-   `align-self: stretch` is what gives it the panel's full cross-axis size. */
+/* Segmented control living in the panel header, immediately beside Minimize:
+   dock position and minimize are the same kind of "where does this panel go"
+   control, so they sit together rather than the switch owning a whole edge
+   strip of the panel. Orientation-independent — it reads the same in both
+   docks, and no longer steals 56px of width from the side dock's content. */
 .authoring-layout-switch {
-  display: flex;
+  display: inline-flex;
   flex: none;
-}
-.authoring-panel-shell--side .authoring-layout-switch {
-  flex-direction: column;
-  width: 56px;   /* wider than a normal button, and the panel's full height */
-  border-right: 2px solid var(--color-border);
-}
-.authoring-panel-shell--bottom .authoring-layout-switch {
   flex-direction: row;
-  height: 44px;  /* taller than a normal button, and the panel's full width */
-  border-bottom: 2px solid var(--color-border);
+  align-items: stretch;
+  height: 28px;
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
 }
 .authoring-layout-switch button {
-  flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
   border: none;
   border-radius: 0;
-  padding: 4px 6px;
+  min-width: 42px;
+  padding: 0 10px;
+  margin: 0;
   font: inherit;
   font-weight: 700;
   font-size: 0.78rem;
+  line-height: 1;
   background: var(--color-surface);
   color: var(--color-text);
   cursor: pointer;
 }
-.authoring-panel-shell--side .authoring-layout-switch button + button {
-  border-top: 2px solid var(--color-border);
-}
-.authoring-panel-shell--bottom .authoring-layout-switch button + button {
+.authoring-layout-switch button + button {
   border-left: 2px solid var(--color-border);
 }
 .authoring-layout-switch button:hover:not([aria-pressed='true']) {
@@ -930,6 +925,14 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+/* dock switch + Minimize as one cluster on the header's trailing edge */
+.authoring-floating-panel-header-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
   gap: var(--space-2);
 }
 

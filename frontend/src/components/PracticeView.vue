@@ -238,7 +238,7 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
   <div class="practice-shell">
     <div class="page-header">
       <h1>Practice</h1>
-      <p class="page-subtitle">Browse a category, review its schema, and submit SQL against the practice sandbox.</p>
+      <p class="page-subtitle">Browse a practices, review its schema, and submit SQL against the practice sandbox.</p>
     </div>
 
     <BackLink to="/student" label="Back to Student Dashboard" />
@@ -252,7 +252,7 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
       <!-- Question List -->
       <div class="card question-list-card" :class="{ collapsed: questionListCollapsed }">
         <div class="card-header">
-          <h3 v-if="!questionListCollapsed" style="margin: 0;">Practice Categories</h3>
+          <h3 v-if="!questionListCollapsed" style="margin: 0;">Practices</h3>
           <button
             class="collapse-btn"
             :title="questionListCollapsed ? 'Expand question list' : 'Collapse question list'"
@@ -591,9 +591,9 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
 
 .requirement-box {
   padding: 12px 16px;
-  background: var(--alert-info-bg);
-  border: 1px solid var(--alert-info-border);
-  color: var(--alert-info-text);
+  background: #ffffff;
+  border: 2px solid #1e40af;
+  color: #1e40af;
   border-radius: var(--radius);
   font-size: 0.98rem;
   line-height: 1.55;

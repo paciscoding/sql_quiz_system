@@ -56,7 +56,7 @@ const form = ref<Partial<PracticeQuestion>>({
   strict_ordering: false,
   strict_attrs: false,
   strict_column_order: false,
-  dual_schema: false
+  dual_schema: true
 })
 const previewRows = ref<any[]>([])
 const previewCols = ref<string[]>([])
@@ -111,16 +111,11 @@ const categoryNameById = computed<Record<string, string>>(() => {
   return map
 })
 
-// Independent client-side check (dual-schema spec §6.1): dual_schema on a
-// category with no decoy schema is allowed (grading falls back to schema B)
-// but must be flagged to the lecturer with zero network round-trips. Purely
-// derived from the already-loaded categories list + form state, so it reacts
-// automatically to toggling form.dual_schema, loading a question into the
-// form (editQuestion does form.value = { ...q }), and changing the category
-// <select> — no extra watcher needed.
-const selectedCategoryHasDecoy = computed(() =>
-  categories.value.find(c => c.id === form.value.category_id)?.has_preview_schema ?? false
-)
+// The client-side "dual_schema on but this category has no decoy schema"
+// check (dual-schema spec §6.1) lived here as `selectedCategoryHasDecoy`. It
+// went away with the dual-schema toggle it annotated — with no lecturer-facing
+// control there is nothing to warn about at author time. The backend still
+// returns dual_schema_warning on save, which saveQuestion surfaces.
 
 const loadCategories = async () => {
   try {
@@ -601,7 +596,7 @@ onMounted(() => {
             </select>
           </div>
           <div class="field">
-            <label>Title <span class="muted">(optional — shown to students instead of a category ordinal)</span></label>
+            <label>Question No.</label>
             <input v-model="form.title" class="input" placeholder="e.g. Employees hired after 2020" />
           </div>
           <div class="field" v-if="form.question_type == 'DML'">
@@ -614,7 +609,7 @@ onMounted(() => {
             <button type="button" class="btn btn-sm" @click="dismissDraft">Discard</button>
           </div>
           <div class="field" style="grid-column: span 2;">
-            <label>Requirement</label>
+            <label>Instructions</label>
             <textarea v-model="form.requirement" class="input" rows="3"
               :aria-invalid="practiceForm.touched.requirement && !!practiceForm.errors.requirement"
               aria-describedby="err-practice-req"
@@ -638,20 +633,16 @@ onMounted(() => {
             </label>
           </div>
           <div v-else class="field muted" style="align-self: flex-end;">
-            DML answers are graded on the final table contents as an unordered set of rows, matched by column name. Ordering and column-order options do not apply.
+            INSERT/UPDATE/DELETE answers are graded on the final table contents as an unordered set of rows, matched by column name. Ordering and column-order options do not apply.
           </div>
-          <!-- Dual schema applies to both QUERY and DML, so it lives outside the
-               question_type v-if/v-else pair above. -->
-          <div class="field" style="display: flex; flex-direction: column; gap: var(--space-1); align-self: flex-end;">
-            <label style="display: flex; align-items: center; gap: var(--space-1); cursor: pointer; font-weight: 700; margin-bottom: 0;">
-              <input type="checkbox" v-model="form.dual_schema" /> Dual schema (hidden grading)
-            </label>
-            <!-- Independent, client-only validation (spec §6.1): no network round-trip,
-                 purely reactive to form.dual_schema + selectedCategoryHasDecoy. -->
-            <span v-if="form.dual_schema && !selectedCategoryHasDecoy" class="badge badge-warning" style="display: inline-block; font-weight: 600;">
-              Dual schema is enabled but this category has no decoy schema yet - previews will use the grading schema until you upload one.
-            </span>
-          </div>
+          <!-- Dual-schema control is hidden from the authoring form. The field
+               itself still travels with the question (form.dual_schema, set by
+               the defaults in resetForm / the loaded question) — only the
+               lecturer-facing toggle and its "no decoy schema yet" warning are
+               gone. Removed from the DOM rather than marked `hidden`: this div
+               carried an inline `display: flex`, and an inline declaration
+               beats the UA's `[hidden] { display: none }`, so the attribute
+               alone left it fully visible. -->
         </div>
 
         <div class="field" style="margin-top: var(--space-4);">
@@ -711,44 +702,45 @@ onMounted(() => {
     <!-- LOWER section: Categories Management. A `position: fixed` overlay in
          BOTH modes (see .authoring-section--lower.is-docked in style.css) —
          'side' docks it to the right edge at full viewport height, 'bottom'
-         to the bottom edge at full viewport width. The orientation switch is
-         docked onto the panel itself (not a separate page-level bar) as a
-         vertical or horizontal strip to match. Minimize is available in both
-         modes: gating it on one mode left the other with no way to get the
-         overlay out of the way. -->
+         to the bottom edge at full viewport width. The dock switch sits in the
+         panel header beside Minimize (not a separate page-level bar, and no
+         longer an edge strip eating the content's width). Minimize is
+         available in both modes: gating it on one mode left the other with no
+         way to get the overlay out of the way. -->
     <section
       class="authoring-section authoring-section--lower is-docked"
       :class="[`dock-${layoutMode}`, { 'is-collapsed': categoriesPanelCollapsed }]"
       aria-labelledby="practice-categories-heading"
     >
       <div class="authoring-panel-shell" :class="`authoring-panel-shell--${layoutMode}`">
-        <span class="authoring-layout-switch" role="group" aria-label="Categories panel dock">
-          <button
-            type="button"
-            data-testid="layout-mode-side"
-            title="Dock to the right edge"
-            :aria-pressed="layoutMode === 'side'"
-            @click="setLayoutMode('side')"
-          >Side</button>
-          <button
-            type="button"
-            data-testid="layout-mode-bottom"
-            title="Dock to the bottom edge"
-            :aria-pressed="layoutMode === 'bottom'"
-            @click="setLayoutMode('bottom')"
-          >Btm</button>
-        </span>
-
       <div class="card authoring-panel-content">
         <div class="authoring-floating-panel-header">
           <h2 id="practice-categories-heading">{{ UI_COPY.MANAGE_CATEGORIES }}</h2>
-          <button
-            type="button"
-            class="btn btn-sm btn-secondary"
-            data-testid="floating-categories-minimize"
-            aria-label="Minimize categories panel"
-            @click="toggleCategoriesPanel"
-          >Minimize</button>
+          <span class="authoring-floating-panel-header-actions">
+            <span class="authoring-layout-switch" role="group" aria-label="Categories panel dock">
+              <button
+                type="button"
+                data-testid="layout-mode-side"
+                title="Dock to the right edge"
+                :aria-pressed="layoutMode === 'side'"
+                @click="setLayoutMode('side')"
+              >Side</button>
+              <button
+                type="button"
+                data-testid="layout-mode-bottom"
+                title="Dock to the bottom edge"
+                :aria-pressed="layoutMode === 'bottom'"
+                @click="setLayoutMode('bottom')"
+              >Btm</button>
+            </span>
+            <button
+              type="button"
+              class="btn btn-sm btn-secondary"
+              data-testid="floating-categories-minimize"
+              aria-label="Minimize categories panel"
+              @click="toggleCategoriesPanel"
+            >Minimize</button>
+          </span>
         </div>
         <p class="muted">Each category owns its own database (schema), kept separate from exams. Import a <code>.sql</code> per category.</p>
 
