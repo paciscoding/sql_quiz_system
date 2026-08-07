@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
@@ -161,7 +162,8 @@ func (s *ValidationService) decideStatus(execResult models.ValidationResult, stu
 		// or fails to parse (e.g. legacy rows captured before ordered-capture existed),
 		// skip the gate rather than hard-failing.
 		if len(q.ExpectedColumns) > 0 && json.Unmarshal(q.ExpectedColumns, &teacherCols) == nil && len(teacherCols) > 0 {
-			if !equalStringSlices(teacherCols, studentColumns) {
+			// ARCH-043: order is graded, casing is not.
+			if !equalStringSlicesFold(teacherCols, studentColumns) {
 				execResult.Status = "incorrect"
 				execResult.IsCorrect = false
 				execResult.Score = 0
@@ -257,12 +259,90 @@ func (s *ValidationService) compareResults(teacher, student []map[string]interfa
 	return true
 }
 
-func equalStringSlices(a, b []string) bool {
+// foldColumnName is the single definition of how a COLUMN NAME is normalised
+// before grading compares it (ARCH-043). Postgres folds every unquoted
+// identifier to lower case, so `SELECT fname` captures the key "fname" while a
+// student who writes `SELECT fname AS "Fname"` captures "Fname" — the exact
+// same column, spelled differently only because one of the two happened to
+// quote the alias. Grading a pure casing difference as a wrong answer punishes
+// the student for a Postgres quoting rule rather than for their SQL, so column
+// names match case-insensitively everywhere below. CELL VALUES are untouched:
+// valuesEqual stays case-SENSITIVE, so 'Smith' is still not 'smith'.
+//
+// strings.ToLower (ASCII/Unicode simple fold) is the right normaliser here
+// because these are SQL identifiers, and it matches what Postgres itself does
+// to unquoted names closely enough for the identifiers a quiz can produce.
+func foldColumnName(name string) string {
+	return strings.ToLower(name)
+}
+
+// foldRowKeys re-keys a captured row by folded column name. It reports ok=false
+// when two of the row's OWN column names collide under folding — e.g. a student
+// who wrote `SELECT a AS "x", b AS "X"`, which Postgres happily returns as two
+// distinct columns (ARCH-043).
+//
+// A collision is NOT resolved by picking a winner: with two candidate columns
+// folding to the same name there is no non-arbitrary way to decide which one
+// the teacher's column should be compared against, and map iteration order in
+// Go is randomised, so "pick one" would make the same submission grade correct
+// or incorrect run to run.
+//
+// Instead, the comparison callers fall back to rowsEqualExactKeys for that row
+// pair (ARCH-044). The original ARCH-043 implementation failed closed here, and
+// that was a REGRESSION: ok=false fires on the TEACHER's own captured row too,
+// which happens whenever the model answer projects case-distinct quoted names
+// (`SELECT e.dno AS "Dno", d.dno AS "DNO"`) or the DML target table was created
+// with quoted "Total"/"total" columns. Every student on such a question then
+// scored 0 — including one submitting SQL byte-identical to the model answer —
+// and the ColumnOrder gate could not catch it because equalStringSlicesFold
+// compares element-wise, so ["Dno","DNO"] still equals itself.
+func foldRowKeys(row map[string]interface{}) (map[string]interface{}, bool) {
+	folded := make(map[string]interface{}, len(row))
+	for k, v := range row {
+		fk := foldColumnName(k)
+		if _, dup := folded[fk]; dup {
+			return nil, false
+		}
+		folded[fk] = v
+	}
+	return folded, true
+}
+
+// rowsEqualExactKeys is the PRE-ARCH-043 key-aware row comparison, preserved
+// verbatim as the fallback used whenever either row's own column names collide
+// under folding (ARCH-044). Keys are looked up exactly, byte for byte, with no
+// normalisation at all; values still go through the case-SENSITIVE valuesEqual.
+//
+// Restoring exactly the shipped-before-folding semantics is what makes the
+// fallback safe in both directions: it can never grade anything MORE correct
+// than the deployed pre-ARCH-043 behaviour (a colliding student row still has
+// to carry the teacher's exact key spellings to match, so aliasing two columns
+// to "x" and "X" against a teacher {"x","y"} still misses on "y"), and it can
+// never regress a question that graded correctly before folding existed.
+// Folding stays a strict relaxation, applied only where it is unambiguous.
+// Deterministic: no dependence on Go's randomised map iteration order.
+//
+// Callers must have already established that the two rows have equal arity.
+func rowsEqualExactKeys(teacher, student map[string]interface{}) bool {
+	for k, v := range teacher {
+		sv, ok := student[k]
+		if !ok || !valuesEqual(v, sv) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalStringSlicesFold compares two column-name slices element by element,
+// order-sensitively, folding each name (ARCH-043). It backs the ColumnOrder
+// gate: the ORDER of the columns is still graded strictly, only the SPELLING of
+// each name is case-insensitive.
+func equalStringSlicesFold(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if foldColumnName(a[i]) != foldColumnName(b[i]) {
 			return false
 		}
 	}
@@ -275,9 +355,21 @@ func (s *ValidationService) compareRows(teacher, student map[string]interface{},
 	}
 
 	if mode.Attributes {
-		// Strict attributes: keys must match
-		for k, v := range teacher {
-			sv, ok := student[k]
+		// Strict attributes: keys must match, but only up to case (ARCH-043).
+		// Both rows are re-keyed by folded column name first. If EITHER row's own
+		// column names collide under folding, folding has no unambiguous answer
+		// for this pair, so we fall back to the pre-ARCH-043 exact-key comparison
+		// (ARCH-044) rather than failing closed — failing closed zeroed every
+		// student on any question whose TEACHER row carried case-distinct quoted
+		// names. Folding cannot change either row's key count without colliding,
+		// so the arity check above stays meaningful on the folded maps.
+		tFolded, tOK := foldRowKeys(teacher)
+		sFolded, sOK := foldRowKeys(student)
+		if !tOK || !sOK {
+			return rowsEqualExactKeys(teacher, student)
+		}
+		for k, v := range tFolded {
+			sv, ok := sFolded[k]
 			if !ok || !valuesEqual(v, sv) {
 				return false
 			}

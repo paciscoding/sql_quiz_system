@@ -545,12 +545,17 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 // category's decoy preview schema (ARCH-006 / "Preview as student" for
 // dual-schema questions) instead of the real grading schema; it never falls
 // back silently to the real schema when no decoy has been imported.
-func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, categoryID int, qType, targetTable, sqlText string, useDecoy bool) ([]map[string]interface{}, error) {
+//
+// Returns (rows, orderedColumns, err); the ordered columns are the pgx
+// FieldDescriptions order, i.e. the SELECT projection order (for DML, the
+// post-image snapshot's column order). Row maps are unordered, so callers must
+// use these columns instead of ranging a row to build the preview header.
+func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, categoryID int, qType, targetTable, sqlText string, useDecoy bool) ([]map[string]interface{}, []string, error) {
 	if sqlText == "" {
-		return nil, fmt.Errorf("sql text is empty")
+		return nil, nil, fmt.Errorf("sql text is empty")
 	}
 	if qType == "DML" && targetTable == "" {
-		return nil, fmt.Errorf("target_table is required for DML preview")
+		return nil, nil, fmt.Errorf("target_table is required for DML preview")
 	}
 
 	sqlText = normalizeSmartQuotes(sqlText)
@@ -560,27 +565,28 @@ func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, cate
 	if useDecoy {
 		previewSchema, err = r.GetPracticeCategoryPreviewSchema(ctx, categoryID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if previewSchema == "" {
-			return nil, fmt.Errorf("no decoy schema uploaded for this category")
+			return nil, nil, fmt.Errorf("no decoy schema uploaded for this category")
 		}
 	} else {
 		previewSchema, err = r.GetPracticeCategorySchema(ctx, categoryID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if qType == "DML" {
 		canonical, resolveErr := r.ResolveTargetTable(ctx, previewSchema, targetTable)
 		if resolveErr != nil {
-			return nil, resolveErr
+			return nil, nil, resolveErr
 		}
 		targetTable = canonical
 	}
 
 	var results []map[string]interface{}
+	var orderedCols []string
 	previewErr := r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		safe := pgx.Identifier{previewSchema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safe)); err != nil {
@@ -588,13 +594,13 @@ func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, cate
 		}
 		var err error
 		if qType == "QUERY" {
-			results, err = r.queryWithTx(ctx, tx, previewSchema, sqlText)
+			results, orderedCols, err = r.queryWithTxCols(ctx, tx, previewSchema, sqlText)
 		} else {
 			if _, err = tx.Exec(ctx, sqlText); err != nil {
 				return err
 			}
 			safeTable := pgx.Identifier{targetTable}.Sanitize()
-			results, err = r.queryWithTx(ctx, tx, previewSchema, fmt.Sprintf("SELECT * FROM %s", safeTable))
+			results, orderedCols, err = r.queryWithTxCols(ctx, tx, previewSchema, fmt.Sprintf("SELECT * FROM %s", safeTable))
 		}
 		if err != nil {
 			return err
@@ -603,9 +609,12 @@ func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, cate
 		return errCaptureRollback
 	})
 	if previewErr != nil && !errors.Is(previewErr, errCaptureRollback) {
-		return nil, previewErr
+		return nil, nil, previewErr
 	}
-	return results, nil
+	// ARCH-044: see dedupePreviewColumns (postgres_questions.go). Same-named
+	// projection fields collapse into one row-map key, so the header must be
+	// deduped to stay in step with the rows. Preview only.
+	return results, dedupePreviewColumns(orderedCols), nil
 }
 
 func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error {

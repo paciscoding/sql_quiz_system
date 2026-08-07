@@ -396,12 +396,13 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 	}
 
 	var rows []map[string]interface{}
+	var cols []string
 	var err error
 	useDecoy := req.Schema == "preview"
 	if int(req.CategoryID) > 0 {
-		rows, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy)
+		rows, cols, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy)
 	} else {
-		rows, err = ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
+		rows, cols, err = ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
 	}
 	if err != nil {
 		// Surface engine errors with status='error' to match LecturerController
@@ -409,11 +410,10 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 		return
 	}
 
-	cols := []string{}
-	if len(rows) > 0 {
-		for k := range rows[0] {
-			cols = append(cols, k)
-		}
+	// Ordered projection columns from the engine (pgx FieldDescriptions), not a
+	// map range — see LecturerController.PreviewCorrectSQL. Never emit null.
+	if cols == nil {
+		cols = []string{}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

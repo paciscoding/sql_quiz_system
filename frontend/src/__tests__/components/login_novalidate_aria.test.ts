@@ -28,7 +28,6 @@ function makeRouter() {
     routes: [
       { path: '/', component: { template: '<div />' } },
       { path: '/login', component: { template: '<div />' } },
-      { path: '/forgot-password', component: { template: '<div />' } },
       { path: '/dashboard', component: { template: '<div />' } },
     ],
   })
@@ -201,7 +200,9 @@ describe('LoginView novalidate + ARIA (TODO-083)', () => {
     wrapper.unmount()
   })
 
-  it('shows a "Forgot password?" link pointing to /forgot-password', async () => {
+  it('offers no forgot-password link — only static "contact your administrator" help text', async () => {
+    // Self-service recovery is disabled (public endpoints gated off server-side),
+    // so the login page must not send anyone to /forgot-password.
     const router = makeRouter()
     await router.push('/login')
     const LoginView = (await import('../../components/LoginView.vue')).default
@@ -210,11 +211,13 @@ describe('LoginView novalidate + ARIA (TODO-083)', () => {
     })
     await flushPromises()
 
-    const link = wrapper.find('[data-testid="forgot-password-link"]')
-    expect(link.exists()).toBe(true)
-    expect(link.text().toLowerCase()).toContain('forgot password')
-    // RouterLink renders an <a href="/forgot-password">
-    expect(link.attributes('href')).toBe('/forgot-password')
+    expect(wrapper.find('[data-testid="forgot-password-link"]').exists()).toBe(false)
+    expect(wrapper.findAll('a[href="/forgot-password"]').length).toBe(0)
+
+    const help = wrapper.find('[data-testid="forgot-password-help"]')
+    expect(help.exists()).toBe(true)
+    expect(help.element.tagName.toLowerCase()).not.toBe('a')
+    expect(help.text().toLowerCase()).toContain('contact your administrator')
 
     wrapper.unmount()
   })

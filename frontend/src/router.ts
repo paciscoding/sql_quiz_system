@@ -25,10 +25,12 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: false }
   },
   {
+    // Self-service password recovery is disabled — the public forgot-password
+    // endpoints are gated off server-side and password resets are admin-driven.
+    // ForgotPasswordView.vue is intentionally kept (unrouted) so the flow can be
+    // re-enabled later; the redirect keeps bookmarked URLs off the NotFound view.
     path: '/forgot-password',
-    name: 'forgot-password',
-    component: () => import('./components/ForgotPasswordView.vue'),
-    meta: { requiresAuth: false }
+    redirect: '/login'
   },
   {
     path: '/',

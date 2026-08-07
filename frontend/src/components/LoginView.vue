@@ -111,12 +111,14 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
           <span class="badge badge-danger">{{ error }}</span>
         </p>
 
-        <p style="margin-top: var(--space-4); text-align: center;">
-          <RouterLink
-            to="/forgot-password"
-            class="forgot-link"
-            data-testid="forgot-password-link"
-          >Forgot password?</RouterLink>
+        <!--
+          Self-service password recovery is disabled: the public forgot-password
+          endpoints are gated off server-side, so a link here would only lead to a
+          404. Password resets are admin-driven (the new password is shown in the
+          admin UI), hence the static pointer to the administrator instead of a link.
+        -->
+        <p class="forgot-help" data-testid="forgot-password-help">
+          Forgot your password? Contact your administrator to have it reset.
         </p>
       </form>
     </div>
@@ -133,12 +135,12 @@ const { inFlight: loginLoading, run: handleLogin } = useSingleFlight(async () =>
   padding: var(--space-7) var(--space-4);
 }
 .req { color: var(--color-danger); }
-.forgot-link {
+.forgot-help {
+  margin-top: var(--space-4);
+  text-align: center;
   font-size: 0.88rem;
-  color: var(--color-primary-strong, var(--color-primary));
-  text-decoration: underline;
+  color: var(--color-text-muted, var(--color-text));
 }
-.forgot-link:hover { text-decoration: none; }
 .pw-wrap { display: flex; gap: var(--space-2); }
 .pw-wrap .input { flex: 1; }
 .login-card {

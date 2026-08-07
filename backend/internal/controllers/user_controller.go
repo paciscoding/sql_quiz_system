@@ -4,6 +4,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -191,6 +193,52 @@ func (ctrl *UserController) CreateStudent(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, resp)
+}
+
+// PasswordResetEmailEnabledEnv gates the two PUBLIC forgot-password routes.
+// It defaults to DISABLED: SMTP delivery is unreliable in this deployment, so
+// the emailed-code flow is a dead end for students, and a dead end that still
+// accepts input is worse than one that says so. Admins reset passwords from the
+// admin UI instead (POST /users/:id/reset-password, which never needs email and
+// is NOT affected by this flag). Set to a truthy value to restore the flow with
+// no code change.
+const PasswordResetEmailEnabledEnv = "PASSWORD_RESET_EMAIL_ENABLED"
+
+// passwordResetDisabledMessage is the ONLY body the gated routes emit. Like
+// forgotPasswordMessage below it is a constant: it must not vary by username,
+// by whether the account exists, or by anything else, so the disabled routes are
+// no more of an enumeration oracle than the enabled ones.
+const passwordResetDisabledMessage = "Password reset by email is unavailable. Please contact your administrator to have your password reset."
+
+// PasswordResetEmailEnabled reports whether the public email-based reset flow is
+// switched on. Unset, empty, or any non-boolean value means disabled — the fail-
+// closed direction, matching the "explicitly truthy or off" reading of the flag.
+func PasswordResetEmailEnabled() bool {
+	v := os.Getenv(PasswordResetEmailEnabledEnv)
+	if v == "" {
+		return false
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return parsed
+}
+
+// PasswordResetEmailGate is middleware for the two public forgot-password
+// routes. When the flow is disabled it aborts with a constant 404 before the
+// handler runs, so no lookup, no email, and no timing-observable work happens;
+// when enabled it is a pass-through and the existing handlers are untouched.
+// Registered as middleware rather than by omitting the routes so flipping the
+// env var is the only thing needed to bring the flow back.
+func PasswordResetEmailGate(enabled bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if enabled {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": passwordResetDisabledMessage})
+	}
 }
 
 // forgotPasswordMessage is the single, generic response for step 1 of the

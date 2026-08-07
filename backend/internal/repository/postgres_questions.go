@@ -273,11 +273,48 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 	return newID, err
 }
 
+// dedupePreviewColumns returns cols with later exact-duplicate names removed,
+// keeping the first occurrence of each name in the order given.
+//
+// ARCH-044. The preview funcs take their ordered column list straight from pgx
+// FieldDescriptions, which is the projection order but is NOT deduplicated:
+// `SELECT * FROM employee, department` reports `dno` twice. The row maps the
+// same code builds are keyed by column name (rowMap[fd.Name] = values[i] in
+// queryWithTxCols), so two fields sharing an output name collapse into one map
+// key. Handing the frontend more columns than the rows can carry makes
+// ResultTable.vue / ExamQuestionsPanel.vue — both `v-for="c in columns"
+// :key="c"` over header and cells — emit duplicate v-for keys (Vue warns and
+// can mis-patch keyed nodes on re-render) and render a phantom extra column.
+// Deduping restores exact parity with the pre-ordering behaviour, which
+// derived the header by ranging a row map and so deduped implicitly, while
+// keeping the correct projection ordering.
+//
+// Renaming duplicates (dno, dno_1) is deliberately NOT done: the row map
+// physically cannot carry the second column's value, so a renamed header would
+// render an always-blank column. Known limitation, pre-dating any of this: the
+// surviving cell holds the LAST same-named field's value, because the later
+// assignment in the rowMap loop overwrites the earlier one.
+//
+// Always returns a non-nil slice so callers can hand `[]` (not `null`) to the
+// frontend without a further nil check.
+func dedupePreviewColumns(cols []string) []string {
+	out := make([]string, 0, len(cols))
+	seen := make(map[string]struct{}, len(cols))
+	for _, c := range cols {
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		out = append(out, c)
+	}
+	return out
+}
+
 // PreviewCorrectSQL is the backward-compatible wrapper that always previews
 // against the 'public' schema. Existing callers (e.g. practice_controller) use
 // this signature; new callers that want per-exam curriculum resolution should
 // call PreviewCorrectSQLInSchema instead.
-func (r *PostgresRepository) PreviewCorrectSQL(ctx context.Context, qType, targetTable, sqlText string) ([]map[string]interface{}, error) {
+func (r *PostgresRepository) PreviewCorrectSQL(ctx context.Context, qType, targetTable, sqlText string) ([]map[string]interface{}, []string, error) {
 	return r.PreviewCorrectSQLInSchema(ctx, qType, targetTable, sqlText, 0, 0, false)
 }
 
@@ -307,12 +344,19 @@ func (r *PostgresRepository) PreviewCorrectSQL(ctx context.Context, qType, targe
 // or the real curriculum (which would leak grading schema B under a
 // "student" preview). When useDecoy is false, behaviour is byte-for-byte
 // identical to before this parameter existed.
-func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qType, targetTable, sqlText string, examID int, categoryID int, useDecoy bool) ([]map[string]interface{}, error) {
+//
+// Returns (rows, orderedColumns, err). The ordered columns come from pgx
+// FieldDescriptions, i.e. the SELECT projection order — the row maps
+// themselves are Go maps and therefore have no order, so ranging one to build
+// the preview header shuffled the columns on every request. For DML the
+// columns are the post-image snapshot's (SELECT * FROM target) field order,
+// which is the table's physical column order.
+func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qType, targetTable, sqlText string, examID int, categoryID int, useDecoy bool) ([]map[string]interface{}, []string, error) {
 	if sqlText == "" {
-		return nil, fmt.Errorf("sql text is empty")
+		return nil, nil, fmt.Errorf("sql text is empty")
 	}
 	if qType == "DML" && targetTable == "" {
-		return nil, fmt.Errorf("target_table is required for DML preview")
+		return nil, nil, fmt.Errorf("target_table is required for DML preview")
 	}
 
 	// Repair typographic quotes pasted from documents so the SQL executes
@@ -329,13 +373,13 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 			categoryID, examID).Scan(&schemaName, &previewSchemaName)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, ErrExamCategoryMismatch
+				return nil, nil, ErrExamCategoryMismatch
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		if useDecoy {
 			if previewSchemaName == "" {
-				return nil, fmt.Errorf("no decoy schema uploaded for this category")
+				return nil, nil, fmt.Errorf("no decoy schema uploaded for this category")
 			}
 			previewSchema = previewSchemaName
 		} else {
@@ -344,10 +388,10 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 	} else if useDecoy && examID > 0 {
 		decoy, err := r.GetExamPreviewCurriculumSchema(ctx, examID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if decoy == "" {
-			return nil, fmt.Errorf("no decoy schema uploaded for this exam")
+			return nil, nil, fmt.Errorf("no decoy schema uploaded for this exam")
 		}
 		previewSchema = decoy
 	} else {
@@ -367,12 +411,13 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 	if qType == "DML" {
 		canonical, err := r.ResolveTargetTable(ctx, previewSchema, targetTable)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		targetTable = canonical
 	}
 
 	var results []map[string]interface{}
+	var orderedCols []string
 	previewErr := r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		safe := pgx.Identifier{previewSchema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safe)); err != nil {
@@ -380,13 +425,13 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 		}
 		var err error
 		if qType == "QUERY" {
-			results, err = r.queryWithTx(ctx, tx, previewSchema, sqlText)
+			results, orderedCols, err = r.queryWithTxCols(ctx, tx, previewSchema, sqlText)
 		} else {
 			if _, err = tx.Exec(ctx, sqlText); err != nil {
 				return err
 			}
 			safeTable := pgx.Identifier{targetTable}.Sanitize()
-			results, err = r.queryWithTx(ctx, tx, previewSchema, fmt.Sprintf("SELECT * FROM %s", safeTable))
+			results, orderedCols, err = r.queryWithTxCols(ctx, tx, previewSchema, fmt.Sprintf("SELECT * FROM %s", safeTable))
 		}
 		if err != nil {
 			return err
@@ -395,9 +440,13 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 		return errCaptureRollback
 	})
 	if previewErr != nil && !errors.Is(previewErr, errCaptureRollback) {
-		return nil, previewErr
+		return nil, nil, previewErr
 	}
-	return results, nil
+	// ARCH-044: FieldDescriptions is not deduplicated but the row maps are
+	// (same-named fields collapse to one key), so trim the header down to the
+	// keys the rows actually carry. Preview only — the capture path that feeds
+	// expected_columns for grading is untouched.
+	return results, dedupePreviewColumns(orderedCols), nil
 }
 
 func (r *PostgresRepository) GetQuestion(ctx context.Context, id int) (models.Question, error) {

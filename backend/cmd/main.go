@@ -179,11 +179,23 @@ func main() {
 	v1 := r.Group("/api/v1")
 	{
 		v1.POST("/login", userCtrl.Login)
+		// PASSWORD_RESET_EMAIL_ENABLED gates BOTH public forgot-password routes and
+		// defaults to off (SMTP delivery is unreliable here, so the student-facing
+		// flow would be a dead end). When off, the gate answers a constant 404
+		// pointing at the administrator and the handlers never run. The admin reset
+		// path (/users/:id/reset-password) needs no email and is NOT gated.
+		resetEmailEnabled := controllers.PasswordResetEmailEnabled()
+		if resetEmailEnabled {
+			log.Printf("password reset: public email flow ENABLED (%s truthy)", controllers.PasswordResetEmailEnabledEnv)
+		} else {
+			log.Printf("password reset: public email flow disabled (%s unset/false); admins reset passwords from the admin UI", controllers.PasswordResetEmailEnabledEnv)
+		}
+		resetGate := controllers.PasswordResetEmailGate(resetEmailEnabled)
 		// Public forgot-password step 1: NO auth middleware. Always returns a generic 200.
-		v1.POST("/forgot-password", userCtrl.ForgotPassword)
+		v1.POST("/forgot-password", resetGate, userCtrl.ForgotPassword)
 		// Public forgot-password step 2: NO auth middleware. Verifies the emailed
 		// code; every failure returns the same generic 400.
-		v1.POST("/forgot-password/verify", userCtrl.VerifyForgotPassword)
+		v1.POST("/forgot-password/verify", resetGate, userCtrl.VerifyForgotPassword)
 
 		// Protected User Routes
 		user := v1.Group("/users")

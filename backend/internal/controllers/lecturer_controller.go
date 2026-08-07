@@ -526,7 +526,7 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	}
 
 	useDecoy := req.Schema == "preview"
-	rows, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy)
+	rows, cols, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy)
 	if err != nil {
 		if errors.Is(err, repository.ErrExamCategoryMismatch) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -538,11 +538,12 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		return
 	}
 
-	cols := []string{}
-	if len(rows) > 0 {
-		for k := range rows[0] {
-			cols = append(cols, k)
-		}
+	// Emit the projection order the engine reported (pgx FieldDescriptions).
+	// Ranging rows[0] here used to shuffle the header on every request, since
+	// Go randomises map iteration. Keep a non-nil slice so the frontend always
+	// gets [] rather than null when the preview returned no columns.
+	if cols == nil {
+		cols = []string{}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",

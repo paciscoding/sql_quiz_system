@@ -51,12 +51,31 @@ func diffRowMultiset(teacher, student []map[string]interface{}) (missing, extra 
 // DML forces key-aware comparison unconditionally, because both snapshots come
 // from `SELECT *` on the same table, so column names always line up and
 // ignoring them (the non-strict path) only manufactures false positives.
+// Column names are matched case-insensitively (ARCH-043) for the same reason as
+// on the QUERY path: an identifier's capture casing is an artefact of whether it
+// was quoted, not of whether the answer is right. When EITHER row's own column
+// names collide under folding, folding has no unambiguous answer for that pair
+// and we fall back to the pre-ARCH-043 exact-key comparison (ARCH-044). The
+// original code failed closed there, which zeroed every student whose target
+// table was created with case-distinct quoted columns ("Total" and "total"):
+// the TEACHER's captured post-image collided, so diffRowMultiset reported every
+// teacher row as missing no matter what the student wrote. The fallback is
+// still deterministic — no dependence on Go's randomised map order.
+// Values still compare case-sensitively through valuesEqual.
 func rowsEqualStrict(teacher, student map[string]interface{}) bool {
+	// Folding never changes a row's key count unless it collides, so this arity
+	// check remains a valid pre-filter over the folded maps below — and it is
+	// also the arity precondition rowsEqualExactKeys relies on.
 	if len(teacher) != len(student) {
 		return false
 	}
-	for k, v := range teacher {
-		sv, ok := student[k]
+	tFolded, tOK := foldRowKeys(teacher)
+	sFolded, sOK := foldRowKeys(student)
+	if !tOK || !sOK {
+		return rowsEqualExactKeys(teacher, student)
+	}
+	for k, v := range tFolded {
+		sv, ok := sFolded[k]
 		if !ok || !valuesEqual(v, sv) {
 			return false
 		}
@@ -109,21 +128,35 @@ func appendSampleRows(b *strings.Builder, rows []map[string]interface{}, columns
 }
 
 func formatDMLRow(row map[string]interface{}, columns []string) string {
-	keys := columns
-	if len(keys) == 0 {
-		keys = make([]string, 0, len(row))
-		for k := range row {
-			keys = append(keys, k)
+	// ARCH-043: matching folds column names, but the DISPLAY must not. When the
+	// caller supplies the teacher's captured column list we look each cell up by
+	// folded name (so a student row keyed "Fname" still renders under the
+	// teacher's "fname" slot) yet print the teacher's original spelling, which
+	// is the one the question was authored with and the one the student should
+	// see in the feedback. A row whose own names collide under folding gets no
+	// usable folded index, so it falls back to rendering its own keys verbatim
+	// rather than dropping cells.
+	folded, foldOK := foldRowKeys(row)
+	if len(columns) > 0 && foldOK {
+		parts := make([]string, 0, len(columns))
+		for _, k := range columns {
+			v, ok := folded[foldColumnName(k)]
+			if !ok {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%s=%s", k, truncateCell(fmt.Sprintf("%v", v))))
 		}
-		sort.Strings(keys)
+		return "{" + strings.Join(parts, ", ") + "}"
 	}
+
+	keys := make([]string, 0, len(row))
+	for k := range row {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		v, ok := row[k]
-		if !ok {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s=%s", k, truncateCell(fmt.Sprintf("%v", v))))
+		parts = append(parts, fmt.Sprintf("%s=%s", k, truncateCell(fmt.Sprintf("%v", row[k]))))
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }

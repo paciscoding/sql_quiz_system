@@ -86,11 +86,22 @@ describe('router beforeEach guard', () => {
     expect(router.currentRoute.value.name).toBe('login')
   })
 
-  it('has a public /forgot-password route reachable while unauthenticated', async () => {
+  it('/forgot-password redirects to /login (self-service recovery disabled)', async () => {
+    // The route is kept only as a redirect so bookmarked URLs land on login
+    // instead of the NotFound view; the view itself is no longer reachable.
     await router.push('/forgot-password')
 
-    expect(router.currentRoute.value.path).toBe('/forgot-password')
-    expect(router.currentRoute.value.meta.requiresAuth).toBe(false)
+    expect(router.currentRoute.value.path).toBe('/login')
+    expect(router.currentRoute.value.name).toBe('login')
+  })
+
+  it('logged-in user hitting /forgot-password is not left on a dead route', async () => {
+    loginAs('STUDENT')
+
+    await router.push('/forgot-password')
+
+    // Redirect to /login, then Rule 1 bounces the logged-in user to the dashboard.
+    expect(router.currentRoute.value.path).toBe('/student')
   })
 
   it('logged-in LECTURER navigating to /dashboard is redirected to /lecturer', async () => {
