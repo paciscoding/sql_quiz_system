@@ -55,6 +55,23 @@ export interface CategoryIntroduction {
   tables: TableIntrospection[]
 }
 
+// AutoSeedColumn is one column/value pair the backend derived to satisfy a
+// DML question's WHERE clause when the row does not exist in the category
+// database. Rendered read-only in the authoring UI; never sent back to the
+// backend.
+export interface AutoSeedColumn {
+  name: string
+  value: string
+}
+
+// AutoSeedPlan describes a row the backend invents (inside a rolled-back
+// transaction) so a DML question's answer has something to act on. Display
+// only -- see PracticeAuthoring.vue's "Auto-seeded row" panel.
+export interface AutoSeedPlan {
+  table: string
+  columns: AutoSeedColumn[]
+}
+
 export interface PracticeQuestion {
   id: string
   created_by: string
@@ -78,6 +95,7 @@ export interface PracticeQuestion {
   created_at: string
   updated_at: string
   dual_schema?: boolean
+  auto_seed?: AutoSeedPlan | null
 }
 
 export interface PracticeAttempt {

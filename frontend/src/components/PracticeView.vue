@@ -133,25 +133,11 @@ const truncate = (str: string, len: number) => {
 
 const categoryNameFor = (q: PracticeQuestion) => q.category_name || q.category || 'Uncategorized'
 
+// Groups every question by category, uncapped — the per-category list is
+// scrollable in the template (ARCH-009) instead of truncating questions past
+// a fixed count, so lecturers can add more than 5 to a category and students
+// still reach all of them.
 const groupedQuestions = computed(() => {
-  const groups: Record<string, PracticeQuestion[]> = {}
-  questions.value.forEach(q => {
-    const key = categoryNameFor(q)
-    if (!groups[key]) {
-      groups[key] = []
-    }
-    if (groups[key].length < 5) {
-      groups[key].push(q)
-    }
-  })
-  return groups
-})
-
-// Same grouping as groupedQuestions but uncapped, so every question can be
-// assigned a stable category-relative ordinal (ARCH-009). Iteration order
-// matches groupedQuestions, so the first 5 entries of each group are
-// identical between the two — the visible list's ordinals never change.
-const questionsByCategoryFull = computed(() => {
   const groups: Record<string, PracticeQuestion[]> = {}
   questions.value.forEach(q => {
     const key = categoryNameFor(q)
@@ -168,7 +154,7 @@ const questionsByCategoryFull = computed(() => {
 // raw opaque id/token.
 const questionLabel = (q: PracticeQuestion): string => {
   if (q.title) return q.title
-  const group = questionsByCategoryFull.value[categoryNameFor(q)] || []
+  const group = groupedQuestions.value[categoryNameFor(q)] || []
   const idx = group.findIndex(item => item.id === q.id)
   return '#' + (idx >= 0 ? idx + 1 : 1)
 }
@@ -177,7 +163,7 @@ const questionLabel = (q: PracticeQuestion): string => {
 // identity (attempts only carry practice_question_id, an opaque token).
 const questionLabelMap = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {}
-  Object.values(questionsByCategoryFull.value).forEach(group => {
+  Object.values(groupedQuestions.value).forEach(group => {
     group.forEach(q => { map[q.id] = questionLabel(q) })
   })
   return map
@@ -232,6 +218,20 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
   const qs = groupedQuestions.value[cat]
   return qs && qs.length > 0 ? qs[0] : null
 }
+
+async function copyToClipboard(text: string) {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      notify('Password copied to clipboard.', 'success')
+    } else {
+      notify('Clipboard not available in this browser.', 'error')
+    }
+  } catch {
+    notify('Failed to copy text.', 'error')
+  }
+}
+
 </script>
 
 <template>
@@ -271,21 +271,23 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
                 title="View category schema and description"
               >Schema</button>
             </div>
-            <div 
-              v-for="q in qs" 
-              :key="q.id" 
-              class="question-item"
-              :class="{ active: selectedQuestion?.id === q.id }"
-              @click="selectQuestion(q)"
-            >
-              <div class="question-item-header">
-                <span class="q-id">{{ questionLabel(q) }}</span>
-                <span class="badge" :class="q.question_type === 'QUERY' ? 'badge-info' : 'badge-warning'">
-                  {{ q.question_type }}
-                </span>
-                <span class="points">{{ q.points }} pts</span>
+            <div class="question-items-scroll">
+              <div
+                v-for="q in qs"
+                :key="q.id"
+                class="question-item"
+                :class="{ active: selectedQuestion?.id === q.id }"
+                @click="selectQuestion(q)"
+              >
+                <div class="question-item-header">
+                  <span class="q-id">{{ questionLabel(q) }}</span>
+                  <span class="badge" :class="q.question_type === 'QUERY' ? 'badge-info' : 'badge-warning'">
+                    {{ q.question_type }}
+                  </span>
+                  <span class="points">{{ q.points }} pts</span>
+                </div>
+                <div class="requirement-preview">{{ truncate(q.requirement, 60) }}</div>
               </div>
-              <div class="requirement-preview">{{ truncate(q.requirement, 60) }}</div>
             </div>
           </div>
           <p v-if="questions.length === 0" class="muted">No practice questions available.</p>
@@ -418,6 +420,7 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
           <div class="attempt-main">
             <span class="attempt-question">{{ questionLabelMap[a.practice_question_id] || 'Unknown question' }}</span>
             <code class="attempt-sql">{{ truncate(a.sql_text, 80) }}</code>
+            <button type="button" class="btn btn-sm" @click="copyToClipboard(a.sql_text)">Copy</button>
             <span class="badge" :class="a.is_correct ? 'badge-success' : 'badge-warning'">
               {{ a.is_correct ? 'Correct' : 'Incorrect' }}
             </span>
@@ -526,6 +529,17 @@ const firstQuestionForCategory = (cat: string): PracticeQuestion | null => {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* Caps the visible list at roughly 5 question-items' worth of height, then
+   scrolls — categories with more than 5 questions stay fully reachable
+   instead of the old hard truncation at 5. */
+.question-items-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-height: 400px;
+  overflow-y: auto;
 }
 
 .question-item {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted } from 'vue'
-import type { Examination, CaptureStatus, PreviewResult } from './types'
+import type { Examination, CaptureStatus, PreviewResult, AutoSeedPlan } from './types'
 import SqlEditor from '../SqlEditor.vue'
 import IntroImagesEditor from '../IntroImagesEditor.vue'
 import FieldError from '../FieldError.vue'
@@ -103,6 +103,20 @@ watch(() => question.value.requirement, (v) => { questionValidation.values.requi
 watch(() => question.value.correct_sql, (v) => { questionValidation.values.correct_sql = v })
 
 const lastCapture = ref<CaptureStatus>({ status: '', error: '', capturedAt: null })
+
+// Auto-seeded row (ARCH-042): read-only, backend-derived plan for a DML
+// question whose model answer matches no existing row. Kept entirely
+// separate from `question` (which mirrors the create/update request body) so
+// it can never accidentally be sent back to the backend.
+const autoSeedPlan = ref<AutoSeedPlan | null>(null)
+const autoSeedStatement = computed(() => {
+  const plan = autoSeedPlan.value
+  if (!plan) return ''
+  const cols = plan.columns.map(c => c.name).join(', ')
+  const vals = plan.columns.map(c => c.value).join(', ')
+  return `INSERT INTO ${plan.table} (${cols}) VALUES (${vals})`
+})
+
 const examQuestions = ref<any[]>([])
 const sortKey = ref<'id'|'type'|'points'|null>(null)
 const sortDir = ref<'asc'|'desc'>('asc')
@@ -440,6 +454,7 @@ const editQuestion = async (q: any) => {
     }
   }
   loadedQuestionSnapshot.value = JSON.stringify(question.value)
+  autoSeedPlan.value = q.auto_seed ?? null
   lastCapture.value = {
     status: q.expected_result_status || '',
     error: q.capture_error || '',
@@ -470,6 +485,7 @@ async function onQuestionDropdownChange(event: Event) {
       strict_mode: { ordering: false, attributes: false, column_order: false }
     }
     loadedQuestionSnapshot.value = JSON.stringify(question.value)
+    autoSeedPlan.value = null
     lastCapture.value = { status: '', error: '', capturedAt: null }
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
     previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
@@ -800,6 +816,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     question.value = blankQuestion()
     question.value.exam_id = props.exam.id
     loadedQuestionSnapshot.value = JSON.stringify(question.value)
+    autoSeedPlan.value = null
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
     previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   } catch (err) {
@@ -925,6 +942,17 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         >
           {{ previewAsStudentLoading ? 'Running...' : 'Preview as Student' }}
         </button>
+      </div>
+
+      <!-- Auto-seeded row (ARCH-042): read-only, backend-derived. Never sent
+           back in the create/update request body -- saveQuestion serializes
+           `question`, which never carries autoSeedPlan. -->
+      <div v-if="autoSeedPlan" class="auto-seed-panel">
+        <strong>Auto-seeded row</strong>
+        <div class="auto-seed-statement"><code>{{ autoSeedStatement }}</code></div>
+        <p class="muted" style="margin: var(--space-2) 0 0 0; font-size: 0.85rem;">
+          This row does not exist in the exam curriculum database. The system adds it inside a transaction that is rolled back, so the real database is unchanged.
+        </p>
       </div>
 
       <div v-if="previewResult.status" class="preview-block" :class="previewResult.status">
@@ -1379,6 +1407,20 @@ textarea {
 }
 .capture-status.captured { background: var(--color-success-bg); color: var(--color-success); border-color: #c4dfba; }
 .capture-status.failed   { background: var(--color-danger-bg);  color: var(--color-danger);  border-color: #e9bcbc; }
+
+.auto-seed-panel {
+  margin-top: var(--space-3);
+  padding: 10px 14px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  background: var(--color-surface-muted);
+}
+.auto-seed-statement {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  white-space: pre-wrap;
+}
 
 .preview-block {
   margin-top: var(--space-3);

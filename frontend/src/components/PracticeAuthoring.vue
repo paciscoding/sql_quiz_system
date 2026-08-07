@@ -14,7 +14,8 @@ import {
   setCategoryIntroduction,
   ApiError,
   type PracticeQuestion,
-  type PracticeCategory
+  type PracticeCategory,
+  type AutoSeedPlan
 } from '../services/practice'
 import { UI_COPY } from '../constants/ui_copy'
 import SqlEditor from './SqlEditor.vue'
@@ -62,6 +63,21 @@ const previewRows = ref<any[]>([])
 const previewCols = ref<string[]>([])
 const previewLoading = ref(false)
 const previewError = ref('')
+
+// The auto-seed plan (ARCH-042) belongs to the *loaded* question, not the
+// editable form: it must never round-trip through form.value, since
+// saveQuestion sends form.value verbatim as the request body and auto_seed
+// is derived server-side only. Kept in its own ref, set in editQuestion /
+// cleared in resetForm, and rendered read-only beneath Correct SQL.
+const loadedAutoSeed = ref<AutoSeedPlan | null>(null)
+
+const autoSeedStatement = computed(() => {
+  const seed = loadedAutoSeed.value
+  if (!seed) return ''
+  const cols = seed.columns.map(c => c.name).join(', ')
+  const vals = seed.columns.map(c => `'${c.value}'`).join(', ')
+  return `INSERT INTO ${seed.table} (${cols}) VALUES (${vals})`
+})
 
 // "Preview as student" (schema: 'preview') results — kept in a separate set of
 // refs from the grading-schema Preview above so the lecturer can see both the
@@ -177,7 +193,11 @@ async function confirmDiscardIfDirty(): Promise<boolean> {
 
 const editQuestion = async (q: PracticeQuestion) => {
   if (!(await confirmDiscardIfDirty())) return
-  form.value = { ...q }
+  // auto_seed is display-only and deliberately excluded from form.value (see
+  // loadedAutoSeed above) so it can never be re-sent in the save payload.
+  const { auto_seed, ...editable } = q
+  form.value = { ...editable }
+  loadedAutoSeed.value = auto_seed ?? null
   loadedFormSnapshot.value = JSON.stringify(form.value)
 }
 
@@ -193,6 +213,7 @@ const resetForm = () => {
     strict_column_order: false,
     dual_schema: false
   }
+  loadedAutoSeed.value = null
   previewRows.value = []
   previewCols.value = []
   previewError.value = ''
@@ -653,6 +674,14 @@ onMounted(() => {
             height="200px"
           />
           <FieldError id="practice-correct-sql-error" :message="practiceForm.touched.correct_sql ? practiceForm.errors.correct_sql : ''" />
+        </div>
+
+        <div v-if="loadedAutoSeed" class="field" style="margin-top: var(--space-4);">
+          <label>Auto-seeded row</label>
+          <code>{{ autoSeedStatement }}</code>
+          <p class="muted" style="margin: 0;">
+            This row does not exist in the category database. The system adds it inside a transaction that is rolled back, so the real database is unchanged.
+          </p>
         </div>
 
         <div style="display: flex; gap: var(--space-2); margin-top: var(--space-4);">
