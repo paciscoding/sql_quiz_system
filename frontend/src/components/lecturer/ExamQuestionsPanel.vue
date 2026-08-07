@@ -113,7 +113,7 @@ const autoSeedStatement = computed(() => {
   const plan = autoSeedPlan.value
   if (!plan) return ''
   const cols = plan.columns.map(c => c.name).join(', ')
-  const vals = plan.columns.map(c => c.value).join(', ')
+  const vals = plan.columns.map(c => `'${c.value}'`).join(', ')
   return `INSERT INTO ${plan.table} (${cols}) VALUES (${vals})`
 })
 

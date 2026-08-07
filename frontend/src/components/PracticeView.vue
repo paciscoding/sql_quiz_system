@@ -227,9 +227,14 @@ async function copyToClipboard(text: string) {
     } else {
       notify('Clipboard not available in this browser.', 'error')
     }
+    RefillData(text)
   } catch {
     notify('Failed to copy text.', 'error')
   }
+}
+
+function RefillData(text: string) {
+  sqlText.value = text
 }
 
 </script>
