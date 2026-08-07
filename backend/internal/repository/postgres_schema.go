@@ -863,6 +863,7 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			expected_result_captured_at TIMESTAMP WITH TIME ZONE,
 			capture_error TEXT,
 			expected_rows_affected INTEGER,
+			auto_seed JSONB,
 			dual_schema BOOLEAN NOT NULL DEFAULT false,
 			created_by INTEGER REFERENCES app.system_users(id),
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -914,6 +915,7 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			expected_result_status TEXT NOT NULL DEFAULT 'pending' CHECK (expected_result_status IN ('pending','captured','failed')),
 			capture_error TEXT,
 			expected_rows_affected INTEGER,
+			auto_seed JSONB,
 			expected_result_captured_at TIMESTAMPTZ,
 			dual_schema BOOLEAN NOT NULL DEFAULT false,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1085,6 +1087,13 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		// (captured before this column existed) — never read during grading.
 		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS expected_rows_affected INTEGER",
 		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS expected_rows_affected INTEGER",
+		// Auto-seed derivation plan (2026-08-07, ARCH-040a): when a lecturer's
+		// DELETE/UPDATE model answer matches no existing row, the backend derives
+		// the missing row from the WHERE clause and stores the derivation plan
+		// here so grading can replay exactly what capture validated. NULL for
+		// QUERY questions and for every pre-existing row.
+		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS auto_seed JSONB",
+		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS auto_seed JSONB",
 		// Dual-schema grading (2026-07-22, ARCH-001): a lecturer can toggle a
 		// question to preview against a decoy schema while grading stays on the
 		// real curriculum/practice schema. DEFAULT false / '' so every existing

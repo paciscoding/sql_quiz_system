@@ -170,6 +170,16 @@ func (r *PostgresRepository) evaluateQuery(ctx context.Context, question models.
 	return result, nil
 }
 
+// AutoSeedFailureFeedback is the student-facing feedback used when replaying
+// a question's stored ARCH-038 auto-seed plan (see dml_autoseed.go) fails at
+// grade or preview time. This is never the student's fault — the plan was
+// already validated once at capture time — so the wording blames the
+// question, not the submission, and directs the student to their instructor
+// rather than guessing at a fix. It names no schema, table, role or
+// SQLSTATE, so it survives the ARCH-018 dual-schema feedback scrub exactly
+// like MultiStatementFeedback in postgres_student_exec.go.
+const AutoSeedFailureFeedback = "This question could not be prepared for grading due to a configuration problem. Please contact your instructor so the question can be re-saved."
+
 func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
 	// Repair typographic quotes so pasted INSERT/UPDATE/DELETE run instead of
 	// failing with a spurious "column ... does not exist". Consistent with the
@@ -226,6 +236,52 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student"); err != nil {
 		return models.ValidationResult{}, err
+	}
+
+	// ARCH-041-eval: replay the persisted auto-seed plan (if any) so a DML
+	// model answer that only affects rows because a row was missing at
+	// capture time still has that row present at grading time. MUST run
+	// AFTER SET LOCAL ROLE exam_student above, never before/hoisted: the
+	// student login roles are created NOINHERIT (postgres_student_pool.go:133),
+	// so before SET LOCAL ROLE the connection holds no privileges at all and
+	// the seed INSERT would fail outright; exam_student is the role that
+	// actually holds INSERT on the category sandbox schema
+	// (postgres_schema.go:179). unmarshalAutoSeed returns (nil, nil) for the
+	// overwhelmingly common case of a question with no stored plan, so this
+	// issues zero extra statements for every question that doesn't need it.
+	if plan, seedErr := unmarshalAutoSeed(question.AutoSeed); seedErr != nil || plan != nil {
+		if seedErr == nil {
+			seedErr = applyAutoSeed(ctx, tx, plan)
+		}
+		if seedErr != nil {
+			// The seed failed, not the student: this question was captured
+			// with a plan that no longer applies (e.g. the category database
+			// was reset or replaced since capture). The transaction is left
+			// aborted exactly like a failed student statement, so recovery
+			// follows the SAME ordering this file enforces everywhere else
+			// (ARCH-021/ARCH-024b): ROLLBACK TO SAVEPOINT MUST run BEFORE
+			// RESET ROLE, or RESET ROLE itself fails in the aborted state.
+			if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval"); err != nil {
+				_ = tx.Rollback(ctx)
+				return models.ValidationResult{}, fmt.Errorf("failed to roll back student eval savepoint: %w", err)
+			}
+			if _, err := tx.Exec(ctx, "RESET ROLE"); err != nil {
+				_ = tx.Rollback(ctx)
+				return models.ValidationResult{}, fmt.Errorf("failed to reset role after student eval: %w", err)
+			}
+			// Same "commit the now-empty transaction, log any failure, never
+			// turn this into a 500" treatment as the normal success path
+			// below: a seed failure must surface as a graded "error" result,
+			// not a Go error, or callers turn it into an HTTP 500 with raw
+			// internal error text.
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				log.Printf("Warning: evaluateDML commit failed after auto-seed failure rollback: %v", commitErr)
+			}
+			return models.ValidationResult{
+				Status:   "error",
+				Feedback: AutoSeedFailureFeedback,
+			}, nil
+		}
 	}
 
 	var studentResults []map[string]interface{}
@@ -458,6 +514,39 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", err)
 		return pr, nil
+	}
+
+	// ARCH-041-eval: replay the persisted auto-seed plan (if any), mirroring
+	// evaluateDML above. MUST run AFTER SET LOCAL ROLE <role> and the
+	// SET LOCAL search_path above, never before/hoisted: the student login
+	// roles (and the decoy preview roles) are created NOINHERIT
+	// (postgres_student_pool.go:133), so before SET LOCAL ROLE the connection
+	// holds no privileges at all and the seed INSERT would fail outright;
+	// exam_student_preview is the role that holds full DML on the decoy
+	// schema this preview writes to (postgres_preview_schema.go:150).
+	// unmarshalAutoSeed returns (nil, nil) for the overwhelmingly common case
+	// of a question with no stored plan, so this issues zero extra statements
+	// for every question that doesn't need it.
+	if plan, seedErr := unmarshalAutoSeed(question.AutoSeed); seedErr != nil || plan != nil {
+		if seedErr == nil {
+			seedErr = applyAutoSeed(ctx, tx, plan)
+		}
+		if seedErr != nil {
+			// The seed failed, not the student: this question is
+			// misconfigured (the stored plan no longer applies) and must be
+			// re-saved by the lecturer. Feedback names no schema, table,
+			// role or SQLSTATE so it survives the ARCH-018 dual-schema scrub.
+			pr.Result.Status = "error"
+			pr.Result.Feedback = AutoSeedFailureFeedback
+			// ORDER MATTERS (ARCH-021/ARCH-024b): ROLLBACK TO SAVEPOINT
+			// before RESET ROLE, matching every other branch in this
+			// function, so recovery still succeeds when the seed left the
+			// transaction aborted.
+			_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT student_eval")
+			_, _ = tx.Exec(ctx, "RESET ROLE")
+			_ = tx.Rollback(ctx)
+			return pr, nil
+		}
 	}
 
 	if _, execErr := execStudentStatement(ctx, tx, studentSQL); execErr != nil {

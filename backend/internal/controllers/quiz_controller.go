@@ -162,6 +162,12 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 			questions[i].CaptureError = ""
 			questions[i].ExpectedRowsAffected = nil
 		}
+		// AutoSeed (ARCH-040) is the derived WHERE-clause row for a missing-row
+		// DML answer — table, column and literal value. That is a strictly
+		// larger hint than expected_rows_affected (it hands back the answer's
+		// own WHERE clause), so unlike the dual-only fields above it is
+		// scrubbed unconditionally, on single-schema questions too.
+		questions[i].AutoSeed = nil
 	}
 
 	c.JSON(http.StatusOK, questions)

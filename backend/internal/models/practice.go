@@ -69,9 +69,17 @@ type PracticeQuestion struct {
 	// ExpectedRowsAffected is the rows-affected count of the lecturer's DML
 	// correct_sql at capture time, for diagnostics only. NULL for QUERY
 	// questions and for failed captures. Never read during grading (ARCH-009).
-	ExpectedRowsAffected *int      `json:"expected_rows_affected,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	ExpectedRowsAffected *int `json:"expected_rows_affected,omitempty"`
+	// AutoSeed is the ARCH-040 AutoSeedPlan JSON
+	// (`{"table": "...", "columns": [{"name": "...", "value": "..."}]}`) used
+	// to seed a missing row inside the rolled-back grading savepoint before
+	// evaluating a DML answer. NULL for QUERY questions and for DML questions
+	// whose model answer already affected rows on first run. Derived entirely
+	// by the backend at capture time; it must never be accepted from a client
+	// request body.
+	AutoSeed  json.RawMessage `json:"auto_seed,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
 }
 
 // AsQuestion builds a *Question suitable for passing to ValidationService.
@@ -97,6 +105,7 @@ func (pq *PracticeQuestion) AsQuestion() *Question {
 		ExpectedResultStatus:     pq.ExpectedResultStatus,
 		ExpectedResultCapturedAt: pq.ExpectedResultCapturedAt,
 		ExpectedRowsAffected:     pq.ExpectedRowsAffected,
+		AutoSeed:                 pq.AutoSeed,
 		CaptureError:             pq.CaptureError,
 		CreatedBy:                pq.CreatedBy,
 		CreatedAt:                pq.CreatedAt,

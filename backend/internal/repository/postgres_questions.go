@@ -35,6 +35,7 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 	var captureErr string
 	var expectedResult, expectedCols []byte
 	var expectedRowsAffected *int
+	var autoSeed []byte
 
 	// Resolve the schema capture runs against. Defaults to 'public' for
 	// practice questions (ExamID == nil) and for exam questions that haven't
@@ -118,9 +119,66 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 					// every student statement, correct or not, produces the same
 					// untouched end state. Hard block, no override.
 					if tag.RowsAffected() == 0 {
-						status = "failed"
-						captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
-						return errCaptureFailed
+						// ARCH-037: an INSERT that affects 0 rows is an INSERT ... SELECT
+						// over an empty source, which seeding cannot fix. q.Type is just
+						// "DML" for every statement kind, so the actual leading keyword of
+						// the model answer decides — keep today's message unchanged and
+						// never attempt derivation for it.
+						if isAutoSeedIneligibleInsert(q.CorrectSQL) {
+							status = "failed"
+							captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
+							return errCaptureFailed
+						}
+
+						// ARCH-037/038/039: rescue the 0-row DELETE/UPDATE by deriving and
+						// seeding the missing row inside a nested savepoint, so a failed
+						// seed cannot poison the outer capture transaction.
+						if _, spErr := tx.Exec(ctx, "SAVEPOINT autoseed"); spErr != nil {
+							return spErr
+						}
+
+						cols, colsErr := fetchTableColumns(ctx, tx, captureSchema, q.TargetTable)
+						if colsErr != nil {
+							return colsErr
+						}
+
+						plan, deriveErr := deriveAutoSeed(q.CorrectSQL, q.TargetTable, cols)
+						if deriveErr != nil {
+							if errors.Is(deriveErr, ErrAutoSeedUnsupported) {
+								status = "failed"
+								captureErr = "Model answer affected 0 rows. Auto-seed could not build a matching row: " + deriveErr.Error() + ". Use = comparisons on the columns you want seeded, or fix the seed data in this category's database."
+								return errCaptureFailed
+							}
+							return deriveErr
+						}
+
+						if applyErr := applyAutoSeed(ctx, tx, plan); applyErr != nil {
+							// The transaction is now aborted; ROLLBACK TO SAVEPOINT must run
+							// FIRST (ARCH-021 ordering) or every subsequent statement fails.
+							if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT autoseed"); rbErr != nil {
+								return rbErr
+							}
+							status = "failed"
+							captureErr = "Model answer affected 0 rows. Auto-seed built a row but inserting it failed: " + applyErr.Error() + "."
+							return errCaptureFailed
+						}
+
+						tag, err = tx.Exec(ctx, q.CorrectSQL)
+						if err != nil {
+							status = "failed"
+							captureErr = err.Error()
+							return errCaptureFailed
+						}
+						if tag.RowsAffected() == 0 {
+							status = "failed"
+							captureErr = "Model answer affected 0 rows, and still affected 0 rows after auto-seeding a matching row. Check the WHERE clause of the correct SQL."
+							return errCaptureFailed
+						}
+
+						autoSeed, err = marshalAutoSeed(plan)
+						if err != nil {
+							return err
+						}
 					}
 					rowsAffected := int(tag.RowsAffected())
 					expectedRowsAffected = &rowsAffected
@@ -168,23 +226,23 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 			exam_id, target_table, correct_sql, question_type, points, requirement,
 			strict_ordering, strict_attributes, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, category_id, updated_at
+			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, category_id, auto_seed, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, $15, $16, $17, NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, $15, $16, $17, $18, NOW())
 		RETURNING id`
 		err = r.pool.QueryRow(ctx, insertQ,
 			q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
 			q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
-			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema, q.CategoryID).Scan(&newID)
+			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema, q.CategoryID, autoSeed).Scan(&newID)
 	} else {
 		const upsertQ = `
 		INSERT INTO app.questions (
 			id, exam_id, target_table, correct_sql, question_type, points, requirement,
 			strict_ordering, strict_attributes, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, category_id, updated_at
+			expected_result_captured_at, capture_error, expected_rows_affected, created_by, dual_schema, category_id, auto_seed, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15, $16, $17, $18, NOW())
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15, $16, $17, $18, $19, NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			exam_id = EXCLUDED.exam_id,
 			target_table = EXCLUDED.target_table,
@@ -203,12 +261,13 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 			expected_rows_affected = EXCLUDED.expected_rows_affected,
 			dual_schema = EXCLUDED.dual_schema,
 			category_id = EXCLUDED.category_id,
+			auto_seed = EXCLUDED.auto_seed,
 			updated_at = NOW()
 		RETURNING id`
 		err = r.pool.QueryRow(ctx, upsertQ,
 			q.ID, q.ExamID, q.TargetTable, q.CorrectSQL, q.Type, q.Points, q.Requirement,
 			q.StrictMode.Ordering, q.StrictMode.Attributes, q.StrictMode.ColumnOrder,
-			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema, q.CategoryID).Scan(&newID)
+			expectedResult, expectedCols, status, captureErr, expectedRowsAffected, q.CreatedBy, q.DualSchema, q.CategoryID, autoSeed).Scan(&newID)
 	}
 
 	return newID, err
@@ -355,7 +414,8 @@ func (r *PostgresRepository) GetQuestion(ctx context.Context, id int) (models.Qu
 		       q.expected_result_captured_at, q.capture_error, q.expected_rows_affected,
 		       q.created_by, q.created_at, q.updated_at, q.dual_schema,
 		       COALESCE(e.curriculum_schema, 'public') AS curriculum_schema,
-		       q.category_id, COALESCE(ec.name, ''), COALESCE(ec.schema_name, ''), COALESCE(ec.preview_schema_name, '')
+		       q.category_id, COALESCE(ec.name, ''), COALESCE(ec.schema_name, ''), COALESCE(ec.preview_schema_name, ''),
+		       q.auto_seed
 		FROM app.questions q
 		LEFT JOIN app.examinations e ON e.id = q.exam_id
 		LEFT JOIN app.exam_categories ec ON ec.id = q.category_id
@@ -369,7 +429,8 @@ func (r *PostgresRepository) GetQuestion(ctx context.Context, id int) (models.Qu
 		&q.ExpectedResultCapturedAt, &q.CaptureError, &q.ExpectedRowsAffected,
 		&q.CreatedBy, &q.CreatedAt, &q.UpdatedAt, &q.DualSchema,
 		&q.CurriculumSchema,
-		&q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.CategoryPreviewSchema)
+		&q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.CategoryPreviewSchema,
+		&q.AutoSeed)
 
 	return q, err
 }
@@ -386,7 +447,8 @@ func (r *PostgresRepository) GetQuestionsByExamID(ctx context.Context, examID in
 		       q.expected_result, q.expected_columns, q.expected_result_status,
 		       q.expected_result_captured_at, q.capture_error, q.expected_rows_affected,
 		       q.created_by, q.created_at, q.updated_at, q.dual_schema,
-		       q.category_id, COALESCE(ec.name, ''), COALESCE(ec.schema_name, ''), COALESCE(ec.preview_schema_name, '')
+		       q.category_id, COALESCE(ec.name, ''), COALESCE(ec.schema_name, ''), COALESCE(ec.preview_schema_name, ''),
+		       q.auto_seed
 		FROM app.questions q
 		LEFT JOIN app.exam_categories ec ON ec.id = q.category_id
 		WHERE q.exam_id = $1
@@ -407,7 +469,8 @@ func (r *PostgresRepository) GetQuestionsByExamID(ctx context.Context, examID in
 			&q.ExpectedResult, &q.ExpectedColumns, &q.ExpectedResultStatus,
 			&q.ExpectedResultCapturedAt, &q.CaptureError, &q.ExpectedRowsAffected,
 			&q.CreatedBy, &q.CreatedAt, &q.UpdatedAt, &q.DualSchema,
-			&q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.CategoryPreviewSchema)
+			&q.CategoryID, &q.CategoryName, &q.CategorySchema, &q.CategoryPreviewSchema,
+			&q.AutoSeed)
 		if err != nil {
 			return nil, err
 		}

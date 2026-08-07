@@ -58,6 +58,18 @@ func (s *ValidationService) Validate(ctx context.Context, studentID int, questio
 			// text.
 			if result.Feedback == repository.MultiStatementFeedback {
 				log.Printf("dual-schema multi-statement rejection for student %d, question %d", studentID, question.ID)
+			} else if result.Feedback == repository.AutoSeedFailureFeedback {
+				// ARCH-041: like MultiStatementFeedback above, this is our own
+				// fixed constant, not executor output derived from the hidden
+				// grading schema B. It names no schema, table, column, role or
+				// SQLSTATE and its content never varies with any property of
+				// schema B, so it is not a data-dependent oracle and is exactly
+				// as safe to pass through unscrubbed. Exact-equality only, so it
+				// cannot be spoofed by student-controlled error text that merely
+				// contains this wording. Overwriting it with dualExecErrorFeedback
+				// would blame the student's submission for what is actually a
+				// question-configuration failure, contradicting ARCH-041.
+				log.Printf("dual-schema auto-seed failure surfaced to student %d for question %d", studentID, question.ID)
 			} else {
 				log.Printf("dual-schema syntax error suppressed from student %d for question %d: %s", studentID, question.ID, result.Feedback)
 				result.Feedback = dualExecErrorFeedback

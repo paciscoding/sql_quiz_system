@@ -377,7 +377,7 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 	// Phase-0: Correct Result Capture (always rolled back)
 	status := "captured"
 	var captureErr string
-	var expectedResult, expectedCols []byte
+	var expectedResult, expectedCols, autoSeed []byte
 	var expectedRowsAffected *int
 
 	if q.Type != "QUERY" {
@@ -387,32 +387,33 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 			q.TargetTable = strings.TrimSpace(q.TargetTable)
 		} else {
 			q.TargetTable = canonical
-			err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+			err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected, &autoSeed)
 			if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
 				return err
 			}
 		}
 	} else {
-		err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+		err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected, &autoSeed)
 		if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
 			return err
 		}
 	}
 	q.ExpectedRowsAffected = expectedRowsAffected
+	q.AutoSeed = json.RawMessage(autoSeed)
 
 	query := `
 		INSERT INTO app.practice_questions (
 			created_by, category_id, target_table, correct_sql, question_type, requirement,
 			points, strict_ordering, strict_attrs, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			capture_error, title, expected_rows_affected, dual_schema, expected_result_captured_at, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW(), NOW())
+			capture_error, title, expected_rows_affected, dual_schema, auto_seed, expected_result_captured_at, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW(), NOW())
 		RETURNING id, created_at, updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CreatedBy, q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema,
+		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, autoSeed,
 	).Scan(&q.ID, &q.CreatedAt, &q.UpdatedAt)
 }
 
@@ -421,7 +422,13 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 // the marshalled expected result + columns. Returns errCaptureRollback on
 // success (so WithTransaction discards the lecturer's DML side effects) or
 // errCaptureFailed when the SQL aborts.
-func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema string, q *models.PracticeQuestion, status *string, captureErr *string, expectedResult *[]byte, expectedCols *[]byte, expectedRowsAffected **int) error {
+//
+// autoSeed receives the ARCH-040 AutoSeedPlan JSON when the 0-row rescue
+// (ARCH-037/038) derives and successfully applies a seed row; it is left nil
+// for QUERY questions and for any DML question whose model answer affects
+// rows on the first run — deriveAutoSeed is never even called on that path,
+// which is what keeps already-working questions byte-identical to before.
+func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema string, q *models.PracticeQuestion, status *string, captureErr *string, expectedResult *[]byte, expectedCols *[]byte, expectedRowsAffected **int, autoSeed *[]byte) error {
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		safeSchema := pgx.Identifier{schema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", safeSchema)); err != nil {
@@ -442,11 +449,66 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 			if err == nil {
 				// D3 (ARCH-008): a model answer that affects 0 rows is unGRADEABLE —
 				// every student statement, correct or not, produces the same
-				// untouched end state. Hard block, no override.
+				// untouched end state. Hard block, no override — but ARCH-037/038
+				// lets us rescue it by deriving and seeding the missing row the
+				// WHERE clause pins, when the model answer's grammar is narrow
+				// enough for deriveAutoSeed to understand.
 				if tag.RowsAffected() == 0 {
-					*status = "failed"
-					*captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
-					return errCaptureFailed
+					if isAutoSeedIneligibleInsert(q.CorrectSQL) {
+						// A 0-row INSERT is an INSERT ... SELECT over an empty
+						// source, which no amount of row-seeding can fix — skip
+						// derivation entirely and keep today's message.
+						*status = "failed"
+						*captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
+						return errCaptureFailed
+					}
+
+					// Nested savepoint (ARCH-037): a failed seed must not poison
+					// the capture transaction beyond this point.
+					if _, spErr := tx.Exec(ctx, "SAVEPOINT autoseed"); spErr != nil {
+						return spErr
+					}
+
+					cols, colsErr := fetchTableColumns(ctx, tx, schema, q.TargetTable)
+					if colsErr != nil {
+						return colsErr
+					}
+
+					plan, deriveErr := deriveAutoSeed(q.CorrectSQL, q.TargetTable, cols)
+					if deriveErr != nil {
+						if !errors.Is(deriveErr, ErrAutoSeedUnsupported) {
+							return deriveErr
+						}
+						*status = "failed"
+						*captureErr = "Model answer affected 0 rows. Auto-seed could not build a matching row: " + deriveErr.Error() + ". Use = comparisons on the columns you want seeded, or fix the seed data in this category's database."
+						return errCaptureFailed
+					}
+
+					if applyErr := applyAutoSeed(ctx, tx, plan); applyErr != nil {
+						// ARCH-021 ordering: applyErr has already aborted the
+						// transaction, so roll back to the savepoint FIRST — any
+						// other statement issued before that would itself fail.
+						if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT autoseed"); rbErr != nil {
+							return rbErr
+						}
+						*status = "failed"
+						*captureErr = "Model answer affected 0 rows. Auto-seed built a row but inserting it failed: " + applyErr.Error() + "."
+						return errCaptureFailed
+					}
+
+					tag, err = tx.Exec(ctx, q.CorrectSQL)
+					if err != nil {
+						*status = "failed"
+						*captureErr = err.Error()
+						return errCaptureFailed
+					}
+					if tag.RowsAffected() == 0 {
+						*status = "failed"
+						*captureErr = "Model answer affected 0 rows, and still affected 0 rows after auto-seeding a matching row. Check the WHERE clause of the correct SQL."
+						return errCaptureFailed
+					}
+
+					*autoSeed, _ = marshalAutoSeed(plan)
 				}
 				rowsAffected := int(tag.RowsAffected())
 				*expectedRowsAffected = &rowsAffected
@@ -557,7 +619,7 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 	// Phase-0: Correct Result Capture (always rolled back)
 	status := "captured"
 	var captureErr string
-	var expectedResult, expectedCols []byte
+	var expectedResult, expectedCols, autoSeed []byte
 	var expectedRowsAffected *int
 
 	if q.Type != "QUERY" {
@@ -567,18 +629,19 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 			q.TargetTable = strings.TrimSpace(q.TargetTable)
 		} else {
 			q.TargetTable = canonical
-			err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+			err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected, &autoSeed)
 			if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
 				return err
 			}
 		}
 	} else {
-		err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected)
+		err = r.captureExpectedResult(ctx, schema, q, &status, &captureErr, &expectedResult, &expectedCols, &expectedRowsAffected, &autoSeed)
 		if err != nil && !errors.Is(err, errCaptureRollback) && !errors.Is(err, errCaptureFailed) {
 			return err
 		}
 	}
 	q.ExpectedRowsAffected = expectedRowsAffected
+	q.AutoSeed = json.RawMessage(autoSeed)
 
 	query := `
 		UPDATE app.practice_questions
@@ -586,15 +649,15 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 		    points=$6, strict_ordering=$7, strict_attrs=$8, strict_column_order=$9,
 		    expected_result=$10, expected_columns=$11,
 		    expected_result_status=$12, capture_error=$13, title=$14,
-		    expected_rows_affected=$15, dual_schema=$16,
+		    expected_rows_affected=$15, dual_schema=$16, auto_seed=$17,
 		    expected_result_captured_at=NOW(), updated_at=NOW()
-		WHERE id=$17
+		WHERE id=$18
 		RETURNING updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, q.ID,
+		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, autoSeed, q.ID,
 	).Scan(&q.UpdatedAt)
 }
 
@@ -605,7 +668,7 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
 		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
-		       pq.expected_rows_affected, pq.created_at, pq.updated_at
+		       pq.expected_rows_affected, pq.auto_seed, pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		ORDER BY pq.id ASC`
@@ -624,7 +687,7 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 			&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 			&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
 			&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
-			&q.ExpectedRowsAffected, &q.CreatedAt, &q.UpdatedAt)
+			&q.ExpectedRowsAffected, &q.AutoSeed, &q.CreatedAt, &q.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -640,7 +703,7 @@ func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
 		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
-		       pq.expected_rows_affected, pq.created_at, pq.updated_at
+		       pq.expected_rows_affected, pq.auto_seed, pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		WHERE pq.id=$1`
@@ -651,7 +714,7 @@ func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*
 		&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 		&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
 		&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
-		&q.ExpectedRowsAffected, &q.CreatedAt, &q.UpdatedAt)
+		&q.ExpectedRowsAffected, &q.AutoSeed, &q.CreatedAt, &q.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
