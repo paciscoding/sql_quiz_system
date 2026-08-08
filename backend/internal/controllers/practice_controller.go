@@ -95,15 +95,8 @@ func (ctrl *PracticeController) ListForStudent(c *gin.Context) {
 			questions[i].CaptureError = ""
 			questions[i].ExpectedRowsAffected = nil
 		}
-		// AutoSeed (ARCH-040) is the derived WHERE-clause row for a missing-row
-		// DML answer — table, column and literal value. That is a strictly
-		// larger hint than expected_rows_affected (it hands back the answer's
-		// own WHERE clause), so unlike the dual-only fields above it is
-		// scrubbed unconditionally, on single-schema questions too.
-		questions[i].AutoSeed = nil
-		// ARCH-052: seed_sql leaks strictly more than auto_seed — it is
-		// lecturer-written SQL holding the exact values the answer must match.
-		questions[i].SeedSQL = ""
+		// ARCH-053: auto_seed and seed_sql are `json:"-"` on the model, so there is
+		// nothing to scrub here — they cannot reach a student by construction.
 	}
 
 	c.JSON(http.StatusOK, questions)
@@ -138,14 +131,8 @@ func (ctrl *PracticeController) GetForStudent(c *gin.Context) {
 		question.CaptureError = ""
 		question.ExpectedRowsAffected = nil
 	}
-	// AutoSeed (ARCH-040) is the derived WHERE-clause row for a missing-row DML
-	// answer — table, column and literal value. That is a strictly larger hint
-	// than expected_rows_affected, so unlike the dual-only fields above it is
-	// scrubbed unconditionally, on single-schema questions too.
-	question.AutoSeed = nil
-	// ARCH-052: seed_sql leaks strictly more than auto_seed — it is
-	// lecturer-written SQL holding the exact values the answer must match.
-	question.SeedSQL = ""
+	// ARCH-053: auto_seed and seed_sql are `json:"-"` on the model, so there is
+	// nothing to scrub here — they cannot reach a student by construction.
 
 	c.JSON(http.StatusOK, question)
 }
@@ -322,10 +309,25 @@ func (ctrl *PracticeController) Upsert(c *gin.Context) {
 	lecturer := userVal.(models.User)
 
 	var q models.PracticeQuestion
-	if err := c.ShouldBindJSON(&q); err != nil {
+	if err := c.ShouldBindBodyWithJSON(&q); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	// ARCH-055: ARCH-053 gives DMLKind/SeedSQL `json:"-"`, so the bind above
+	// cannot populate them. Recover exactly those two from the same body — and
+	// only those two, which is why auto_seed still cannot be client-supplied.
+	// ShouldBindBodyWithJSON caches the body, so binding it twice is safe;
+	// ShouldBindJSON would consume the reader and make this second bind fail.
+	var seed struct {
+		DMLKind string `json:"dml_kind"`
+		SeedSQL string `json:"seed_sql"`
+	}
+	if err := c.ShouldBindBodyWithJSON(&seed); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	q.DMLKind, q.SeedSQL = seed.DMLKind, seed.SeedSQL
 	q.CreatedBy = lecturer.ID
 
 	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL); err != nil {
@@ -408,7 +410,7 @@ func (ctrl *PracticeController) ListForLecturer(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, questions)
+	c.JSON(http.StatusOK, models.AsLecturerPracticeQuestionViews(questions))
 }
 
 // Delete (DELETE /lecturer/practice/question/:id)

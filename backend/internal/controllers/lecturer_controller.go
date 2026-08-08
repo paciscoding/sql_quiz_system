@@ -375,10 +375,25 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 	lecturer := userVal.(models.User)
 
 	var q models.Question
-	if err := c.ShouldBindJSON(&q); err != nil {
+	if err := c.ShouldBindBodyWithJSON(&q); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	// ARCH-055: ARCH-053 gives DMLKind/SeedSQL `json:"-"`, so the bind above
+	// cannot populate them. Recover exactly those two from the same body — and
+	// only those two, which is why auto_seed still cannot be client-supplied.
+	// ShouldBindBodyWithJSON caches the body, so binding it twice is safe;
+	// ShouldBindJSON would consume the reader and make this second bind fail.
+	var seed struct {
+		DMLKind string `json:"dml_kind"`
+		SeedSQL string `json:"seed_sql"`
+	}
+	if err := c.ShouldBindBodyWithJSON(&seed); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	q.DMLKind, q.SeedSQL = seed.DMLKind, seed.SeedSQL
 	// SECURITY: derive authorship from JWT — never trust client-supplied created_by.
 	q.CreatedBy = lecturer.ID
 
@@ -476,7 +491,7 @@ func (ctrl *LecturerController) GetExamQuestions(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, questions)
+	c.JSON(http.StatusOK, models.AsLecturerQuestionViews(questions))
 }
 
 func (ctrl *LecturerController) DeleteQuestion(c *gin.Context) {
