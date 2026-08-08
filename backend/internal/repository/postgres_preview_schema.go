@@ -44,10 +44,12 @@ const (
 // is exactly the leak this closes; the trailing REVOKE statements self-heal
 // those decoys on every call, including from reconcilePreviewSchemaGrants.
 // allowDML controls whether exam_student_preview additionally gets
-// SELECT/INSERT/UPDATE/DELETE: QUERY-only decoys (the exam curriculum
-// preview) must never grant a writable role, or a dual QUERY preview could
-// mutate the shared decoy via a data-modifying CTE. No sequence grants,
-// mirroring GrantSchemaPermissions (table grants only).
+// SELECT/INSERT/UPDATE/DELETE (and, since ARCH-049, sequence USAGE for a
+// lecturer-authored seed INSERT that omits a serial column): QUERY-only
+// decoys (the exam curriculum preview) must never grant a writable role, or
+// a dual QUERY preview could mutate the shared decoy via a data-modifying
+// CTE. The read-only exam_student_preview_readonly role never gets sequence
+// usage.
 func (r *PostgresRepository) grantPreviewSchemaPermissions(ctx context.Context, schema string, allowDML bool) error {
 	safeSchema := pgx.Identifier{schema}.Sanitize()
 	queries := []string{
@@ -60,6 +62,13 @@ func (r *PostgresRepository) grantPreviewSchemaPermissions(ctx context.Context, 
 			fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", safeSchema, rolePreviewStudent),
 			fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO %s", safeSchema, rolePreviewStudent),
 			fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s", safeSchema, rolePreviewStudent),
+			// ARCH-049: a lecturer-authored seed INSERT that omits a serial/
+			// identity column calls nextval() as exam_student_preview. Without
+			// sequence USAGE that fails with "permission denied for sequence".
+			// Only the writable preview role gets this — the read-only
+			// exam_student_preview_readonly role must never gain sequence usage.
+			fmt.Sprintf("GRANT USAGE ON ALL SEQUENCES IN SCHEMA %s TO %s", safeSchema, rolePreviewStudent),
+			fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT USAGE ON SEQUENCES TO %s", safeSchema, rolePreviewStudent),
 		)
 	}
 	// Asymmetry vs the real-schema grant sites: decoys must NOT keep the

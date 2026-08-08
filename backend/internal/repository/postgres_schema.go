@@ -178,6 +178,13 @@ func (r *PostgresRepository) GrantSchemaPermissions(ctx context.Context, schema 
 		fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO exam_student", safeSchema),
 		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO exam_student", safeSchema),
 		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO exam_student", safeSchema),
+		// ARCH-049: a seed INSERT that omits a serial/identity column calls
+		// nextval() as exam_student. Without sequence USAGE that fails with
+		// "permission denied for sequence" — a live defect in the shipped
+		// derived auto-seed too, since ARCH-038 deliberately omits defaulted
+		// columns and a serial column is a defaulted column.
+		fmt.Sprintf("GRANT USAGE ON ALL SEQUENCES IN SCHEMA %s TO exam_student", safeSchema),
+		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT USAGE ON SEQUENCES TO exam_student", safeSchema),
 	}
 
 	for _, q := range queries {
@@ -864,6 +871,8 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			capture_error TEXT,
 			expected_rows_affected INTEGER,
 			auto_seed JSONB,
+			dml_kind TEXT CHECK (dml_kind IS NULL OR dml_kind IN ('INSERT','UPDATE','DELETE')),
+			seed_sql TEXT,
 			dual_schema BOOLEAN NOT NULL DEFAULT false,
 			created_by INTEGER REFERENCES app.system_users(id),
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -916,6 +925,8 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			capture_error TEXT,
 			expected_rows_affected INTEGER,
 			auto_seed JSONB,
+			dml_kind TEXT CHECK (dml_kind IS NULL OR dml_kind IN ('INSERT','UPDATE','DELETE')),
+			seed_sql TEXT,
 			expected_result_captured_at TIMESTAMPTZ,
 			dual_schema BOOLEAN NOT NULL DEFAULT false,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1094,6 +1105,21 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		// QUERY questions and for every pre-existing row.
 		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS auto_seed JSONB",
 		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS auto_seed JSONB",
+		// Lecturer-authored seed rows (2026-08-08, ARCH-043). dml_kind splits the
+		// authoring dropdown into INSERT/UPDATE/DELETE WITHOUT widening the
+		// question_type CHECK — every existing `Type == "DML"` branch keeps
+		// working. seed_sql holds the lecturer's INSERT-only seed block, applied
+		// inside the rolled-back evaluation savepoint. Both NULL for QUERY
+		// questions and for every pre-existing row; dml_kind is backfilled by
+		// migrateDMLKind.
+		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS dml_kind TEXT",
+		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS dml_kind TEXT",
+		"ALTER TABLE app.questions ADD COLUMN IF NOT EXISTS seed_sql TEXT",
+		"ALTER TABLE app.practice_questions ADD COLUMN IF NOT EXISTS seed_sql TEXT",
+		"ALTER TABLE app.questions DROP CONSTRAINT IF EXISTS questions_dml_kind_check",
+		"ALTER TABLE app.questions ADD CONSTRAINT questions_dml_kind_check CHECK (dml_kind IS NULL OR dml_kind IN ('INSERT','UPDATE','DELETE'))",
+		"ALTER TABLE app.practice_questions DROP CONSTRAINT IF EXISTS practice_questions_dml_kind_check",
+		"ALTER TABLE app.practice_questions ADD CONSTRAINT practice_questions_dml_kind_check CHECK (dml_kind IS NULL OR dml_kind IN ('INSERT','UPDATE','DELETE'))",
 		// Dual-schema grading (2026-07-22, ARCH-001): a lecturer can toggle a
 		// question to preview against a decoy schema while grading stays on the
 		// real curriculum/practice schema. DEFAULT false / '' so every existing
@@ -1171,7 +1197,85 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 		return fmt.Errorf("migration failed: %w", err)
 	}
 
+	// Lecturer-authored seed rows (2026-08-08, ARCH-043): backfill dml_kind for
+	// DML rows written before the column existed. Idempotent.
+	if err := r.migrateDMLKind(ctx); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// migrateDMLKind backfills app.questions.dml_kind and
+// app.practice_questions.dml_kind for rows written before the column existed
+// (ARCH-043). The kind is read from correct_sql's leading statement keyword
+// using the SAME comment-stripping scanner deriveAutoSeed uses — a Postgres
+// regex cannot reliably see past a leading `--` or `/* */` comment, so this
+// runs in Go rather than as an UPDATE ... CASE.
+//
+// Idempotent: the WHERE clause selects only rows whose dml_kind IS NULL, so a
+// second boot matches nothing. A correct_sql that leads with none of the three
+// keywords is left NULL rather than guessed; the lecturer picks the kind on
+// next edit.
+func (r *PostgresRepository) migrateDMLKind(ctx context.Context) error {
+	for _, table := range []string{"app.questions", "app.practice_questions"} {
+		rows, err := r.pool.Query(ctx, fmt.Sprintf(
+			`SELECT id, correct_sql FROM %s WHERE question_type = 'DML' AND dml_kind IS NULL`, table))
+		if err != nil {
+			return fmt.Errorf("migrateDMLKind: select %s: %w", table, err)
+		}
+
+		type pending struct {
+			id   int
+			kind string
+		}
+		var updates []pending
+		for rows.Next() {
+			var id int
+			var correctSQL string
+			if err := rows.Scan(&id, &correctSQL); err != nil {
+				rows.Close()
+				return fmt.Errorf("migrateDMLKind: scan %s: %w", table, err)
+			}
+			if kind := leadingDMLKind(correctSQL); kind != "" {
+				updates = append(updates, pending{id: id, kind: kind})
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migrateDMLKind: iterate %s: %w", table, err)
+		}
+
+		for _, u := range updates {
+			if _, err := r.pool.Exec(ctx, fmt.Sprintf(
+				`UPDATE %s SET dml_kind = $1 WHERE id = $2 AND dml_kind IS NULL`, table),
+				u.kind, u.id); err != nil {
+				return fmt.Errorf("migrateDMLKind: update %s id=%d: %w", table, u.id, err)
+			}
+		}
+		if len(updates) > 0 {
+			log.Printf("migrateDMLKind: backfilled dml_kind for %d row(s) in %s", len(updates), table)
+		}
+	}
+	return nil
+}
+
+// leadingDMLKind returns "INSERT", "UPDATE", or "DELETE" for sql's leading
+// statement keyword after comments are stripped, or "" when it is none of
+// those. Shared by the backfill and by the write-path validation so they can
+// never disagree about what kind a statement is.
+func leadingDMLKind(sql string) string {
+	trimmed := strings.TrimSpace(stripSQLComments(sql))
+	switch {
+	case matchKeywordAt(trimmed, 0, "INSERT"):
+		return "INSERT"
+	case matchKeywordAt(trimmed, 0, "UPDATE"):
+		return "UPDATE"
+	case matchKeywordAt(trimmed, 0, "DELETE"):
+		return "DELETE"
+	default:
+		return ""
+	}
 }
 
 // ensureCategorySchema creates the schema owned by a practice category (if
