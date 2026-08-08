@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -412,32 +413,60 @@ func TestGetExamQuestions_AutoSeedNeverLeaks_RealController(t *testing.T) {
 // database: every QUERY/DML × dml_kind × seed_sql combination that must be
 // accepted or rejected at the API boundary.
 func TestValidateSeedFields(t *testing.T) {
+	const del = "DELETE FROM employee WHERE ssn = '1'"
+	const upd = "UPDATE employee SET fname = 'x' WHERE ssn = '1'"
+	const ins = "INSERT INTO employee (ssn) VALUES ('1')"
+	const cte = "WITH recent AS (SELECT ssn FROM employee) DELETE FROM employee WHERE ssn IN (SELECT ssn FROM recent)"
+	const sel = "SELECT * FROM employee"
+	const seed = "INSERT INTO employee (ssn) VALUES ('1')"
+
 	cases := []struct {
-		name    string
-		qType   string
-		kind    string
-		seed    string
-		wantErr bool
+		name       string
+		qType      string
+		kind       string
+		seedSQL    string
+		correctSQL string
+		wantErr    bool
+		errSubstr  string
 	}{
-		{"query with no kind or seed", "QUERY", "", "", false},
-		{"query with a kind", "QUERY", "DELETE", "", true},
-		{"query with a seed", "QUERY", "", "INSERT INTO t (a) VALUES (1)", true},
-		{"dml with no kind", "DML", "", "", true},
-		{"dml delete with seed", "DML", "DELETE", "INSERT INTO t (a) VALUES (1)", false},
-		{"dml update with seed", "DML", "UPDATE", "INSERT INTO t (a) VALUES (1)", false},
-		{"dml insert with seed", "DML", "INSERT", "INSERT INTO t (a) VALUES (1)", true},
-		{"dml insert without seed", "DML", "INSERT", "", false},
-		{"dml with bogus kind", "DML", "MERGE", "", true},
-		{"dml delete with non-insert seed", "DML", "DELETE", "DELETE FROM t", true},
+		// Unchanged QUERY rules.
+		{name: "query clean", qType: "QUERY", correctSQL: sel},
+		{name: "query with a kind", qType: "QUERY", kind: "DELETE", correctSQL: sel, wantErr: true},
+		{name: "query with a seed", qType: "QUERY", seedSQL: seed, correctSQL: sel, wantErr: true},
+
+		// Agreement (ARCH-057 rule 1).
+		{name: "delete matches", qType: "DML", kind: "DELETE", correctSQL: del},
+		{name: "update matches", qType: "DML", kind: "UPDATE", correctSQL: upd},
+		{name: "insert matches", qType: "DML", kind: "INSERT", correctSQL: ins},
+		{name: "declared DELETE but SQL is UPDATE", qType: "DML", kind: "DELETE", correctSQL: upd, wantErr: true, errSubstr: "UPDATE"},
+		{name: "declared UPDATE but SQL is DELETE", qType: "DML", kind: "UPDATE", correctSQL: del, wantErr: true, errSubstr: "DELETE"},
+		{name: "declared INSERT but SQL is DELETE", qType: "DML", kind: "INSERT", correctSQL: del, wantErr: true, errSubstr: "DELETE"},
+		{name: "declared DELETE but SQL is INSERT", qType: "DML", kind: "DELETE", correctSQL: ins, wantErr: true, errSubstr: "INSERT"},
+
+		// Derivable-only requirement (ARCH-057 rule 2) — the ARCH-050 regression.
+		{name: "CTE-led DML with no kind is allowed", qType: "DML", kind: "", correctSQL: cte},
+		{name: "CTE-led DML with a hand-set kind is allowed", qType: "DML", kind: "DELETE", correctSQL: cte},
+		{name: "plain DELETE with no kind is still rejected", qType: "DML", kind: "", correctSQL: del, wantErr: true},
+		{name: "bogus kind", qType: "DML", kind: "MERGE", correctSQL: del, wantErr: true},
+
+		// Seed rules, unchanged.
+		{name: "delete with seed", qType: "DML", kind: "DELETE", seedSQL: seed, correctSQL: del},
+		{name: "update with seed", qType: "DML", kind: "UPDATE", seedSQL: seed, correctSQL: upd},
+		{name: "insert with seed rejected", qType: "DML", kind: "INSERT", seedSQL: seed, correctSQL: ins, wantErr: true},
+		{name: "non-insert seed rejected", qType: "DML", kind: "DELETE", seedSQL: "DELETE FROM t", correctSQL: del, wantErr: true},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateSeedFields(tc.qType, tc.kind, tc.seed)
+			err := validateSeedFields(tc.qType, tc.kind, tc.seedSQL, tc.correctSQL)
 			if tc.wantErr && err == nil {
 				t.Fatal("accepted, want error")
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("rejected with %v, want accept", err)
+			}
+			if tc.errSubstr != "" && (err == nil || !strings.Contains(err.Error(), tc.errSubstr)) {
+				t.Errorf("error %v does not name %q", err, tc.errSubstr)
 			}
 		})
 	}

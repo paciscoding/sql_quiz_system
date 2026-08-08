@@ -397,7 +397,7 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 	// SECURITY: derive authorship from JWT — never trust client-supplied created_by.
 	q.CreatedBy = lecturer.ID
 
-	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL); err != nil {
+	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL, q.CorrectSQL); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

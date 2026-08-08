@@ -20,7 +20,7 @@ import (
 // validateSeedFields enforces ARCH-044 and ARCH-050 on every question write
 // path. Returns a lecturer-facing error suitable for an HTTP 400 body; the
 // caller never turns any of these into a 500.
-func validateSeedFields(qType, dmlKind, seedSQL string) error {
+func validateSeedFields(qType, dmlKind, seedSQL, correctSQL string) error {
 	seedSQL = strings.TrimSpace(seedSQL)
 
 	if qType == "QUERY" {
@@ -33,10 +33,25 @@ func validateSeedFields(qType, dmlKind, seedSQL string) error {
 		return nil
 	}
 
+	// ARCH-057: correct_sql is the authority on what kind of statement this is.
+	// The declared kind must agree with it — but only when the system can
+	// actually derive it. A CTE-led statement (WITH ... DELETE ...) returns ""
+	// here: unverifiable, which is not the same as wrong.
+	actual := repository.LeadingDMLKind(correctSQL)
+
 	switch dmlKind {
 	case "INSERT", "UPDATE", "DELETE":
+		if actual != "" && actual != dmlKind {
+			return fmt.Errorf("you selected %s, but the correct SQL is a %s statement. Pick the kind that matches your SQL", dmlKind, actual)
+		}
 	case "":
-		return errors.New("dml_kind is required for a DML question and must be INSERT, UPDATE, or DELETE")
+		// ARCH-057 rule 2: demand a kind only when one is derivable. Requiring
+		// it unconditionally made CTE-led DML questions unsavable (the ARCH-050
+		// regression) — the lecturer was blocked on a classification the system
+		// could not make either.
+		if actual != "" {
+			return errors.New("dml_kind is required for a DML question and must be INSERT, UPDATE, or DELETE")
+		}
 	default:
 		return fmt.Errorf("dml_kind must be INSERT, UPDATE, or DELETE, got %q", dmlKind)
 	}
@@ -330,7 +345,7 @@ func (ctrl *PracticeController) Upsert(c *gin.Context) {
 	q.DMLKind, q.SeedSQL = seed.DMLKind, seed.SeedSQL
 	q.CreatedBy = lecturer.ID
 
-	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL); err != nil {
+	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL, q.CorrectSQL); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

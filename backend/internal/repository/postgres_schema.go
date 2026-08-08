@@ -1278,6 +1278,12 @@ func leadingDMLKind(sql string) string {
 	}
 }
 
+// LeadingDMLKind is the exported form of leadingDMLKind, for the controller
+// layer's ARCH-057 agreement check. Returns "INSERT", "UPDATE", "DELETE", or
+// "" when the statement leads with none of them — a CTE-led statement, for
+// example, which the controller treats as unverifiable rather than wrong.
+func LeadingDMLKind(sql string) string { return leadingDMLKind(sql) }
+
 // ensureCategorySchema creates the schema owned by a practice category (if
 // missing) and grants the student roles: exam_student gets full DML (savepoint-
 // rolled-back at evaluation time) and exam_student_readonly gets SELECT (used by
