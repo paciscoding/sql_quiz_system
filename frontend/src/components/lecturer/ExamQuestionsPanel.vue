@@ -63,6 +63,8 @@ const blankQuestion = () => ({
   correct_sql: '',
   requirement: '',
   type: 'QUERY',
+  dml_kind: '',
+  seed_sql: '',
   points: 10,
   dual_schema: false,
   strict_mode: {
@@ -116,6 +118,34 @@ const autoSeedStatement = computed(() => {
   const vals = plan.columns.map(c => `'${c.value}'`).join(', ')
   return `INSERT INTO ${plan.table} (${cols}) VALUES (${vals})`
 })
+
+// The wire format keeps question_type as 'QUERY' | 'DML' (the database CHECK
+// constraint is deliberately unchanged, ARCH-043); the four-way authoring
+// choice is question_type + dml_kind. This computed is the single place the
+// two representations are converted, in both directions.
+const questionKind = computed<string>({
+  get() {
+    if (question.value.type === 'QUERY') return 'QUERY'
+    return question.value.dml_kind || 'DML'
+  },
+  set(v: string) {
+    if (v === 'QUERY') {
+      question.value.type = 'QUERY'
+      question.value.dml_kind = ''
+      question.value.seed_sql = ''
+      return
+    }
+    question.value.type = 'DML'
+    question.value.dml_kind = v
+    // ARCH-044: the seed field only exists for UPDATE and DELETE. Clearing it
+    // here means a hidden field can never be silently persisted.
+    if (v !== 'UPDATE' && v !== 'DELETE') question.value.seed_sql = ''
+  },
+})
+
+const seedApplies = computed(
+  () => question.value.dml_kind === 'UPDATE' || question.value.dml_kind === 'DELETE',
+)
 
 const examQuestions = ref<any[]>([])
 const sortKey = ref<'id'|'type'|'points'|null>(null)
@@ -445,6 +475,8 @@ const editQuestion = async (q: any) => {
     correct_sql: q.correct_sql || '',
     requirement: q.requirement || '',
     type: q.question_type || 'QUERY',
+    dml_kind: q.dml_kind || '',
+    seed_sql: q.seed_sql || '',
     points: q.points || 0,
     dual_schema: q.dual_schema || false,
     strict_mode: {
@@ -480,6 +512,8 @@ async function onQuestionDropdownChange(event: Event) {
       correct_sql: '',
       requirement: '',
       type: 'QUERY',
+      dml_kind: '',
+      seed_sql: '',
       points: 10,
       dual_schema: false,
       strict_mode: { ordering: false, attributes: false, column_order: false }
@@ -851,9 +885,12 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
 
         <div class="input-group">
           <label for="exam-question-type">Type:</label>
-          <select id="exam-question-type" v-model="question.type">
+          <select id="exam-question-type" v-model="questionKind">
             <option value="QUERY">Query (SELECT)</option>
-            <option value="DML">DML (Insert/Update/Delete)</option>
+            <option value="INSERT">INSERT</option>
+            <option value="UPDATE">UPDATE</option>
+            <option value="DELETE">DELETE</option>
+            <option value="DML" disabled>DML (pick a kind)</option>
           </select>
         </div>
 
@@ -944,10 +981,22 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         </button>
       </div>
 
+      <div class="input-group" v-if="seedApplies">
+        <label for="exam-question-seed-sql">Seed rows (sandbox only):</label>
+        <textarea id="exam-question-seed-sql" v-model="question.seed_sql" rows="4"
+          placeholder="INSERT INTO employee (ssn, fname) VALUES ('999999999', 'Test');"></textarea>
+        <small class="muted">
+          These INSERT statements run inside a transaction that is always rolled back.
+          They give your UPDATE/DELETE something to act on. They never modify the imported database.
+        </small>
+      </div>
+
       <!-- Auto-seeded row (ARCH-042): read-only, backend-derived. Never sent
            back in the create/update request body -- saveQuestion serializes
-           `question`, which never carries autoSeedPlan. -->
-      <div v-if="autoSeedPlan" class="auto-seed-panel">
+           `question`, which never carries autoSeedPlan. Gated on !question.seed_sql
+           because the lecturer's own seed and the derived plan are mutually
+           exclusive (ARCH-045) — they must never both show. -->
+      <div v-if="!question.seed_sql && autoSeedPlan" class="auto-seed-panel">
         <strong>Auto-seeded row</strong>
         <div class="auto-seed-statement"><code>{{ autoSeedStatement }}</code></div>
         <p class="muted" style="margin: var(--space-2) 0 0 0; font-size: 0.85rem;">
