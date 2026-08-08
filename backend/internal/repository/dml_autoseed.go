@@ -814,3 +814,148 @@ func unescapeDoubleQuoted(s string) string {
 	inner := s[1 : len(s)-1]
 	return strings.ReplaceAll(inner, `""`, `"`)
 }
+
+// ---------------------------------------------------------------------------
+// Lecturer-authored seed rows (ARCH-046 / ARCH-047)
+// ---------------------------------------------------------------------------
+
+// maxSeedStatements and maxSeedSQLBytes bound a lecturer's seed block. Both
+// refuse rather than truncate: silently dropping statements would seed a
+// different state than the lecturer read back in the form.
+const (
+	maxSeedStatements = 20
+	maxSeedSQLBytes   = 8192
+)
+
+// normalizeSeedSQL is the single definition of "no seed". A field holding only
+// whitespace is stored as the empty string, never as "   ", so the
+// seedSQL != "" precedence test in applyQuestionSeed and in the capture paths
+// can never be fooled by an accidental space.
+func normalizeSeedSQL(seedSQL string) string {
+	return strings.TrimSpace(seedSQL)
+}
+
+// validateSeedSQL is the ARCH-046 INSERT-only allowlist: the first of the
+// three independent layers protecting the imported schema (the other two are
+// the non-superuser student role and the always-rolled-back savepoint).
+//
+// It strips comments with the same scanner deriveAutoSeed uses, splits on
+// top-level semicolons, discards empty segments, and requires every remaining
+// statement to lead with the INSERT keyword. The returned slice is the ordered
+// list of statements to execute one at a time — never as one multi-command
+// string, because the pool is pinned to the extended protocol whose Parse
+// message accepts at most one command.
+//
+// An empty, whitespace-only, or comment-only input is NOT an error: it means
+// "no seed", and returns (nil, nil). Every refusal wraps
+// ErrAutoSeedUnsupported so callers can turn it into a 400 rather than a 500.
+func validateSeedSQL(seedSQL string) ([]string, error) {
+	trimmed := normalizeSeedSQL(seedSQL)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if len(trimmed) > maxSeedSQLBytes {
+		return nil, refusef("the seed SQL is %d bytes, which exceeds the %d byte limit", len(trimmed), maxSeedSQLBytes)
+	}
+
+	cleaned := stripSQLComments(trimmed)
+	if err := checkSeedQuotesBalanced(cleaned); err != nil {
+		return nil, err
+	}
+
+	var stmts []string
+	for _, seg := range splitTopLevelSemicolons(cleaned) {
+		s := strings.TrimSpace(seg)
+		if s == "" {
+			continue
+		}
+		if !matchKeywordAt(s, 0, "INSERT") {
+			return nil, refusef("the seed SQL contains a %s statement; only INSERT statements are allowed, because the seed must add rows and nothing else", leadingSeedKeyword(s))
+		}
+		stmts = append(stmts, s)
+	}
+	if len(stmts) == 0 {
+		return nil, nil
+	}
+	if len(stmts) > maxSeedStatements {
+		return nil, refusef("the seed SQL has %d statements; at most %d statements are allowed", len(stmts), maxSeedStatements)
+	}
+	return stmts, nil
+}
+
+// checkSeedQuotesBalanced refuses a seed whose quoting does not close. Without
+// it, an unterminated literal would swallow every following semicolon and turn
+// several statements into one, defeating the per-statement INSERT check.
+func checkSeedQuotesBalanced(s string) error {
+	inSingle, inDouble := false, false
+	n := len(s)
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if inSingle {
+			if c == '\'' {
+				if i+1 < n && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		}
+	}
+	if inSingle || inDouble {
+		return refuse("the seed SQL has an unterminated quoted value")
+	}
+	return nil
+}
+
+// leadingSeedKeyword returns the uppercased leading word of stmt, for naming
+// the offending statement in a refusal. Returns "unrecognised" when stmt does
+// not start with an identifier-shaped token.
+func leadingSeedKeyword(stmt string) string {
+	end := 0
+	for end < len(stmt) && isAutoSeedIdentByte(stmt[end]) {
+		end++
+	}
+	if end == 0 {
+		return "unrecognised"
+	}
+	return strings.ToUpper(stmt[:end])
+}
+
+// applyQuestionSeed is the single seeding entry point for all four DML paths
+// (practice capture, exam capture, grading, preview). Precedence is ARCH-045:
+// a non-empty lecturer seedSQL wins outright and the derived plan is ignored;
+// an empty seedSQL delegates to applyAutoSeed, whose nil/empty short-circuit
+// means a question with neither seed issues zero extra statements.
+//
+// MUST be called after SET LOCAL ROLE and inside the caller's savepoint. The
+// student login roles are NOINHERIT, so before the role switch the connection
+// holds no privileges and the INSERT would fail outright.
+func applyQuestionSeed(ctx context.Context, tx pgx.Tx, seedSQL string, plan *AutoSeedPlan) error {
+	if normalizeSeedSQL(seedSQL) == "" {
+		return applyAutoSeed(ctx, tx, plan)
+	}
+
+	stmts, err := validateSeedSQL(seedSQL)
+	if err != nil {
+		return err
+	}
+	for _, stmt := range stmts {
+		if _, execErr := tx.Exec(ctx, stmt); execErr != nil {
+			return execErr
+		}
+	}
+	return nil
+}
