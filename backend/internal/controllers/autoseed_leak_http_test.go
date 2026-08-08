@@ -471,3 +471,203 @@ func TestValidateSeedFields(t *testing.T) {
 		})
 	}
 }
+
+// buildSeedRoundTripRouter wires exactly /login plus the two real
+// lecturer-facing practice routes this test exercises (POST
+// /lecturer/practice/question, GET /lecturer/practice/questions), mirroring
+// cmd/main.go's real registration (practiceLecturer.Use(AuthMiddleware(...),
+// RoleMiddleware(models.RoleAdmin, models.RoleLecturer))), using the REAL
+// controller methods — never a mirror handler. postJSON (defined in
+// create_account_role_http_test.go) supplies the POST-with-body helper.
+func buildSeedRoundTripRouter(auth *services.AuthService, userCtrl *UserController, practiceCtrl *PracticeController) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.POST("/login", userCtrl.Login)
+
+	practiceLecturer := v1.Group("/lecturer/practice")
+	practiceLecturer.Use(AuthMiddleware(auth), RoleMiddleware(models.RoleAdmin, models.RoleLecturer))
+	{
+		practiceLecturer.POST("/question", practiceCtrl.Upsert)
+		practiceLecturer.GET("/questions", practiceCtrl.ListForLecturer)
+	}
+	return r
+}
+
+// TestPracticeUpsertSeedFieldsRoundTrip_RealController is the ARCH-055 guard:
+// PracticeController.Upsert binds the request body TWICE — once into
+// models.PracticeQuestion (which can no longer see dml_kind/seed_sql, since
+// ARCH-053 gives them `json:"-"`), and once into a narrow struct that
+// recovers exactly those two. If that second bind were wrong, a lecturer's
+// seed would be silently discarded with no error anywhere. This drives the
+// REAL Upsert and ListForLecturer handlers through a real gin router and a
+// real *repository.PostgresRepository — never a mirror handler.
+func TestPracticeUpsertSeedFieldsRoundTrip_RealController(t *testing.T) {
+	repo := openCtrlTestRepo(t)
+	auth := services.NewAuthService(repo, "test-jwt-secret-least-32-characters-long")
+	userCtrl := NewUserController(auth, services.NewStudentImportService(repo))
+	practiceCtrl := NewPracticeController(repo, services.NewValidationService(repo), auth)
+	r := buildSeedRoundTripRouter(auth, userCtrl, practiceCtrl)
+
+	lecturer := mkCtrlUser(t, repo, models.RoleLecturer, "lecpwrt")
+	token := login(t, r, lecturer.Username, "lecpwrt")
+
+	ctx := context.Background()
+	cat, err := repo.CreatePracticeCategory(ctx, fmt.Sprintf("roundtrip_cat_%d", time.Now().UnixNano()), int(lecturer.ID))
+	if err != nil {
+		t.Fatalf("CreatePracticeCategory: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.DeletePracticeCategory(context.Background(), int(cat.ID), true) })
+
+	tbl := fmt.Sprintf("employee_roundtrip_%d", cat.ID)
+	importSQL := fmt.Sprintf(`CREATE TABLE %s (ssn TEXT PRIMARY KEY, salary INTEGER);`, tbl)
+	if err := repo.ImportSchemaIntoCategory(ctx, int(cat.ID), importSQL, int(lecturer.ID), false); err != nil {
+		t.Fatalf("ImportSchemaIntoCategory: %v", err)
+	}
+
+	// --- 1 & 3: POST a practice question with a non-empty dml_kind and
+	// seed_sql, PLUS a client-supplied (bogus) auto_seed key, through the real
+	// Upsert handler. -------------------------------------------------------
+	seedSQL := fmt.Sprintf("INSERT INTO %s (ssn, salary) VALUES ('555555555', 4000)", tbl)
+	body := map[string]interface{}{
+		"category_id":   publicid.Encode(publicid.TypeCategory, int(cat.ID)),
+		"target_table":  tbl,
+		"correct_sql":   fmt.Sprintf("DELETE FROM %s WHERE ssn = '555555555'", tbl),
+		"question_type": "DML",
+		"dml_kind":      "DELETE",
+		"seed_sql":      seedSQL,
+		"requirement":   "delete a specific employee",
+		"points":        5,
+		// ARCH-053 inbound half: a client cannot supply auto_seed. If the
+		// second bind (or anything else) let this through, the saved row's
+		// auto_seed would echo "evil_table" below.
+		"auto_seed": map[string]interface{}{"table": "evil_table", "columns": []interface{}{}},
+	}
+	w := postJSON(r, "/api/v1/lecturer/practice/question", token, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Upsert: expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var upsertResp struct {
+		ID                   string `json:"id"`
+		ExpectedResultStatus string `json:"expected_result_status"`
+		CaptureError         string `json:"capture_error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &upsertResp); err != nil {
+		t.Fatalf("unmarshal Upsert response: %v", err)
+	}
+	qid, err := publicid.Decode(publicid.TypePractice, upsertResp.ID)
+	if err != nil {
+		t.Fatalf("decode saved id %q: %v", upsertResp.ID, err)
+	}
+
+	// 1: read the row back DIRECTLY FROM THE DATABASE (not via the API, which
+	// would not distinguish "saved correctly" from "echoed back from the
+	// request") and assert both dml_kind and seed_sql survived the double bind.
+	saved, err := repo.GetPracticeQuestion(ctx, qid)
+	if err != nil {
+		t.Fatalf("GetPracticeQuestion: %v", err)
+	}
+	if saved.ExpectedResultStatus != "captured" {
+		t.Fatalf("fixture precondition: expected a captured question, got status=%q capture_error=%q",
+			saved.ExpectedResultStatus, saved.CaptureError)
+	}
+	if saved.DMLKind != "DELETE" {
+		t.Errorf("ARCH-055 regression: dml_kind was dropped by the double bind, got %q, want DELETE", saved.DMLKind)
+	}
+	if saved.SeedSQL == "" {
+		t.Errorf("ARCH-055 regression: seed_sql was dropped by the double bind")
+	} else if !strings.Contains(saved.SeedSQL, "555555555") {
+		t.Errorf("ARCH-055 regression: seed_sql in the database does not match what was posted, got %q", saved.SeedSQL)
+	}
+
+	// 3: the client-supplied auto_seed must never reach the saved row. The
+	// backend's own rule ("auto_seed stays nil: ARCH-045 forbids both
+	// mechanisms at once", postgres_practice.go) means the correct value here
+	// is empty because seed_sql is non-empty — but the assertion that matters
+	// is that it is NOT the client's "evil_table" value, whatever the backend
+	// derived (or didn't).
+	if strings.Contains(string(saved.AutoSeed), "evil_table") {
+		t.Fatalf("SECURITY REGRESSION: client-supplied auto_seed reached the saved row: %s", saved.AutoSeed)
+	}
+
+	// --- 2: ListForLecturer must carry seed_sql for this question. auto_seed
+	// and seed_sql are mutually exclusive on any single row by construction
+	// (see the SeedSQL doc comment on models.PracticeQuestion: "When
+	// non-empty it takes precedence over AutoSeed, which is then NULL"), so
+	// proving the ARCH-054 view carries auto_seed too needs a second,
+	// genuinely auto-seeded fixture rather than this same row.
+	autoSeeded := mkAutoSeedRescuedPracticeQuestion(t, repo, int(lecturer.ID), "roundtriplist")
+
+	w2 := do(r, http.MethodGet, "/api/v1/lecturer/practice/questions", token)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("ListForLecturer: expected 200, got %d (%s)", w2.Code, w2.Body.String())
+	}
+	var listResp []map[string]interface{}
+	if err := json.Unmarshal(w2.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("unmarshal ListForLecturer response: %v", err)
+	}
+	wantSeedID := publicid.Encode(publicid.TypePractice, qid)
+	wantAutoSeedID := publicid.Encode(publicid.TypePractice, int(autoSeeded.ID))
+	foundSeed, foundAutoSeed := false, false
+	for _, q := range listResp {
+		idVal, _ := q["id"].(string)
+		if idVal == wantSeedID {
+			foundSeed = true
+			if got, _ := q["seed_sql"].(string); got == "" {
+				t.Errorf("ARCH-054 regression: ListForLecturer dropped seed_sql for the round-trip question: %+v", q)
+			} else if !strings.Contains(got, "555555555") {
+				t.Errorf("ARCH-054 regression: ListForLecturer seed_sql does not match what was saved, got %q", got)
+			}
+		}
+		if idVal == wantAutoSeedID {
+			foundAutoSeed = true
+			if v, ok := q["auto_seed"]; !ok || v == nil {
+				t.Errorf("ARCH-054 regression: ListForLecturer dropped auto_seed for the auto-seeded question: %+v", q)
+			}
+		}
+	}
+	if !foundSeed {
+		t.Fatalf("expected the round-trip question (id=%s) in the ListForLecturer response: %+v", wantSeedID, listResp)
+	}
+	if !foundAutoSeed {
+		t.Fatalf("expected the auto-seeded question (id=%s) in the ListForLecturer response: %+v", wantAutoSeedID, listResp)
+	}
+
+	// --- 4: a dml_kind that disagrees with correct_sql must be rejected with
+	// a 400 naming both kinds (ARCH-057), through the same real Upsert
+	// handler. A fresh category keeps this independent of the fixtures above.
+	cat2, err := repo.CreatePracticeCategory(ctx, fmt.Sprintf("roundtrip_mismatch_cat_%d", time.Now().UnixNano()), int(lecturer.ID))
+	if err != nil {
+		t.Fatalf("CreatePracticeCategory (mismatch fixture): %v", err)
+	}
+	t.Cleanup(func() { _ = repo.DeletePracticeCategory(context.Background(), int(cat2.ID), true) })
+
+	tbl2 := fmt.Sprintf("employee_roundtrip_mismatch_%d", cat2.ID)
+	importSQL2 := fmt.Sprintf(`CREATE TABLE %s (ssn TEXT PRIMARY KEY, fname TEXT); INSERT INTO %s (ssn, fname) VALUES ('1', 'a');`, tbl2, tbl2)
+	if err := repo.ImportSchemaIntoCategory(ctx, int(cat2.ID), importSQL2, int(lecturer.ID), false); err != nil {
+		t.Fatalf("ImportSchemaIntoCategory (mismatch fixture): %v", err)
+	}
+
+	mismatchBody := map[string]interface{}{
+		"category_id":   publicid.Encode(publicid.TypeCategory, int(cat2.ID)),
+		"target_table":  tbl2,
+		"correct_sql":   fmt.Sprintf("UPDATE %s SET fname = 'b' WHERE ssn = '1'", tbl2),
+		"question_type": "DML",
+		"dml_kind":      "DELETE",
+		"requirement":   "update a specific employee",
+		"points":        5,
+	}
+	w4 := postJSON(r, "/api/v1/lecturer/practice/question", token, mismatchBody)
+	if w4.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a dml_kind/correct_sql mismatch, got %d (%s)", w4.Code, w4.Body.String())
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w4.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if !strings.Contains(errResp.Error, "DELETE") || !strings.Contains(errResp.Error, "UPDATE") {
+		t.Errorf("expected the 400 message to name both DELETE and UPDATE, got %q", errResp.Error)
+	}
+}
