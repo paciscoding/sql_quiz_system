@@ -128,24 +128,52 @@ This is required, not cosmetic. `PracticeAuthoring.vue:226` destructures
 panel, and `ExamQuestionsPanel.vue` does the same through `autoSeedPlan`. The
 lecturer wire shape is unchanged, so no frontend edit is needed.
 
-### ARCH-055 — Writes bind through explicit request structs
+### ARCH-055 — Writes recover the two fields with a second, narrow bind
 
-`PracticeController.Upsert` and `LecturerController.UpsertQuestion` currently
-`ShouldBindJSON` straight into `models.PracticeQuestion` / `models.Question`.
-Each gains an explicit request struct carrying every field a lecturer may set,
-including:
+`PracticeController.Upsert:324` and `LecturerController.UpsertQuestion:377`
+currently `ShouldBindJSON` straight into `models.PracticeQuestion` /
+`models.Question`. Under ARCH-053 that bind silently stops populating `DMLKind`
+and `SeedSQL`, so the lecturer's seed would never be saved.
+
+**Rejected approach: a full request struct.** Enumerating every
+lecturer-settable field (id, exam_id, target_table, correct_sql, type, points,
+requirement, the three strict-mode flags, dual_schema, category_id, …) into a
+new struct and copying it across means a single omitted field becomes silent
+data loss on a **deployed** save path — a field the lecturer sets that stops
+being persisted, with no error. The risk is not worth the tidiness.
+
+**Chosen approach: leave the model bind exactly as it is, and add a second bind
+for only the two hidden fields.**
 
 ```go
-	DMLKind string `json:"dml_kind"`
-	SeedSQL string `json:"seed_sql"`
+	var q models.Question
+	if err := c.ShouldBindBodyWithJSON(&q); err != nil { /* 400 */ }
+
+	// ARCH-053 gives DMLKind/SeedSQL `json:"-"`, so the bind above cannot
+	// populate them. Recover exactly those two from the same body — and only
+	// those two, which is why auto_seed still cannot be client-supplied.
+	// ShouldBindBodyWithJSON caches the body on first use, so binding twice is
+	// safe; plain ShouldBindJSON would consume the reader and fail here.
+	var seed struct {
+		DMLKind string `json:"dml_kind"`
+		SeedSQL string `json:"seed_sql"`
+	}
+	if err := c.ShouldBindBodyWithJSON(&seed); err != nil { /* 400 */ }
+	q.DMLKind, q.SeedSQL = seed.DMLKind, seed.SeedSQL
 ```
 
-The handler copies the struct's fields into the model, then proceeds exactly as
-today. `auto_seed` is simply absent from the request struct: a client cannot
-supply it, by construction rather than by comment.
+Every other field keeps its existing binding path untouched, so no field can be
+lost. `auto_seed` appears in neither bind: `json:"-"` blocks it on the model and
+it is absent from `seed`. The inbound guarantee of ARCH-053 is preserved.
 
-The round-trip test in the Testing section exists specifically to catch a field
-dropped during this transcription.
+Every `ShouldBindJSON` call in these two handlers becomes
+`ShouldBindBodyWithJSON` — mixing the two leaves the second bind reading an
+already-consumed body. The method exists in the vendored gin v1.12.0
+(`vendor/github.com/gin-gonic/gin/context.go:946`) and needs no extra import,
+unlike the older `ShouldBindBodyWith(obj, binding.JSON)` form.
+
+The round-trip test in the Testing section guards this: save a seed through the
+API, read it back, confirm it survived.
 
 ### ARCH-056 — The manual scrubs are deleted
 
@@ -210,9 +238,11 @@ guarantee, tested directly:
 **Leak regression** — `controllers/autoseed_leak_http_test.go` passes unchanged
 with the ARCH-056 assignments deleted.
 
-**Round-trip** — save a question with a `seed_sql` through the real API, read it
-back through the lecturer path, and assert the seed survived intact. This is the
-guard against a field lost in the ARCH-055 transcription.
+**Round-trip** — save a question with a `seed_sql` and a `dml_kind` through the
+real API, read it back through the lecturer path, and assert both survived
+intact. This is the guard against ARCH-055's double bind silently dropping them.
+A companion case posts a body containing `auto_seed` and asserts the saved row's
+`auto_seed` is unaffected by it.
 
 **Drift** (`validateSeedFields` table test):
 
