@@ -382,6 +382,11 @@ func (ctrl *LecturerController) UpsertQuestion(c *gin.Context) {
 	// SECURITY: derive authorship from JWT — never trust client-supplied created_by.
 	q.CreatedBy = lecturer.ID
 
+	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	newID, err := ctrl.repo.CreateQuestion(c.Request.Context(), q)
 	if err != nil {
 		c.JSON(statusForRepoErr(err), gin.H{"error": err.Error()})
@@ -515,6 +520,7 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		ExamID      models.ExamID         `json:"exam_id"`               // optional; 0 = use public schema
 		CategoryID  models.ExamCategoryID `json:"category_id,omitempty"` // optional; 0 = no category
 		Schema      string                `json:"schema"`                // optional; "grading" (default) or "preview"
+		SeedSQL     string                `json:"seed_sql"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -524,9 +530,15 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be QUERY or DML"})
 		return
 	}
+	if strings.TrimSpace(req.SeedSQL) != "" {
+		if _, err := repository.ValidateSeedSQL(req.SeedSQL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("seed_sql is not valid: %s", err.Error())})
+			return
+		}
+	}
 
 	useDecoy := req.Schema == "preview"
-	rows, cols, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy, "")
+	rows, cols, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy, req.SeedSQL)
 	if err != nil {
 		if errors.Is(err, repository.ErrExamCategoryMismatch) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

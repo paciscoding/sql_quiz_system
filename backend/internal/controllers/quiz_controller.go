@@ -168,6 +168,9 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 		// own WHERE clause), so unlike the dual-only fields above it is
 		// scrubbed unconditionally, on single-schema questions too.
 		questions[i].AutoSeed = nil
+		// ARCH-052: seed_sql leaks strictly more than auto_seed — it is
+		// lecturer-written SQL holding the exact values the answer must match.
+		questions[i].SeedSQL = ""
 	}
 
 	c.JSON(http.StatusOK, questions)

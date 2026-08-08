@@ -934,6 +934,12 @@ func leadingSeedKeyword(stmt string) string {
 	return strings.ToUpper(stmt[:end])
 }
 
+// ValidateSeedSQL is the exported form of validateSeedSQL, for the controller
+// layer's request validation. The repository re-validates on its own write
+// path regardless — this is a fast 400 for the lecturer, not the security
+// boundary.
+func ValidateSeedSQL(seedSQL string) ([]string, error) { return validateSeedSQL(seedSQL) }
+
 // applyQuestionSeed is the single seeding entry point for all four DML paths
 // (practice capture, exam capture, grading, preview). Precedence is ARCH-045:
 // a non-empty lecturer seedSQL wins outright and the derived plan is ignored;

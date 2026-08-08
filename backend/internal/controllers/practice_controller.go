@@ -17,6 +17,44 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
 
+// validateSeedFields enforces ARCH-044 and ARCH-050 on every question write
+// path. Returns a lecturer-facing error suitable for an HTTP 400 body; the
+// caller never turns any of these into a 500.
+func validateSeedFields(qType, dmlKind, seedSQL string) error {
+	seedSQL = strings.TrimSpace(seedSQL)
+
+	if qType == "QUERY" {
+		if dmlKind != "" {
+			return errors.New("dml_kind must be empty for a QUERY question")
+		}
+		if seedSQL != "" {
+			return errors.New("seed_sql must be empty for a QUERY question")
+		}
+		return nil
+	}
+
+	switch dmlKind {
+	case "INSERT", "UPDATE", "DELETE":
+	case "":
+		return errors.New("dml_kind is required for a DML question and must be INSERT, UPDATE, or DELETE")
+	default:
+		return fmt.Errorf("dml_kind must be INSERT, UPDATE, or DELETE, got %q", dmlKind)
+	}
+
+	if seedSQL == "" {
+		return nil
+	}
+	if dmlKind == "INSERT" {
+		// ARCH-044: an INSERT model answer can only affect 0 rows via
+		// INSERT ... SELECT over an empty source, which seeding cannot fix.
+		return errors.New("seed_sql applies only to UPDATE and DELETE questions")
+	}
+	if _, err := repository.ValidateSeedSQL(seedSQL); err != nil {
+		return fmt.Errorf("seed_sql is not valid: %w", err)
+	}
+	return nil
+}
+
 type PracticeController struct {
 	repo      *repository.PostgresRepository
 	validator *services.ValidationService
@@ -63,6 +101,9 @@ func (ctrl *PracticeController) ListForStudent(c *gin.Context) {
 		// own WHERE clause), so unlike the dual-only fields above it is
 		// scrubbed unconditionally, on single-schema questions too.
 		questions[i].AutoSeed = nil
+		// ARCH-052: seed_sql leaks strictly more than auto_seed — it is
+		// lecturer-written SQL holding the exact values the answer must match.
+		questions[i].SeedSQL = ""
 	}
 
 	c.JSON(http.StatusOK, questions)
@@ -102,6 +143,9 @@ func (ctrl *PracticeController) GetForStudent(c *gin.Context) {
 	// than expected_rows_affected, so unlike the dual-only fields above it is
 	// scrubbed unconditionally, on single-schema questions too.
 	question.AutoSeed = nil
+	// ARCH-052: seed_sql leaks strictly more than auto_seed — it is
+	// lecturer-written SQL holding the exact values the answer must match.
+	question.SeedSQL = ""
 
 	c.JSON(http.StatusOK, question)
 }
@@ -284,6 +328,11 @@ func (ctrl *PracticeController) Upsert(c *gin.Context) {
 	}
 	q.CreatedBy = lecturer.ID
 
+	if err := validateSeedFields(q.Type, q.DMLKind, q.SeedSQL); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	ctx := c.Request.Context()
 
 	// A practice question must belong to an existing category (the category owns
@@ -385,6 +434,7 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 		CorrectSQL  string            `json:"correct_sql"`
 		CategoryID  models.CategoryID `json:"category_id"`
 		Schema      string            `json:"schema"`
+		SeedSQL     string            `json:"seed_sql"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -394,13 +444,19 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be QUERY or DML"})
 		return
 	}
+	if strings.TrimSpace(req.SeedSQL) != "" {
+		if _, err := repository.ValidateSeedSQL(req.SeedSQL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("seed_sql is not valid: %s", err.Error())})
+			return
+		}
+	}
 
 	var rows []map[string]interface{}
 	var cols []string
 	var err error
 	useDecoy := req.Schema == "preview"
 	if int(req.CategoryID) > 0 {
-		rows, cols, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy, "")
+		rows, cols, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy, req.SeedSQL)
 	} else {
 		rows, cols, err = ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
 	}
