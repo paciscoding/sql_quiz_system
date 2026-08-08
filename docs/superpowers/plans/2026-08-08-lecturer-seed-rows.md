@@ -19,7 +19,7 @@
 - `ROLLBACK TO SAVEPOINT` always runs **before** `RESET ROLE` on every error exit path (ARCH-021 / ARCH-024b). Reversing them makes `RESET ROLE` itself fail in the aborted transaction.
 - `seed_sql` and `auto_seed` must never appear in a student-facing HTTP response.
 - Run `cd backend && go build ./...` and `gofmt -l .` before each commit; `gofmt -l .` must print nothing.
-- Frontend: `cd frontend && npm run test:unit` and `npx vue-tsc --noEmit` must pass before each frontend commit.
+- Frontend: `cd frontend && npm test --` and `npx vue-tsc --noEmit` must pass before each frontend commit.
 
 ---
 
@@ -1271,7 +1271,7 @@ Create `frontend/src/__tests__/components/practice_authoring_seed.test.ts`. Read
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd frontend && npm run test:unit -- practice_authoring_seed`
+Run: `cd frontend && npm test -- -- practice_authoring_seed`
 
 Expected: FAIL — the select still offers only two options.
 
@@ -1354,7 +1354,7 @@ Use whatever the component already names the loaded question object; do not intr
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cd frontend && npm run test:unit -- practice_authoring_seed && npx vue-tsc --noEmit`
+Run: `cd frontend && npm test -- -- practice_authoring_seed && npx vue-tsc --noEmit`
 
 Expected: all new assertions PASS; no type errors.
 
@@ -1384,7 +1384,7 @@ Create `frontend/src/__tests__/components/exam_questions_seed.test.ts` asserting
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd frontend && npm run test:unit -- exam_questions_seed`
+Run: `cd frontend && npm test -- -- exam_questions_seed`
 
 Expected: FAIL — the select still offers only two options.
 
@@ -1452,7 +1452,7 @@ Leave the two `question.type === 'DML'` target-table guards at `:526` and `:571`
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cd frontend && npm run test:unit && npx vue-tsc --noEmit`
+Run: `cd frontend && npm test -- && npx vue-tsc --noEmit`
 
 Expected: the whole frontend suite PASSes; no type errors.
 
@@ -1479,7 +1479,7 @@ Expected: build succeeds, `gofmt -l` prints nothing, all tests PASS.
 
 - [ ] **Step 2: Full frontend suite**
 
-Run: `cd frontend && npx vue-tsc --noEmit && npm run test:unit && npm run build`
+Run: `cd frontend && npx vue-tsc --noEmit && npm test -- && npm run build`
 
 Expected: no type errors, all tests PASS, build succeeds.
 
