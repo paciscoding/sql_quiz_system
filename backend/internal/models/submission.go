@@ -65,11 +65,23 @@ type Question struct {
 	// whose model answer already affected rows on first run. Derived entirely
 	// by the backend at capture time; it must never be accepted from a client
 	// request body.
-	AutoSeed     json.RawMessage `json:"auto_seed,omitempty"`
-	CaptureError string          `json:"capture_error,omitempty"`
-	CreatedBy    UserID          `json:"created_by"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	AutoSeed json.RawMessage `json:"auto_seed,omitempty"`
+	// DMLKind is the DML statement kind the lecturer selected: "INSERT",
+	// "UPDATE", or "DELETE". Empty for QUERY questions and for DML questions
+	// written before the column existed (ARCH-043). Presentation and
+	// validation only — grading branches on Type, never on this.
+	DMLKind string `json:"dml_kind,omitempty"`
+	// SeedSQL is the lecturer's INSERT-only seed block, applied inside the
+	// rolled-back evaluation savepoint before the answer statement so an
+	// UPDATE/DELETE question has a row to act on (ARCH-045/046). When
+	// non-empty it takes precedence over AutoSeed, which is then NULL.
+	// MUST be scrubbed from every student-facing response (ARCH-052) — it
+	// carries the exact values the correct answer must match.
+	SeedSQL      string    `json:"seed_sql,omitempty"`
+	CaptureError string    `json:"capture_error,omitempty"`
+	CreatedBy    UserID    `json:"created_by"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 	// CurriculumSchema is the schema that holds the exam's reference database for
 	// this question (populated by GetQuestion only, from the exam's curriculum_schema
 	// column). Defaults to 'public' when not set — the pre-curriculum-import

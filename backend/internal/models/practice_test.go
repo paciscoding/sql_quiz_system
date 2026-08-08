@@ -135,3 +135,19 @@ func TestPracticeQuestion_AsQuestion(t *testing.T) {
 		})
 	}
 }
+
+func TestAsQuestionCarriesSeedFields(t *testing.T) {
+	pq := PracticeQuestion{
+		Type:        "DML",
+		TargetTable: "employee",
+		DMLKind:     "DELETE",
+		SeedSQL:     "INSERT INTO employee (ssn) VALUES ('1')",
+	}
+	got := pq.AsQuestion()
+	if got.DMLKind != "DELETE" {
+		t.Errorf("DMLKind: got %q, want %q", got.DMLKind, "DELETE")
+	}
+	if got.SeedSQL != pq.SeedSQL {
+		t.Errorf("SeedSQL: got %q, want %q", got.SeedSQL, pq.SeedSQL)
+	}
+}

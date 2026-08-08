@@ -77,9 +77,21 @@ type PracticeQuestion struct {
 	// whose model answer already affected rows on first run. Derived entirely
 	// by the backend at capture time; it must never be accepted from a client
 	// request body.
-	AutoSeed  json.RawMessage `json:"auto_seed,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	AutoSeed json.RawMessage `json:"auto_seed,omitempty"`
+	// DMLKind is the DML statement kind the lecturer selected: "INSERT",
+	// "UPDATE", or "DELETE". Empty for QUERY questions and for DML questions
+	// written before the column existed (ARCH-043). Presentation and
+	// validation only — grading branches on Type, never on this.
+	DMLKind string `json:"dml_kind,omitempty"`
+	// SeedSQL is the lecturer's INSERT-only seed block, applied inside the
+	// rolled-back evaluation savepoint before the answer statement so an
+	// UPDATE/DELETE question has a row to act on (ARCH-045/046). When
+	// non-empty it takes precedence over AutoSeed, which is then NULL.
+	// MUST be scrubbed from every student-facing response (ARCH-052) — it
+	// carries the exact values the correct answer must match.
+	SeedSQL   string    `json:"seed_sql,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // AsQuestion builds a *Question suitable for passing to ValidationService.
@@ -96,6 +108,8 @@ func (pq *PracticeQuestion) AsQuestion() *Question {
 		Type:                     pq.Type,
 		DualSchema:               pq.DualSchema,
 		TargetTable:              pq.TargetTable,
+		DMLKind:                  pq.DMLKind,
+		SeedSQL:                  pq.SeedSQL,
 		CorrectSQL:               pq.CorrectSQL,
 		Points:                   pq.Points,
 		Requirement:              pq.Requirement,
