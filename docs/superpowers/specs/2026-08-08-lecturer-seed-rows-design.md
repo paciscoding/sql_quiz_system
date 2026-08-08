@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-08
 **Status:** Approved, ready for implementation
-**ARCH range:** ARCH-043 … ARCH-051
+**ARCH range:** ARCH-043 … ARCH-052
 **Supersedes in part:** the 2026-08-07 DML auto-seed spec (ARCH-037 … ARCH-042),
 whose derivation becomes a fallback rather than the only mechanism.
 
@@ -78,18 +78,13 @@ Both columns are added to the `CREATE TABLE` bodies **and** to the idempotent
 matching the established `ADD COLUMN IF NOT EXISTS` pattern used by
 `expected_rows_affected` and `auto_seed` (`:1086-1094`).
 
-**Backfill.** The migration additionally runs, once per table, guarded so it is
-a no-op on every subsequent boot:
-
-```sql
-UPDATE app.practice_questions
-   SET dml_kind = CASE
-       WHEN correct_sql ~* '^\s*(--[^\n]*\n|/\*.*?\*/|\s)*INSERT\M' THEN 'INSERT'
-       WHEN correct_sql ~* '^\s*(--[^\n]*\n|/\*.*?\*/|\s)*UPDATE\M' THEN 'UPDATE'
-       WHEN correct_sql ~* '^\s*(--[^\n]*\n|/\*.*?\*/|\s)*DELETE\M' THEN 'DELETE'
-   END
- WHERE question_type = 'DML' AND dml_kind IS NULL;
-```
+**Backfill.** Runs in Go, not SQL — a leading `--` or `/* */` comment before
+the statement keyword cannot be stripped reliably by a Postgres regex, and
+`dml_autoseed.go`'s `stripSQLComments` already does it correctly. A new
+`migrateDMLKind(ctx)` in `postgres_schema.go` selects
+`id, correct_sql` for rows `WHERE question_type = 'DML' AND dml_kind IS NULL`,
+computes the kind with the shared scanner, and writes it back. The
+`dml_kind IS NULL` guard makes it a no-op on every subsequent boot.
 
 A row whose `correct_sql` matches none of the three keeps `dml_kind = NULL`;
 the UI falls back to showing it as `DELETE`-less plain DML and the lecturer
@@ -287,6 +282,24 @@ specific message.
   `frontend/src/components/lecturer/types.ts` gain `dml_kind?: string` and
   `seed_sql?: string` on their question interfaces.
 
+### ARCH-052 — `seed_sql` never reaches a student
+
+`auto_seed` is stripped from every student-facing response because it carries
+the literal values the model answer's `WHERE` clause pins — handing a student
+the answer. The scrub sites are `quiz_controller.go:170`,
+`practice_controller.go:65` (list) and `practice_controller.go:104` (get), and
+`controllers/autoseed_leak_http_test.go` asserts the responses contain no
+`auto_seed` field at all.
+
+`seed_sql` leaks strictly more: it is lecturer-written SQL containing the exact
+values the answer must match. It is scrubbed at the same three sites, in the
+same place, by setting the field to `""` so `json:"seed_sql,omitempty"` drops
+it from the payload entirely — and the existing leak test is extended to assert
+its absence alongside `auto_seed`.
+
+`dml_kind` is **not** secret and is not scrubbed; a student can already read the
+question type.
+
 ## Known limitations
 
 Stated explicitly rather than hidden:
@@ -338,6 +351,9 @@ Stated explicitly rather than hidden:
   `dml_kind` matching their `correct_sql`'s leading keyword.
 - **Regression**: questions with neither `seed_sql` nor a derived plan produce
   byte-identical `expected_result` to before the change.
+- **Leak** (ARCH-052): `controllers/autoseed_leak_http_test.go` extended so the
+  student list/get responses for practice and exam contain no `seed_sql` field,
+  with a fixture question whose `seed_sql` is non-empty in the database.
 
 Backend tests touching the shared database must run with `go test -p 1` — a
 plain `go test ./...` on a shared DB fakes regressions.
