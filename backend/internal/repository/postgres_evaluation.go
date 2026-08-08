@@ -249,9 +249,15 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	// (postgres_schema.go:179). unmarshalAutoSeed returns (nil, nil) for the
 	// overwhelmingly common case of a question with no stored plan, so this
 	// issues zero extra statements for every question that doesn't need it.
-	if plan, seedErr := unmarshalAutoSeed(question.AutoSeed); seedErr != nil || plan != nil {
+	// ARCH-045/047: one seeding entry point. A non-empty lecturer seed_sql
+	// wins and the derived plan is ignored; an empty one delegates to the
+	// derived plan, whose nil short-circuit means zero extra statements for
+	// the overwhelmingly common question that needs no seed. MUST stay AFTER
+	// SET LOCAL ROLE above — the student login roles are NOINHERIT, so before
+	// the switch the connection holds no privileges and the INSERT fails.
+	if plan, seedErr := unmarshalAutoSeed(question.AutoSeed); seedErr != nil || plan != nil || question.SeedSQL != "" {
 		if seedErr == nil {
-			seedErr = applyAutoSeed(ctx, tx, plan)
+			seedErr = applyQuestionSeed(ctx, tx, question.SeedSQL, plan)
 		}
 		if seedErr != nil {
 			// The seed failed, not the student: this question was captured
@@ -527,9 +533,15 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 	// unmarshalAutoSeed returns (nil, nil) for the overwhelmingly common case
 	// of a question with no stored plan, so this issues zero extra statements
 	// for every question that doesn't need it.
-	if plan, seedErr := unmarshalAutoSeed(question.AutoSeed); seedErr != nil || plan != nil {
+	// ARCH-045/047: one seeding entry point. A non-empty lecturer seed_sql
+	// wins and the derived plan is ignored; an empty one delegates to the
+	// derived plan, whose nil short-circuit means zero extra statements for
+	// the overwhelmingly common question that needs no seed. MUST stay AFTER
+	// SET LOCAL ROLE above — the student login roles are NOINHERIT, so before
+	// the switch the connection holds no privileges and the INSERT fails.
+	if plan, seedErr := unmarshalAutoSeed(question.AutoSeed); seedErr != nil || plan != nil || question.SeedSQL != "" {
 		if seedErr == nil {
-			seedErr = applyAutoSeed(ctx, tx, plan)
+			seedErr = applyQuestionSeed(ctx, tx, question.SeedSQL, plan)
 		}
 		if seedErr != nil {
 			// The seed failed, not the student: this question is
