@@ -222,6 +222,15 @@ The system refuses only what it can prove is inconsistent.
 3. **The lecturer view is opt-in per handler.** A future *lecturer* endpoint
    that forgets to wrap will omit the two fields. That failure is safe — a
    missing authoring field is visible immediately, unlike a silent leak.
+4. **Rule 2 widens ARCH-044 for unclassifiable SQL.** ARCH-044 restricts
+   `seed_sql` to `UPDATE`/`DELETE` questions by checking `dml_kind == "INSERT"`.
+   When `dml_kind` is empty because `LeadingDMLKind` returned `""`, that check
+   cannot fire, so a `WITH … DELETE …` question may carry a seed with no kind
+   set. This is intended, not an oversight: such a question genuinely may need a
+   seed, and refusing one would re-block the very case Rule 2 exists to unblock.
+   The seed still passes the full ARCH-046 INSERT-only validation. The authoring
+   UI cannot reach this state — it offers the field only for `UPDATE`/`DELETE` —
+   so it is available through the API only.
 
 ## Testing
 
