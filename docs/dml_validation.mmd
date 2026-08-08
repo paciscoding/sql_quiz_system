@@ -2,37 +2,53 @@ sequenceDiagram
     participant S as Student
     participant B as Backend (Go Gin)
     participant Q as SubmissionQueue<br/>(1 worker, cap 256, 30s timeout)
-    participant DB as Postgres<br/>(sandbox_exam_{examID})
+    participant P as quiz_exec_rw pool<br/>(LOGIN role, NOINHERIT)
+    participant DB as Postgres<br/>(sandbox_exam_{id} / sandbox_exam_cat_{id})
 
     S->>B: POST /quiz/submit (DML)
-    B->>B: Fetch question, verify exam active + enrolled
+    B->>B: Fetch question, verify effective_state=active + enrolled
+    B->>B: normalizeSmartQuotes(student_sql)
     B->>Q: Run(ctx, evaluate)
     Note over Q: Non-blocking send.<br/>Full → ErrQueueFull → HTTP 503
 
     rect rgb(220, 240, 220)
-        Note right of Q: Phase 2: serialised evaluation (one student at a time)
-        Q->>DB: BEGIN; SAVEPOINT student_eval
+        Note right of Q: Phase 2: serialised evaluation (one exam DML at a time)
+        Q->>P: Acquire connection (never the privileged app pool)
+        P->>DB: BEGIN
+        Q->>DB: pg_advisory_xact_lock_shared(schema)  -- blocks a concurrent rebuild
+        Q->>DB: SAVEPOINT student_eval
+        Q->>DB: SET LOCAL search_path = <schema>, public, pg_temp
+        Note over Q,DB: pg_temp named LAST (ARCH-023): a student<br/>CREATE TEMP TABLE cannot shadow target_table
         Q->>DB: SET LOCAL ROLE exam_student
-        Q->>DB: SET LOCAL search_path = sandbox_exam_{examID}, public
+        opt seed_sql or auto_seed present
+            Q->>DB: apply lecturer seed_sql, else the derived AutoSeedPlan INSERT
+            Note over Q,DB: Must run AFTER SET LOCAL ROLE — login roles are NOINHERIT.<br/>Seed failure → rollback → status=error, not HTTP 500
+        end
         Q->>DB: Execute student DML
         DB-->>Q: (writes applied to sandbox)
         Q->>DB: SELECT * FROM target_table  -- post-image
         DB-->>Q: Captured rows
         Q->>DB: ROLLBACK TO SAVEPOINT student_eval
+        Note over Q,DB: ROLLBACK FIRST, then RESET ROLE (ARCH-021):<br/>an aborted tx rejects every other statement
+        Q->>DB: RESET ROLE
         Q->>DB: COMMIT
         Note over Q,DB: Sandbox restored byte-identically<br/>for the next student in the queue
     end
 
-    Q-->>B: ValidationResult (status, score, feedback)
-    Note over B: Compare against cached expected_result<br/>(no teacher SQL re-executed)
+    Q-->>B: ValidationResult (status, captured post-image)
+    Note over B: decideDMLStatus: multiset diff of post-images<br/>against cached expected_result.<br/>Column names folded to lowercase.<br/>No ordering or column-order gate on DML.<br/>Teacher SQL is never re-executed.
     B->>DB: INSERT INTO app.submissions
 
     alt status = correct
         B-->>S: 200 OK · status=correct · full points
-    else status = incorrect
-        B-->>S: 200 OK · status=incorrect · 0 points · "The result is wrong."
+    else status = incorrect (single-schema)
+        B-->>S: 200 OK · 0 points · row-level missing/extra diff
+    else status = incorrect (dual_schema)
+        B-->>S: 200 OK · 0 points · generic message (no decoy/grading data leaked)
     else status = syntax_error
-        B-->>S: 200 OK · status=syntax_error · 0 points · engine error detail
+        B-->>S: 200 OK · 0 points · engine error detail
+    else seed replay failed
+        B-->>S: 200 OK · status=error · "question could not be prepared"
     else queue full
         B-->>S: 503 · "submission queue is full"
     else per-job timeout (30s)

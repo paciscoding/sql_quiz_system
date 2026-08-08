@@ -25,7 +25,7 @@ The Administrator is responsible for system infrastructure and the initial creat
 - **Reset a password** for any user via the admin action — this generates a new password and **logs the user out of all devices**.
 - **Resend a credential** re-emails the user's current password (requires an email on file and `PASSWORD_LOG_KEY` configured); it does not change the password.
 - **Password events** shows a per-user audit trail of password changes.
-- Users who forget their password can self-serve from the login page (see the Student workflow's *Forgot Password* note) if they have an email on file.
+- Users who forget their password normally ask an administrator for a reset (above). Self-service from the login page exists but is **switched off by default** — it works only where the deployment sets `PASSWORD_RESET_EMAIL_ENABLED=true` *and* the account has an email on file. See the Student workflow's *Forgot Password* note.
 
 **Bulk password reset (lab exams).** From **Account Administration → User Management**, the **"Bulk Reset Passwords"** button opens a dedicated page for resetting many students' passwords in one operation — for example, ahead of a proctored lab exam where every station needs a fresh, unknown password.
 - **Pick a selection mode:** *Selected students* (tick individually), *All students*, or *By exam roster* (every student assigned to one exam).
@@ -173,7 +173,9 @@ Students interact only with the examination interface.
 1. Log in with the credentials provided by your Lecturer.
 2. Your **Student ID** is automatically identified by the system; you do not need to enter it manually.
 
-**Forgot your password?** If your account has an email on file, use **"Forgot password"** on the login screen: enter your username to receive a 6-digit code by email, then enter the code to have a new password emailed to you. The code expires in 10 minutes.
+**Forgot your password?** **Ask your instructor or an administrator to reset it** — that is the supported route, and it is the only one on a default installation.
+
+The self-service flow is **disabled unless your deployment turns it on** (`PASSWORD_RESET_EMAIL_ENABLED=true`); where it is off, "Forgot password" simply reports that you should contact an administrator. Where it *is* on and your account has an email on file: enter your username to receive a 6-digit code by email, then enter the code to have a new password emailed to you. The code expires in 10 minutes.
 
 ### Selecting an Exam & the Waiting Page
 1. Pick an exam you're enrolled in.

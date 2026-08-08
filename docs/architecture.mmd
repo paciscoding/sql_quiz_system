@@ -1,39 +1,66 @@
 graph TD
-    User((Student/Lecturer/Admin)) -->|HTTPS/JWT| Nginx[Nginx Reverse Proxy]
+    User((Student/Lecturer/Admin)) -->|HTTPS/JWT| Nginx[Nginx Reverse Proxy<br/>UI at / · API at /api/v1]
     Nginx -->|Static Files| Frontend[Vue 3 Frontend]
     Nginx -->|API Requests| Backend[Go Gin Backend]
 
     subgraph Auth & RBAC
-        Backend --> AuthService[Auth Service]
-        AuthService --> JWT[JWT Verification]
-        AuthService --> RBAC[Role-Based Access Control]
+        Backend --> AuthService[Auth Service<br/>JWT + token_version]
+        AuthService --> JWT[Token version check<br/>password change evicts sessions]
+        AuthService --> RBAC[RoleMiddleware<br/>Admin / Lecturer / Student]
+        Backend --> PublicID[publicid codec<br/>Sqids over ID_SALT<br/>opaque ids on the wire]
     end
 
-    subgraph Core Features
-        Backend --> QuizCtrl[Quiz Controller]
-        Backend --> LecturerCtrl[Lecturer Controller]
-        QuizCtrl --> Exams[Examination Management]
-        LecturerCtrl --> Questions[Question Management]
+    subgraph Controllers
+        Backend --> QuizCtrl[Quiz Controller<br/>submit · preview · SSE stream]
+        Backend --> LecturerCtrl[Lecturer Controller<br/>exams · questions · roster · import]
+        Backend --> PracticeCtrl[Practice Controller<br/>questions · categories · attempts]
+        Backend --> ExamCatCtrl[Exam Category Controller]
+        Backend --> UserCtrl[User Controller<br/>login · passwords · bulk reset]
+        Backend --> ExportCtrl[Export Controller<br/>submission-log emailer]
     end
 
     subgraph Concurrency
-        QuizCtrl -->|DML only| Queue[SubmissionQueue<br/>1 worker · cap 256 · 30s timeout]
-        QuizCtrl -.->|SELECT: lock-free,<br/>30s context.WithTimeout| Logic
+        QuizCtrl -->|exam DML only| Queue[SubmissionQueue<br/>1 worker · cap 256 · 30s timeout]
+        QuizCtrl -.->|SELECT: lock-free<br/>30s context.WithTimeout| Logic
+        PracticeCtrl -.->|practice: no queue<br/>savepoint isolation only| Logic
+        Logic -->|per-schema advisory lock<br/>shared on eval / exclusive on rebuild| RebuildLock[(pg_advisory_xact_lock)]
     end
 
-    subgraph Docker Container
-        Backend -->|SQL| DB[(PostgreSQL)]
-        DB -->|app schema| AppDB[System Tables<br/>users / exams / questions / submissions / exam_sandboxes]
-        DB -->|public schema, frozen on activate| MainDB[Lecturer Curriculum<br/>clone template · SELECT-only via exam_student_readonly]
-        DB -.->|cloned once at activation<br/>LIKE INCLUDING ALL + INSERT SELECT| ExamDB[Per-exam DML Sandbox<br/>sandbox_exam_{examID}<br/>shared across all enrolled students]
-        DB -->|per-category schema, lecturer-imported| PracticeDB[Practice Category DBs<br/>practice_cat_{categoryID}<br/>isolated from public · SELECT + DML]
+    subgraph "Restricted execution pools — ARCH-022"
+        Logic --> PoolRO[quiz_exec_ro<br/>-> exam_student_readonly]
+        Logic --> PoolRW[quiz_exec_rw<br/>-> exam_student]
+        Logic --> PoolPRO[quiz_exec_prev_ro<br/>-> exam_student_preview_readonly]
+        Logic --> PoolPRW[quiz_exec_prev_rw<br/>-> exam_student_preview]
+        Note[NOINHERIT · one membership each<br/>poolForRole never falls back to the app pool]
+    end
+
+    subgraph PostgreSQL
+        Backend -->|privileged app pool| DB[(PostgreSQL 15+)]
+        DB -->|app schema| AppDB[System Tables<br/>users · exams · categories · questions<br/>submissions · practice · password_events · export_state]
+        DB -->|public schema| MainDB[Legacy global curriculum<br/>fallback when curriculum_schema = 'public']
+        DB --> ExamCur[curriculum_exam_id<br/>per-exam reference DB]
+        DB --> ExamCat[exam_cat_id<br/>per-exam-category reference DB]
+        DB --> PracticeDB[practice_cat_id<br/>per-practice-category reference DB]
+        DB -.->|cloned lazily, LIKE INCLUDING ALL<br/>+ INSERT SELECT| ExamSandbox[DML sandboxes<br/>sandbox_exam_id · sandbox_exam_cat_id]
+        DB -.->|optional decoy, display only| Decoy[_preview schemas<br/>same structure, different data]
     end
 
     subgraph Evaluation Logic
         Backend --> Logic[Validation Engine]
-        Queue -->|serialised DML| Logic
-        Logic -->|BEGIN; SAVEPOINT student_eval;<br/>… ROLLBACK TO SAVEPOINT; COMMIT| ExamDB
-        Logic -->|SELECT under exam_student_readonly| MainDB
+        Queue -->|serialised exam DML| Logic
+        Logic -->|smart-quote normalise · resolve target_table| Prep[Statement prep]
+        Logic -->|SET LOCAL ROLE · search_path schema, public, pg_temp last| ExamSandbox
+        Logic -->|apply seed_sql or auto_seed inside savepoint| ExamSandbox
+        Logic -->|BEGIN; SAVEPOINT student_eval;<br/>… ROLLBACK TO SAVEPOINT; COMMIT| ExamSandbox
+        Logic -->|SELECT under exam_student_readonly| ExamCur
+        Logic -->|SELECT under exam_student_readonly| ExamCat
         Logic -->|practice SELECT + DML<br/>savepoint-rollback| PracticeDB
-        Logic -->|cached expected_result comparison| AppDB
+        Logic -.->|dual_schema preview only<br/>preview-only roles| Decoy
+        Logic -->|cached expected_result comparison<br/>case-folded column names| AppDB
+    end
+
+    subgraph Out-of-band jobs
+        ExportCtrl --> Exporter[SubmissionExportService<br/>interval loop · gzip CSV over SMTP]
+        Exporter --> AppDB
+        QuizCtrl --> SSE[SSE Hub<br/>exam-status frames · 20s keep-alive]
     end

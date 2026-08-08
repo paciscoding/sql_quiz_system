@@ -5,12 +5,15 @@ erDiagram
     APP_SYSTEM_USERS ||--o{ APP_QUESTIONS                  : "authors"
     APP_SYSTEM_USERS ||--o{ APP_SUBMISSIONS                : "submits"
     APP_SYSTEM_USERS ||--o{ APP_SCHEMA_IMPORT_AUDIT        : "imports"
-    APP_SYSTEM_USERS ||--o{ APP_PASSWORD_EVENTS           : "password_history"
+    APP_SYSTEM_USERS ||--o{ APP_PASSWORD_EVENTS            : "password_history"
+    APP_SYSTEM_USERS ||--o{ APP_EXAM_CATEGORIES            : "created_by"
     APP_EXAMINATIONS ||--o{ APP_QUESTIONS                  : "contains"
+    APP_EXAMINATIONS ||--o{ APP_EXAM_CATEGORIES            : "groups"
     APP_EXAMINATIONS ||--o{ APP_EXAM_STUDENTS              : "has"
     APP_EXAMINATIONS ||--o{ APP_SUBMISSIONS                : "scopes"
     APP_EXAMINATIONS ||--o| APP_EXAM_SANDBOXES             : "owns"
     APP_EXAMINATIONS ||--o{ APP_EXAMINATION_INTRO_IMAGES   : "illustrates"
+    APP_EXAM_CATEGORIES ||--o{ APP_QUESTIONS               : "category_id (SET NULL)"
     APP_QUESTIONS    ||--o{ APP_SUBMISSIONS                : "answered_by"
     APP_SYSTEM_USERS ||--o{ APP_PRACTICE_QUESTIONS         : "created_by"
     APP_SYSTEM_USERS ||--o{ APP_PRACTICE_ATTEMPTS          : "student_id"
@@ -23,18 +26,21 @@ erDiagram
         int id PK
         string username UK
         string password_hash
-        string role
+        string role "ADMIN|LECTURER|STUDENT"
         int created_by FK
         timestamp created_at
-        string student_number UK
-        string student_id_ext UK
+        string student_number "non-unique index (students may share)"
+        string student_id_ext UK "partial unique, NULLs unconstrained"
         string sec_lec
         string sec_lab
         string first_name
         string last_name
-        string email
-        int token_version
+        string email UK "partial unique, NULLs unconstrained"
+        int token_version "bumped on password change; evicts JWTs"
         timestamp last_forgot_reset_at
+        string reset_otp_hash "SHA-256 of the emailed OTP"
+        timestamp reset_otp_expires_at
+        int reset_otp_attempts
     }
 
     APP_EXAMINATIONS {
@@ -47,16 +53,30 @@ erDiagram
         timestamp archived_at
         timestamp scheduled_start_at
         timestamp scheduled_end_at
-        boolean block_practice_during_exam
+        boolean block_practice_during_exam "forced TRUE on activate"
         text introduction
-        string curriculum_schema
+        string curriculum_schema "default 'public'"
+        string preview_curriculum_schema "decoy schema, '' when none"
+    }
+
+    APP_EXAM_CATEGORIES {
+        int id PK
+        int exam_id FK "ON DELETE CASCADE"
+        string name "UNIQUE (exam_id, name), not global"
+        string schema_name "exam_cat_<id>, or the exam's own schema when adopted; NOT unique"
+        string preview_schema_name "exam_cat_<id>_preview, '' when none"
+        text introduction
+        int created_by FK "nullable"
+        timestamp created_at
+        timestamp updated_at
     }
 
     APP_QUESTIONS {
-        int id PK
+        int id PK "identity default added by migrateQuestionsIdentity"
         int exam_id FK
+        int category_id FK "ON DELETE SET NULL"
         int created_by FK
-        string question_type
+        string question_type "QUERY|DML"
         string target_table
         string correct_sql
         double points
@@ -64,11 +84,16 @@ erDiagram
         boolean strict_ordering
         boolean strict_attributes
         boolean strict_column_order
+        boolean dual_schema "preview on decoy, grade on real"
         jsonb expected_result
         jsonb expected_columns
-        string expected_result_status
+        string expected_result_status "pending|captured|failed"
         timestamp expected_result_captured_at
         text capture_error
+        int expected_rows_affected "diagnostics only, never graded"
+        jsonb auto_seed "derived AutoSeedPlan; lecturer-only in responses"
+        string dml_kind "INSERT|UPDATE|DELETE, NULL for QUERY"
+        text seed_sql "lecturer INSERT-only seed; lecturer-only in responses"
         timestamp created_at
         timestamp updated_at
     }
@@ -102,7 +127,8 @@ erDiagram
     APP_PRACTICE_CATEGORIES {
         int id PK
         string name UK
-        string schema_name UK
+        string schema_name UK "practice_cat_<id>"
+        string preview_schema_name "practice_cat_<id>_preview, '' when none"
         int created_by FK
         timestamp created_at
         timestamp updated_at
@@ -112,20 +138,26 @@ erDiagram
     APP_PRACTICE_QUESTIONS {
         int id PK
         int created_by FK
-        int category_id FK
-        string category "legacy, deprecated"
+        int category_id FK "NOT NULL"
+        string category "legacy free text, write-dead"
+        text title "'' means fall back to an ordinal"
         text target_table
         text correct_sql
-        text question_type
+        text question_type "QUERY|DML"
         text requirement
         numeric points
         boolean strict_ordering
         boolean strict_attrs
         boolean strict_column_order
+        boolean dual_schema
         jsonb expected_result
         jsonb expected_columns
-        text expected_result_status
+        text expected_result_status "pending|captured|failed"
         text capture_error
+        int expected_rows_affected
+        jsonb auto_seed
+        string dml_kind "INSERT|UPDATE|DELETE, NULL for QUERY"
+        text seed_sql
         timestamp expected_result_captured_at
         timestamp created_at
         timestamp updated_at
@@ -134,18 +166,11 @@ erDiagram
     APP_PRACTICE_ATTEMPTS {
         int id PK
         int student_id FK
-        int practice_question_id FK
+        int practice_question_id FK "ON DELETE CASCADE"
         text sql_text
         boolean is_correct
         jsonb validation_details
         timestamp submitted_at
-    }
-
-    APP_PRACTICE_SANDBOX_STATE {
-        int id PK "singleton, id = 1"
-        string schema_name
-        timestamp created_at
-        timestamp last_reset_at
     }
 
     APP_SCHEMA_IMPORT_AUDIT {
@@ -160,8 +185,8 @@ erDiagram
         int id PK
         int examination_id FK
         int sort_order
-        string mime_type
-        int byte_size
+        string mime_type "image/png|image/jpeg"
+        int byte_size "1..5242880"
         bytea image_bytes
         timestamp created_at
         timestamp updated_at
@@ -171,8 +196,8 @@ erDiagram
         int id PK
         int category_id FK
         int sort_order
-        string mime_type
-        int byte_size
+        string mime_type "image/png|image/jpeg"
+        int byte_size "1..5242880"
         bytea image_bytes
         timestamp created_at
         timestamp updated_at
@@ -183,8 +208,15 @@ erDiagram
         int user_id FK
         int changed_by FK
         string source "create|self_change|admin_reset|forgot_reset"
-        bytea new_password_enc
+        bytea new_password_enc "AES-256-GCM, key in PASSWORD_LOG_KEY"
         bytea nonce
         boolean notified_admin
         timestamp created_at
+    }
+
+    APP_EXPORT_STATE {
+        int id PK "singleton, CHECK (id = 1)"
+        boolean enabled
+        timestamp last_export_at "watermark for the next export window"
+        timestamp updated_at
     }

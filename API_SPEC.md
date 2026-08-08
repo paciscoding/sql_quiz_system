@@ -126,6 +126,8 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 - **401:** `{"error": "invalid username or password"}`, or `{"error": "too many login attempts. please try again in 10 minutes"}`.
 - **Notable:** In-memory sliding-window rate limit — **5 attempts / 10 min per username**, cleared on success; not persisted across restarts.
 
+> **Both forgot-password routes are feature-gated and default to OFF.** The routes stay registered, but a middleware gate lets them through only when `PASSWORD_RESET_EMAIL_ENABLED` is truthy. Otherwise it aborts with a constant **404** pointing the user at the administrator — before any lookup, email, or timing-observable work. Flipping the env var is the only thing needed to bring the flow back. The admin reset path (`POST /users/:id/reset-password`) needs no email and is **not** gated.
+
 ### Forgot Password (step 1 — request code)
 - `POST /forgot-password`
 - **Payload:** `{"username": "..."}`
@@ -315,16 +317,24 @@ Read-only "category header" view — what the flat question array in **Get Exam 
 
 ### Upsert Question
 - `POST /lecturer/question`
-- **Payload:** `models.Question` — `{"id", "exam_id", "type": "QUERY"|"DML", "target_table", "correct_sql", "points", "strict_mode": {"ordering": bool, "attributes": bool, "column_order": bool}}`. `created_by` is forced from the JWT.
+- **Payload:** `models.Question` — `{"id", "exam_id", "category_id?", "type": "QUERY"|"DML", "dml_kind?", "target_table", "correct_sql", "seed_sql?", "points", "dual_schema", "strict_mode": {"ordering": bool, "attributes": bool, "column_order": bool}}`. `created_by` is forced from the JWT.
   - `strict_mode.ordering` — rows must match the teacher's order; off ⇒ set-equality.
   - `strict_mode.attributes` — output column names must match `expected_columns`.
-  - `strict_mode.column_order` — output columns must match `expected_columns` index-by-index; independent gate, default `false`.
-- **Behaviour:** saves the row, then runs the teacher SQL against the exam's curriculum clone inside a transaction, captures the result, rolls back, writes the cache. **Capture failure does not roll back the upsert.**
-- **200:** `{"message": "Question saved successfully", "id", "expected_result_status", "expected_result_captured_at", "capture_error"}` (last four added on read-back success). `expected_result_status` is `captured` | `failed` | `pending`.
+  - `strict_mode.column_order` — output columns must match `expected_columns` index-by-index; independent gate, default `false`. Compared case-insensitively — order is graded, casing is not.
+  - `dual_schema` (default `false`) — student **preview** runs against the decoy schema while **grading** stays on the real schema. Requires a decoy to have been imported for the resolved category/curriculum.
+  - `dml_kind` — `INSERT` | `UPDATE` | `DELETE`; must be empty for QUERY. Presentation/validation only; grading branches on `type`. `correct_sql` is the authority: **400** when the declared kind disagrees with its leading keyword, and **400** when it is omitted while that keyword *is* derivable. A CTE-led statement (`WITH … DELETE …`) yields no derivable keyword, so it may be saved with an empty `dml_kind` — unverifiable is not the same as wrong.
+  - `seed_sql` — optional **INSERT-only** block applied inside the rolled-back savepoint before the model answer at capture, and before the student's answer at grading and preview. **400** for a non-INSERT leading keyword or unbalanced quotes, **400** when supplied for a QUERY question, and **400** when supplied for `dml_kind = "INSERT"` (a 0-row INSERT is an `INSERT … SELECT` over an empty source, which seeding cannot fix).
+  - `auto_seed` is **never accepted from a client** — it is derived by the backend and stored, and is only ever emitted on lecturer read paths.
+  - **Binding note:** `dml_kind` and `seed_sql` are `json:"-"` on `models.Question`, so the handler binds the body twice and recovers exactly those two fields by name. That is why `auto_seed`, which has no such second bind, remains un-injectable.
+- **Behaviour:** saves the row, then runs the teacher SQL against the exam's curriculum clone inside a transaction, captures the result, rolls back, writes the cache. **Capture failure does not roll back the upsert.** For DML, a model answer that affects **0 rows** is refused (`expected_result_status = "failed"`): with `seed_sql` present the error says the seed inserted but the answer still matched nothing; without it the backend first tries to derive a one-row seed from the answer's `WHERE` equality terms, and reports the refusal reason when it cannot. A 0-row `INSERT` is never rescued.
+- **200:** `{"message": "Question saved successfully", "id", "expected_result_status", "expected_result_captured_at", "capture_error", "table_warning", "dual_schema_warning", "mixed_dual_warning"}` (everything after `id` added on read-back success). `expected_result_status` is `captured` | `failed` | `pending`. The three warnings are advisory strings — empty when they do not apply, and **never** blocking:
+  - `table_warning` — the DML `correct_sql` appears to write a different table than `target_table`.
+  - `dual_schema_warning` — `dual_schema` is on but no decoy has been imported for the resolved category/exam, so previews fall back to the grading schema.
+  - `mixed_dual_warning` — the exam holds both dual and non-dual questions, so a student can open a non-dual question's preview and read the grading schema, bypassing the decoy.
 - **409:** `{"error": "exam is active; ..."}` when the exam is active.
 
 ### List Questions for an Exam
-- `GET /lecturer/exams/:id/questions` → **200:** array of full question objects.
+- `GET /lecturer/exams/:id/questions` → **200:** array of full question objects, serialised as `models.LecturerQuestionView` — the **only** shape that carries `auto_seed` and `seed_sql`. Both fields are `json:"-"` on the question model itself, so no student-facing response can leak them by omission and no request body can inject them. Also carries `expected_rows_affected` (diagnostics only; never read during grading).
 
 ### Delete Question
 - `DELETE /lecturer/questions/:id` → **200:** `{"message": "Question deleted successfully"}`.
@@ -456,7 +466,7 @@ Student practice endpoints return **423 Locked** (`{"error": "practice_unavailab
 
 ### Practice (Lecturer)
 
-- `POST /lecturer/practice/question` — **Payload:** `models.PracticeQuestion` with **top-level** strict flags (`strict_ordering`, `strict_attrs`, `strict_column_order`, all default `false`) and a required `category_id > 0`; `id=0` creates. `created_by` from JWT. **200:** `{"message": "Practice question saved", "id", "expected_result_status", "expected_result_captured_at", "capture_error"}`. **404:** category not found.
+- `POST /lecturer/practice/question` — **Payload:** `models.PracticeQuestion` with **top-level** strict flags (`strict_ordering`, `strict_attrs`, `strict_column_order`, all default `false`), `dual_schema`, optional `title`, optional `dml_kind` / `seed_sql`, and a required `category_id > 0`; `id=0` creates. `created_by` from JWT. `dml_kind` / `seed_sql` / `auto_seed` follow **exactly** the rules documented under *Upsert Question* above, including the same 400s and the same lecturer-only serialisation (`models.LecturerPracticeQuestionView`). **200:** `{"message": "Practice question saved", "id", "expected_result_status", "expected_result_captured_at", "capture_error"}`. **404:** category not found.
 - `GET /lecturer/practice/questions` → **200:** full array (sensitive fields intact).
 - `DELETE /lecturer/practice/question/:id` → **200:** `{"message": "Practice question deleted"}`.
 - `POST /lecturer/practice/preview` — **Payload:** `{"type", "target_table", "correct_sql"}` (no `exam_id`). **200 (ok):** `{"status": "ok", "rows", "columns"}`; **200 (engine error):** `{"status": "error", "error"}`.

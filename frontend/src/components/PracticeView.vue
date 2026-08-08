@@ -223,7 +223,7 @@ async function copyToClipboard(text: string) {
   try {
     if (navigator?.clipboard?.writeText) {
       await navigator.clipboard.writeText(text)
-      notify('Password copied to clipboard.', 'success')
+      notify('Copied.', 'success')
     } else {
       notify('Clipboard not available in this browser.', 'error')
     }
