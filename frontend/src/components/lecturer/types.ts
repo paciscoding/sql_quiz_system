@@ -60,3 +60,38 @@ export interface AutoSeedPlan {
   table: string
   columns: AutoSeedColumn[]
 }
+
+// ExamQuestion mirrors the backend's models.Question JSON shape (see
+// backend/internal/models/submission.go), i.e. the objects returned by
+// GET /api/v1/lecturer/exams/:id/questions and consumed by
+// ExamQuestionsPanel.vue.
+export interface ExamQuestion {
+  id: number
+  exam_id?: string
+  category_id?: string | null
+  category_name?: string
+  target_table: string
+  correct_sql?: string
+  type: string
+  points: number
+  requirement: string
+  strict_mode?: { ordering: boolean; attributes: boolean; column_order: boolean }
+  dual_schema?: boolean
+  expected_result?: any
+  expected_columns?: any
+  expected_result_status?: string
+  expected_result_captured_at?: string | null
+  capture_error?: string
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+  auto_seed?: AutoSeedPlan | null
+  // DML statement kind the lecturer selected: 'INSERT' | 'UPDATE' | 'DELETE'.
+  // Absent for QUERY questions and for DML questions authored before the
+  // column existed. Presentation and validation only.
+  dml_kind?: string
+  // Lecturer-authored INSERT-only seed block, run inside a rolled-back
+  // transaction so an UPDATE/DELETE question has a row to act on. Never
+  // present in a student-facing response.
+  seed_sql?: string
+}

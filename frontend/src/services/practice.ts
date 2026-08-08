@@ -96,6 +96,14 @@ export interface PracticeQuestion {
   updated_at: string
   dual_schema?: boolean
   auto_seed?: AutoSeedPlan | null
+  // DML statement kind the lecturer selected: 'INSERT' | 'UPDATE' | 'DELETE'.
+  // Absent for QUERY questions and for DML questions authored before the
+  // column existed. Presentation and validation only.
+  dml_kind?: string
+  // Lecturer-authored INSERT-only seed block, run inside a rolled-back
+  // transaction so an UPDATE/DELETE question has a row to act on. Never
+  // present in a student-facing response.
+  seed_sql?: string
 }
 
 export interface PracticeAttempt {
