@@ -20,6 +20,18 @@ import (
 // validateSeedFields enforces ARCH-044 and ARCH-050 on every question write
 // path. Returns a lecturer-facing error suitable for an HTTP 400 body; the
 // caller never turns any of these into a 500.
+// articleFor returns the indefinite article for a DML kind name, so the
+// mismatch message reads "an UPDATE statement" rather than "a UPDATE
+// statement". INSERT and UPDATE begin with a vowel sound; DELETE does not.
+func articleFor(kind string) string {
+	switch kind {
+	case "INSERT", "UPDATE":
+		return "an"
+	default:
+		return "a"
+	}
+}
+
 func validateSeedFields(qType, dmlKind, seedSQL, correctSQL string) error {
 	seedSQL = strings.TrimSpace(seedSQL)
 
@@ -42,7 +54,7 @@ func validateSeedFields(qType, dmlKind, seedSQL, correctSQL string) error {
 	switch dmlKind {
 	case "INSERT", "UPDATE", "DELETE":
 		if actual != "" && actual != dmlKind {
-			return fmt.Errorf("you selected %s, but the correct SQL is a %s statement. Pick the kind that matches your SQL", dmlKind, actual)
+			return fmt.Errorf("you selected %s, but the correct SQL is %s %s statement. Pick the kind that matches your SQL", dmlKind, articleFor(actual), actual)
 		}
 	case "":
 		// ARCH-057 rule 2: demand a kind only when one is derivable. Requiring
