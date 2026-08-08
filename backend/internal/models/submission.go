@@ -65,7 +65,11 @@ type Question struct {
 	// whose model answer already affected rows on first run. Derived entirely
 	// by the backend at capture time; it must never be accepted from a client
 	// request body.
-	AutoSeed json.RawMessage `json:"auto_seed,omitempty"`
+	// ARCH-053: `json:"-"` in BOTH directions. It can never be marshalled into
+	// a response (no student endpoint can leak it by omission) and can never be
+	// bound from a request body (a client cannot supply it). Lecturer authoring
+	// reads opt back in via models.LecturerQuestionView.
+	AutoSeed json.RawMessage `json:"-"`
 	// DMLKind is the DML statement kind the lecturer selected: "INSERT",
 	// "UPDATE", or "DELETE". Empty for QUERY questions and for DML questions
 	// written before the column existed (ARCH-043). Presentation and
@@ -77,7 +81,9 @@ type Question struct {
 	// non-empty it takes precedence over AutoSeed, which is then NULL.
 	// MUST be scrubbed from every student-facing response (ARCH-052) — it
 	// carries the exact values the correct answer must match.
-	SeedSQL      string    `json:"seed_sql,omitempty"`
+	// ARCH-053: `json:"-"`, same reasoning as AutoSeed above — and stronger,
+	// since seed_sql carries the exact values the correct answer must match.
+	SeedSQL      string    `json:"-"`
 	CaptureError string    `json:"capture_error,omitempty"`
 	CreatedBy    UserID    `json:"created_by"`
 	CreatedAt    time.Time `json:"created_at"`
