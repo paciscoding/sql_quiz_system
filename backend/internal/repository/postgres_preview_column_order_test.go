@@ -155,7 +155,7 @@ func TestPreviewColumnOrder_PracticeQueryAndDML(t *testing.T) {
 		want := []string{"mid", "zeta", "alpha"}
 		for i := 0; i < previewOrderReps; i++ {
 			_, cols, err := repo.PreviewPracticeCorrectSQL(ctx, catID, "QUERY", "",
-				"SELECT mid, zeta, alpha FROM pcol_target", false)
+				"SELECT mid, zeta, alpha FROM pcol_target", false, "")
 			if err != nil {
 				t.Fatalf("PreviewPracticeCorrectSQL: %v", err)
 			}
@@ -169,7 +169,7 @@ func TestPreviewColumnOrder_PracticeQueryAndDML(t *testing.T) {
 		want := []string{"zeta", "alpha", "mid"}
 		for i := 0; i < previewOrderReps; i++ {
 			rows, cols, err := repo.PreviewPracticeCorrectSQL(ctx, catID, "DML", "pcol_target",
-				"UPDATE pcol_target SET alpha = 42", false)
+				"UPDATE pcol_target SET alpha = 42", false, "")
 			if err != nil {
 				t.Fatalf("PreviewPracticeCorrectSQL (DML): %v", err)
 			}

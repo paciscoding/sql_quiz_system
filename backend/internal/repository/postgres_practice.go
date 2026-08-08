@@ -367,6 +367,15 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 	// Repair typographic quotes (e.g. ‘…’ → '…') before capture and persistence,
 	// so pasted correct SQL doesn't fail with "column ... does not exist".
 	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
+	// ARCH-046: normalize + validate the lecturer's seed before capture runs,
+	// so an invalid seed is rejected with the ARCH-046 refusal instead of
+	// being persisted and only failing later at grade time.
+	q.SeedSQL = normalizeSeedSQL(q.SeedSQL)
+	if q.SeedSQL != "" {
+		if _, err := validateSeedSQL(q.SeedSQL); err != nil {
+			return err
+		}
+	}
 	// Resolve the category's owned schema; the correct-result capture and all
 	// student submissions for this question run against it (not public).
 	schema, err := r.GetPracticeCategorySchema(ctx, int(q.CategoryID))
@@ -406,14 +415,14 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 			created_by, category_id, target_table, correct_sql, question_type, requirement,
 			points, strict_ordering, strict_attrs, strict_column_order,
 			expected_result, expected_columns, expected_result_status,
-			capture_error, title, expected_rows_affected, dual_schema, auto_seed, expected_result_captured_at, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW(), NOW())
+			capture_error, title, expected_rows_affected, dual_schema, auto_seed, dml_kind, seed_sql, expected_result_captured_at, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NULLIF($19, ''), $20, NOW(), NOW(), NOW())
 		RETURNING id, created_at, updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CreatedBy, q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, autoSeed,
+		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, autoSeed, q.DMLKind, q.SeedSQL,
 	).Scan(&q.ID, &q.CreatedAt, &q.UpdatedAt)
 }
 
@@ -445,71 +454,101 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 				return fmt.Errorf("target table is required for DML questions")
 			}
 			var tag pgconn.CommandTag
-			tag, err = tx.Exec(ctx, q.CorrectSQL)
-			if err == nil {
-				// D3 (ARCH-008): a model answer that affects 0 rows is unGRADEABLE —
-				// every student statement, correct or not, produces the same
-				// untouched end state. Hard block, no override — but ARCH-037/038
-				// lets us rescue it by deriving and seeding the missing row the
-				// WHERE clause pins, when the model answer's grammar is narrow
-				// enough for deriveAutoSeed to understand.
-				if tag.RowsAffected() == 0 {
-					if isAutoSeedIneligibleInsert(q.CorrectSQL) {
-						// A 0-row INSERT is an INSERT ... SELECT over an empty
-						// source, which no amount of row-seeding can fix — skip
-						// derivation entirely and keep today's message.
-						*status = "failed"
-						*captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
-						return errCaptureFailed
-					}
-
-					// Nested savepoint (ARCH-037): a failed seed must not poison
-					// the capture transaction beyond this point.
-					if _, spErr := tx.Exec(ctx, "SAVEPOINT autoseed"); spErr != nil {
-						return spErr
-					}
-
-					cols, colsErr := fetchTableColumns(ctx, tx, schema, q.TargetTable)
-					if colsErr != nil {
-						return colsErr
-					}
-
-					plan, deriveErr := deriveAutoSeed(q.CorrectSQL, q.TargetTable, cols)
-					if deriveErr != nil {
-						if !errors.Is(deriveErr, ErrAutoSeedUnsupported) {
-							return deriveErr
-						}
-						*status = "failed"
-						*captureErr = "Model answer affected 0 rows. Auto-seed could not build a matching row: " + deriveErr.Error() + ". Use = comparisons on the columns you want seeded, or fix the seed data in this category's database."
-						return errCaptureFailed
-					}
-
-					if applyErr := applyAutoSeed(ctx, tx, plan); applyErr != nil {
-						// ARCH-021 ordering: applyErr has already aborted the
-						// transaction, so roll back to the savepoint FIRST — any
-						// other statement issued before that would itself fail.
-						if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT autoseed"); rbErr != nil {
-							return rbErr
-						}
-						*status = "failed"
-						*captureErr = "Model answer affected 0 rows. Auto-seed built a row but inserting it failed: " + applyErr.Error() + "."
-						return errCaptureFailed
-					}
-
-					tag, err = tx.Exec(ctx, q.CorrectSQL)
-					if err != nil {
-						*status = "failed"
-						*captureErr = err.Error()
-						return errCaptureFailed
-					}
-					if tag.RowsAffected() == 0 {
-						*status = "failed"
-						*captureErr = "Model answer affected 0 rows, and still affected 0 rows after auto-seeding a matching row. Check the WHERE clause of the correct SQL."
-						return errCaptureFailed
-					}
-
-					*autoSeed, _ = marshalAutoSeed(plan)
+			if q.SeedSQL != "" {
+				// ARCH-045: the lecturer's seed runs BEFORE the model answer and
+				// whenever it is present — not only on the 0-row branch — so
+				// capture, grading and preview all observe one state. Nested
+				// savepoint (ARCH-047) so a failed seed cannot poison the outer
+				// capture transaction before the refusal is recorded.
+				if _, spErr := tx.Exec(ctx, "SAVEPOINT lecturer_seed"); spErr != nil {
+					return spErr
 				}
+				if seedErr := applyQuestionSeed(ctx, tx, q.SeedSQL, nil); seedErr != nil {
+					// ARCH-021 ordering: the tx is aborted, so ROLLBACK TO
+					// SAVEPOINT must run before any other statement.
+					if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT lecturer_seed"); rbErr != nil {
+						return rbErr
+					}
+					*status = "failed"
+					*captureErr = "Seed INSERT failed: " + seedErr.Error() + "."
+					return errCaptureFailed
+				}
+				tag, err = tx.Exec(ctx, q.CorrectSQL)
+				if err == nil && tag.RowsAffected() == 0 {
+					*status = "failed"
+					*captureErr = "Your seed rows were inserted, but the correct SQL still affected 0 rows. Check the WHERE clause of the correct SQL against the values you seeded."
+					return errCaptureFailed
+				}
+				// auto_seed stays nil: ARCH-045 forbids both mechanisms at once.
+			} else {
+				tag, err = tx.Exec(ctx, q.CorrectSQL)
+				if err == nil {
+					// D3 (ARCH-008): a model answer that affects 0 rows is unGRADEABLE —
+					// every student statement, correct or not, produces the same
+					// untouched end state. Hard block, no override — but ARCH-037/038
+					// lets us rescue it by deriving and seeding the missing row the
+					// WHERE clause pins, when the model answer's grammar is narrow
+					// enough for deriveAutoSeed to understand.
+					if tag.RowsAffected() == 0 {
+						if isAutoSeedIneligibleInsert(q.CorrectSQL) {
+							// A 0-row INSERT is an INSERT ... SELECT over an empty
+							// source, which no amount of row-seeding can fix — skip
+							// derivation entirely and keep today's message.
+							*status = "failed"
+							*captureErr = "The model answer affected 0 rows, so this question cannot tell a correct answer apart from a statement that does nothing. Fix the WHERE clause of the correct SQL, or fix the seed data in this category's database."
+							return errCaptureFailed
+						}
+
+						// Nested savepoint (ARCH-037): a failed seed must not poison
+						// the capture transaction beyond this point.
+						if _, spErr := tx.Exec(ctx, "SAVEPOINT autoseed"); spErr != nil {
+							return spErr
+						}
+
+						cols, colsErr := fetchTableColumns(ctx, tx, schema, q.TargetTable)
+						if colsErr != nil {
+							return colsErr
+						}
+
+						plan, deriveErr := deriveAutoSeed(q.CorrectSQL, q.TargetTable, cols)
+						if deriveErr != nil {
+							if !errors.Is(deriveErr, ErrAutoSeedUnsupported) {
+								return deriveErr
+							}
+							*status = "failed"
+							*captureErr = "Model answer affected 0 rows. Auto-seed could not build a matching row: " + deriveErr.Error() + ". Use = comparisons on the columns you want seeded, or fix the seed data in this category's database."
+							return errCaptureFailed
+						}
+
+						if applyErr := applyAutoSeed(ctx, tx, plan); applyErr != nil {
+							// ARCH-021 ordering: applyErr has already aborted the
+							// transaction, so roll back to the savepoint FIRST — any
+							// other statement issued before that would itself fail.
+							if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT autoseed"); rbErr != nil {
+								return rbErr
+							}
+							*status = "failed"
+							*captureErr = "Model answer affected 0 rows. Auto-seed built a row but inserting it failed: " + applyErr.Error() + "."
+							return errCaptureFailed
+						}
+
+						tag, err = tx.Exec(ctx, q.CorrectSQL)
+						if err != nil {
+							*status = "failed"
+							*captureErr = err.Error()
+							return errCaptureFailed
+						}
+						if tag.RowsAffected() == 0 {
+							*status = "failed"
+							*captureErr = "Model answer affected 0 rows, and still affected 0 rows after auto-seeding a matching row. Check the WHERE clause of the correct SQL."
+							return errCaptureFailed
+						}
+
+						*autoSeed, _ = marshalAutoSeed(plan)
+					}
+				}
+			}
+			if err == nil {
 				rowsAffected := int(tag.RowsAffected())
 				*expectedRowsAffected = &rowsAffected
 				safeTable := pgx.Identifier{q.TargetTable}.Sanitize()
@@ -550,7 +589,11 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 // FieldDescriptions order, i.e. the SELECT projection order (for DML, the
 // post-image snapshot's column order). Row maps are unordered, so callers must
 // use these columns instead of ranging a row to build the preview header.
-func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, categoryID int, qType, targetTable, sqlText string, useDecoy bool) ([]map[string]interface{}, []string, error) {
+//
+// When seedSQL is non-empty it is applied via applyQuestionSeed (ARCH-047)
+// inside the same rolled-back transaction, before sqlText runs, so the
+// lecturer previews the state their seed rows produce.
+func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, categoryID int, qType, targetTable, sqlText string, useDecoy bool, seedSQL string) ([]map[string]interface{}, []string, error) {
 	if sqlText == "" {
 		return nil, nil, fmt.Errorf("sql text is empty")
 	}
@@ -596,6 +639,11 @@ func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, cate
 		if qType == "QUERY" {
 			results, orderedCols, err = r.queryWithTxCols(ctx, tx, previewSchema, sqlText)
 		} else {
+			if seedSQL != "" {
+				if seedErr := applyQuestionSeed(ctx, tx, seedSQL, nil); seedErr != nil {
+					return seedErr
+				}
+			}
 			if _, err = tx.Exec(ctx, sqlText); err != nil {
 				return err
 			}
@@ -620,6 +668,14 @@ func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, cate
 func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error {
 	// Repair typographic quotes before capture and persistence (see Create).
 	q.CorrectSQL = normalizeSmartQuotes(q.CorrectSQL)
+	// ARCH-046: normalize + validate the lecturer's seed before capture runs
+	// (see CreatePracticeQuestion).
+	q.SeedSQL = normalizeSeedSQL(q.SeedSQL)
+	if q.SeedSQL != "" {
+		if _, err := validateSeedSQL(q.SeedSQL); err != nil {
+			return err
+		}
+	}
 	schema, err := r.GetPracticeCategorySchema(ctx, int(q.CategoryID))
 	if err != nil {
 		return err
@@ -659,14 +715,15 @@ func (r *PostgresRepository) UpdatePracticeQuestion(ctx context.Context, q *mode
 		    expected_result=$10, expected_columns=$11,
 		    expected_result_status=$12, capture_error=$13, title=$14,
 		    expected_rows_affected=$15, dual_schema=$16, auto_seed=$17,
+		    dml_kind=NULLIF($18, ''), seed_sql=$19,
 		    expected_result_captured_at=NOW(), updated_at=NOW()
-		WHERE id=$18
+		WHERE id=$20
 		RETURNING updated_at`
 
 	return r.pool.QueryRow(ctx, query,
 		q.CategoryID, q.TargetTable, q.CorrectSQL, q.Type, q.Requirement,
 		q.Points, q.StrictOrdering, q.StrictAttrs, q.StrictColumnOrder,
-		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, autoSeed, q.ID,
+		expectedResult, expectedCols, status, captureErr, q.Title, expectedRowsAffected, q.DualSchema, autoSeed, q.DMLKind, q.SeedSQL, q.ID,
 	).Scan(&q.UpdatedAt)
 }
 
@@ -677,7 +734,7 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
 		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
-		       pq.expected_rows_affected, pq.auto_seed, pq.created_at, pq.updated_at
+		       pq.expected_rows_affected, pq.auto_seed, COALESCE(pq.dml_kind, ''), COALESCE(pq.seed_sql, ''), pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		ORDER BY pq.id ASC`
@@ -696,7 +753,7 @@ func (r *PostgresRepository) ListPracticeQuestions(ctx context.Context) ([]model
 			&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 			&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
 			&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
-			&q.ExpectedRowsAffected, &q.AutoSeed, &q.CreatedAt, &q.UpdatedAt)
+			&q.ExpectedRowsAffected, &q.AutoSeed, &q.DMLKind, &q.SeedSQL, &q.CreatedAt, &q.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -712,7 +769,7 @@ func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*
 		       pq.target_table, pq.correct_sql, pq.question_type, pq.requirement, pq.points,
 		       pq.strict_ordering, pq.strict_attrs, pq.strict_column_order, pq.expected_result, pq.expected_columns,
 		       pq.expected_result_status, pq.capture_error, COALESCE(pq.title, ''), pq.expected_result_captured_at,
-		       pq.expected_rows_affected, pq.auto_seed, pq.created_at, pq.updated_at
+		       pq.expected_rows_affected, pq.auto_seed, COALESCE(pq.dml_kind, ''), COALESCE(pq.seed_sql, ''), pq.created_at, pq.updated_at
 		FROM app.practice_questions pq
 		LEFT JOIN app.practice_categories pc ON pc.id = pq.category_id
 		WHERE pq.id=$1`
@@ -723,7 +780,7 @@ func (r *PostgresRepository) GetPracticeQuestion(ctx context.Context, id int) (*
 		&q.TargetTable, &q.CorrectSQL, &q.Type, &q.Requirement, &q.Points,
 		&q.StrictOrdering, &q.StrictAttrs, &q.StrictColumnOrder, &q.ExpectedResult, &q.ExpectedColumns,
 		&q.ExpectedResultStatus, &q.CaptureError, &q.Title, &q.ExpectedResultCapturedAt,
-		&q.ExpectedRowsAffected, &q.AutoSeed, &q.CreatedAt, &q.UpdatedAt)
+		&q.ExpectedRowsAffected, &q.AutoSeed, &q.DMLKind, &q.SeedSQL, &q.CreatedAt, &q.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

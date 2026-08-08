@@ -400,7 +400,7 @@ func (ctrl *PracticeController) LecturerPreview(c *gin.Context) {
 	var err error
 	useDecoy := req.Schema == "preview"
 	if int(req.CategoryID) > 0 {
-		rows, cols, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy)
+		rows, cols, err = ctrl.repo.PreviewPracticeCorrectSQL(c.Request.Context(), int(req.CategoryID), req.Type, req.TargetTable, req.CorrectSQL, useDecoy, "")
 	} else {
 		rows, cols, err = ctrl.repo.PreviewCorrectSQL(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL)
 	}
