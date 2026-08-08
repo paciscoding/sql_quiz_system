@@ -53,6 +53,8 @@ const questions = ref<PracticeQuestion[]>([])
 const categories = ref<PracticeCategory[]>([])
 const form = ref<Partial<PracticeQuestion>>({
   question_type: 'QUERY',
+  dml_kind: '',
+  seed_sql: '',
   points: 1.0,
   strict_ordering: false,
   strict_attrs: false,
@@ -78,6 +80,32 @@ const autoSeedStatement = computed(() => {
   const vals = seed.columns.map(c => `'${c.value}'`).join(', ')
   return `INSERT INTO ${seed.table} (${cols}) VALUES (${vals})`
 })
+
+// The wire format keeps question_type as 'QUERY' | 'DML' (the database CHECK
+// constraint is deliberately unchanged, ARCH-043); the four-way authoring
+// choice is question_type + dml_kind. This computed is the single place the
+// two representations are converted, in both directions.
+const questionKind = computed<string>({
+  get() {
+    if (form.value.question_type === 'QUERY') return 'QUERY'
+    return form.value.dml_kind || 'DML'
+  },
+  set(v: string) {
+    if (v === 'QUERY') {
+      form.value.question_type = 'QUERY'
+      form.value.dml_kind = ''
+      form.value.seed_sql = ''
+      return
+    }
+    form.value.question_type = 'DML'
+    form.value.dml_kind = v
+    // ARCH-044: the seed field only exists for UPDATE and DELETE. Clearing it
+    // here means a hidden field can never be silently persisted.
+    if (v !== 'UPDATE' && v !== 'DELETE') form.value.seed_sql = ''
+  },
+})
+
+const seedApplies = computed(() => form.value.dml_kind === 'UPDATE' || form.value.dml_kind === 'DELETE')
 
 // "Preview as student" (schema: 'preview') results — kept in a separate set of
 // refs from the grading-schema Preview above so the lecturer can see both the
@@ -196,7 +224,10 @@ const editQuestion = async (q: PracticeQuestion) => {
   // auto_seed is display-only and deliberately excluded from form.value (see
   // loadedAutoSeed above) so it can never be re-sent in the save payload.
   const { auto_seed, ...editable } = q
-  form.value = { ...editable }
+  // dml_kind/seed_sql default to '' so a question saved before those columns
+  // existed carries a clean slate rather than undefined, and so an edit
+  // round-trip never inherits the previously-loaded question's seed.
+  form.value = { dml_kind: '', seed_sql: '', ...editable }
   loadedAutoSeed.value = auto_seed ?? null
   loadedFormSnapshot.value = JSON.stringify(form.value)
 }
@@ -207,6 +238,8 @@ const resetForm = () => {
   form.value = {
     category_id: categories.value[0]?.id,
     question_type: 'QUERY',
+    dml_kind: '',
+    seed_sql: '',
     points: 1.0,
     strict_ordering: false,
     strict_attrs: false,
@@ -611,16 +644,19 @@ onMounted(() => {
           </div>
           <div class="field">
             <label>Question Type</label>
-            <select v-model="form.question_type" class="input">
+            <select v-model="questionKind" class="input">
               <option value="QUERY">QUERY</option>
-              <option value="DML">INSERT/UPDATE/DELETE</option>
+              <option value="INSERT">INSERT</option>
+              <option value="UPDATE">UPDATE</option>
+              <option value="DELETE">DELETE</option>
+              <option value="DML" disabled>DML (pick a kind)</option>
             </select>
           </div>
           <div class="field">
             <label>Question No.</label>
             <input v-model="form.title" class="input" placeholder="e.g. Employees hired after 2020" />
           </div>
-          <div class="field" v-if="form.question_type == 'DML'">
+          <div class="field" v-if="form.question_type === 'DML'">
             <label>Target Table (INSERT/UPDATE/DELETE only)</label>
             <input v-model="form.target_table" class="input" placeholder="e.g. employee" />
           </div>
@@ -676,7 +712,17 @@ onMounted(() => {
           <FieldError id="practice-correct-sql-error" :message="practiceForm.touched.correct_sql ? practiceForm.errors.correct_sql : ''" />
         </div>
 
-        <div v-if="loadedAutoSeed" class="field" style="margin-top: var(--space-4);">
+        <div class="field" style="grid-column: span 2; margin-top: var(--space-4);" v-if="seedApplies">
+          <label>Seed rows (sandbox only)</label>
+          <textarea v-model="form.seed_sql" class="input" rows="4"
+            placeholder="INSERT INTO employee (ssn, fname) VALUES ('999999999', 'Test');"></textarea>
+          <small class="muted">
+            These INSERT statements run inside a transaction that is always rolled back.
+            They give your UPDATE/DELETE something to act on. They never modify the imported database.
+          </small>
+        </div>
+
+        <div v-if="!form.seed_sql && loadedAutoSeed" class="field" style="margin-top: var(--space-4);">
           <label>Auto-seeded row</label>
           <code>{{ autoSeedStatement }}</code>
           <p class="muted" style="margin: 0;">
