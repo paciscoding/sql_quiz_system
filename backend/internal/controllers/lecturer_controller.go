@@ -526,7 +526,7 @@ func (ctrl *LecturerController) PreviewCorrectSQL(c *gin.Context) {
 	}
 
 	useDecoy := req.Schema == "preview"
-	rows, cols, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy)
+	rows, cols, err := ctrl.repo.PreviewCorrectSQLInSchema(c.Request.Context(), req.Type, req.TargetTable, req.CorrectSQL, int(req.ExamID), int(req.CategoryID), useDecoy, "")
 	if err != nil {
 		if errors.Is(err, repository.ErrExamCategoryMismatch) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
