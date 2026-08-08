@@ -255,6 +255,28 @@ const resetForm = () => {
   previewAsStudentError.value = ''
   loadedFormSnapshot.value = JSON.stringify(form.value)
 }
+const resetSubmissionForm = () => {
+  form.value = {
+    category_id: form.value.category_id,
+    question_type: 'QUERY',
+    dml_kind: '',
+    seed_sql: '',
+    points: 1.0,
+    strict_ordering: false,
+    strict_attrs: false,
+    strict_column_order: false,
+    dual_schema: false
+  }
+  loadedAutoSeed.value = null
+  previewRows.value = []
+  previewCols.value = []
+  previewError.value = ''
+  previewAsStudentRows.value = []
+  previewAsStudentCols.value = []
+  previewAsStudentError.value = ''
+  loadedFormSnapshot.value = JSON.stringify(form.value)
+}
+
 
 async function newPracticeQuestion() {
   if (!(await confirmDiscardIfDirty())) return
@@ -284,7 +306,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     if (res.mixed_dual_warning) notify(res.mixed_dual_warning, 'error')
     await loadQuestions()
     clearDraft()
-    resetForm()
+    resetSubmissionForm()
   } catch (err) {
     handleApiError(err, { fallback: 'Failed to save question' })
   }
@@ -842,7 +864,7 @@ onMounted(() => {
 
             <!-- Database schema sub-panel -->
             <div class="cat-subpanel">
-              <span class="cat-subpanel-label">Database schema</span>
+              <span class="cat-subpanel-label">Database schema (hidden schema)</span>
               <div v-if="importCategoryId === c.id">
                 <h3>Import database into "{{ c.name }}"</h3>
                 <p class="muted">Upload a <code>.sql</code> file or paste a SQL script, using unqualified names (no <code>public.</code> / <code>app.</code> prefixes).</p>
@@ -871,7 +893,7 @@ onMounted(() => {
                  the grading schema above, different data; used by dual-schema questions
                  so the student's preview never leaks the grading data). -->
             <div class="cat-subpanel">
-              <span class="cat-subpanel-label">Decoy database schema (preview only)</span>
+              <span class="cat-subpanel-label">Decoy database schema (student preview schema)</span>
               <div v-if="importPreviewCategoryId === c.id">
                 <h3>Import decoy database into "{{ c.name }}"</h3>
                 <p class="muted">Upload a <code>.sql</code> file or paste a SQL script with the same tables and columns as the grading database above, but different data. Students previewing a dual-schema question see this data instead of the real grading data.</p>
