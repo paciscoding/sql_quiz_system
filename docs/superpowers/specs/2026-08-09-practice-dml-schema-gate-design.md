@@ -319,6 +319,17 @@ package.
   deployment ever scales out, both need revisiting together.
 - **Damage scope untouched.** The gate closes concurrency hazards only. A
   bypassed savepoint still corrupts the lecturer's real data.
+- **Cross-schema seeds can still deadlock.** The gate keys on the execution
+  schema, but every evaluation runs with `search_path = <schema>, public,
+  pg_temp` (`postgres_evaluation.go:294`), and `validateSeedSQL`
+  (`dml_autoseed.go:852`) only requires each statement to be an `INSERT` — it
+  does not forbid a schema-qualified target, and `exam_student` holds DML on
+  every real schema. Two evaluations on *different* gated schemas whose seeds
+  both write the same `public.*` table therefore still produce `40P01` in
+  exactly the original shape. The gate narrows the hazard to lecturer-authored
+  cross-schema seeds rather than eliminating it. Closing that would mean either
+  restricting `validateSeedSQL` to the question's own schema or keying the gate
+  on the set of tables a seed touches — both larger changes than this spec.
 - **Serialisation is now strict.** DML per execution schema goes from
   concurrent-with-lock-contention to strictly one-at-a-time. Under a full class
   submitting simultaneously this changes latency in a direction that has not

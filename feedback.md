@@ -223,7 +223,7 @@ invalidates, and whether eval-path tests should be required to distinguish
 infrastructure failure from a real negative. The OPEN-1 probe does the latter
 (`t.Fatalf("INCONCLUSIVE…")`), and that pattern is worth generalising.
 
-## OPEN-8 — A password test hardcodes an email and never cleans up
+## OPEN-8 — Tests hardcode email addresses and never clean up
 
 Severity: **low** (test-only, but it fails work that did not cause it)
 
@@ -231,6 +231,11 @@ Severity: **low** (test-only, but it fails work that did not cause it)
 creates a user with the hardcoded address `verify@example.com` and deletes
 nothing afterwards. On the shared `TEST_DATABASE_URL` the row survives the run,
 so the next invocation collides on the unique email and the test fails.
+
+`TestParity_SingleVsBulk` does the same with `parity@example.com`, so this is a
+pattern rather than one careless fixture. Both were hit during the same
+afternoon's work; assume others exist and `grep` for hardcoded `@example.com`
+addresses before trusting a suite run.
 
 Found 2026-08-09 during the ARCH-058 work, where it failed a package run twice
 and had to be reproduced with the branch's changes stashed before it could be
