@@ -321,7 +321,7 @@ package.
   bypassed savepoint still corrupts the lecturer's real data.
 - **Cross-schema seeds can still deadlock.** The gate keys on the execution
   schema, but every evaluation runs with `search_path = <schema>, public,
-  pg_temp` (`postgres_evaluation.go:294`), and `validateSeedSQL`
+  pg_temp` (`postgres_evaluation.go:301`), and `validateSeedSQL`
   (`dml_autoseed.go:852`) only requires each statement to be an `INSERT` — it
   does not forbid a schema-qualified target, and `exam_student` holds DML on
   every real schema. Two evaluations on *different* gated schemas whose seeds
