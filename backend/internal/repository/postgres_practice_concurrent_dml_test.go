@@ -368,18 +368,26 @@ func TestPracticeConcurrentDML_CaseB_ProductionPath(t *testing.T) {
 		}
 	}
 
-	if len(shed) == 0 {
-		t.Fatalf("CASE B NOT REPRODUCED on the production path: both concurrent submissions "+
-			"were graded normally (%+v). If the mechanism subtest also passes clean, the "+
-			"deadlock half of OPEN-1 is unsupported.", out)
+	// Before ARCH-058..061 this assertion was inverted: the deadlock was the
+	// finding, and this test failed on purpose to record it. The gate now lives
+	// inside repo.Evaluate, one level below this call, so the same two
+	// concurrent submissions must both be graded normally.
+	//
+	// If this fires again, the gate is gone or mis-keyed. It is the regression
+	// test for the entire change — do not soften it into a t.Logf.
+	if len(shed) > 0 {
+		t.Fatalf("REGRESSION — ARCH-059: student(s) %v submitted the model answer verbatim "+
+			"and were told %q. The seed deadlocked (SQLSTATE 40P01 — see the mechanism "+
+			"subtest), which means concurrent DML reached one schema and the per-schema "+
+			"gate in Evaluate did not serialise them.", shed, out[shed[0]].res.Feedback)
 	}
 
-	t.Errorf("CONFIRMED — feedback.md OPEN-1: student(s) %v submitted the model answer verbatim "+
-		"and were told %q. The seed deadlocked (SQLSTATE 40P01 — see the mechanism subtest); "+
-		"evaluateDML converts that into a graded 'error' with a nil Go error, so a server-side "+
-		"concurrency defect reaches the student as a broken-question message. This t.Errorf IS "+
-		"the finding; replace it with a pass assertion once the practice schema gate lands.",
-		shed, out[shed[0]].res.Feedback)
+	for i, o := range out {
+		if o.res.Status != "success" {
+			t.Fatalf("student %d: status=%q feedback=%q — both concurrent submissions "+
+				"submitted the model answer verbatim and must grade success", i, o.res.Status, o.res.Feedback)
+		}
+	}
 
 	// The reference schema must survive regardless of which actor lost.
 	for _, tc := range []struct {

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
+	"github.com/paciscoding/sql-quiz-system/internal/schemagate"
 )
 
 // ErrExamActive is returned by mutating endpoints that are frozen while any
@@ -147,6 +148,18 @@ type PostgresRepository struct {
 	// NEVER falls back to the privileged `pool` above. See
 	// postgres_student_pool.go for the full rationale and construction.
 	studentPools map[string]*pgxpool.Pool
+
+	// dmlGate serialises DML evaluation per execution schema, in-process
+	// (ARCH-058/059). Practice DML has no SubmissionQueue and
+	// acquireSchemaEvalLock is taken SHARED, so without this two evaluations
+	// whose seeds touch the same tables in opposite order deadlock with
+	// SQLSTATE 40P01 and a student is told their question is broken. See
+	// postgres_practice_concurrent_dml_test.go.
+	//
+	// A value, not a pointer: schemagate.SchemaGate's zero value is usable, so
+	// NewPostgresRepository needs no change and no construction path can
+	// produce a repository with a nil gate.
+	dmlGate schemagate.SchemaGate
 }
 
 func NewPostgresRepository(connString string) (*PostgresRepository, error) {

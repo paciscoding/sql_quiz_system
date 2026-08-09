@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -10,6 +11,51 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
+
+// ErrSchemaBusy reports that a DML evaluation could not start because another
+// evaluation held the same execution schema for longer than
+// schemaGateWaitBudget.
+//
+// It deliberately does NOT wrap context.DeadlineExceeded. quiz_controller.go
+// maps DeadlineExceeded to HTTP 504 ("submission timed out"), which would be a
+// lie here: nothing ran, nothing timed out, and the request is retriable. Both
+// controllers map this to 503 instead.
+var ErrSchemaBusy = errors.New("schema is busy: another DML evaluation is in progress")
+
+// schemaGateWaitBudget bounds how long a DML evaluation waits for its execution
+// schema before being shed with ErrSchemaBusy.
+//
+// Deliberately shorter than evaluateDML's own 30 s ceiling (see :191): a
+// genuinely wedged evaluation sheds waiters in half that time instead of
+// hanging them, while a full class at a realistic ~300 ms per submission drains
+// well inside it.
+//
+// A var rather than a const solely so tests can shorten it — asserting the
+// shed path is otherwise a 15-second test. Production never assigns to it.
+var schemaGateWaitBudget = 15 * time.Second
+
+// acquireDMLGate serialises DML evaluation per execution schema (ARCH-059).
+//
+// The wait is bounded by a context of its own (ARCH-060). The caller's ctx —
+// never waitCtx — is what goes on to the evaluator, so time spent queueing can
+// never be deducted from the execution window.
+//
+// The two failure causes are kept distinct: if the CALLER's context ended, that
+// is a genuine timeout or cancellation and propagates unchanged; only our own
+// wait budget expiring yields ErrSchemaBusy.
+func (r *PostgresRepository) acquireDMLGate(ctx context.Context, schema string) (func(), error) {
+	waitCtx, cancel := context.WithTimeout(ctx, schemaGateWaitBudget)
+	defer cancel()
+
+	release, err := r.dmlGate.Acquire(waitCtx, schema)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("%w: %s", ErrSchemaBusy, schema)
+	}
+	return release, nil
+}
 
 // Evaluate runs the student's SQL against the appropriate sandbox and captures
 // the result for comparison. SELECT questions read directly from the frozen
@@ -19,13 +65,27 @@ import (
 // questions execute against the shared per-exam sandbox `sandbox_exam_{X}`,
 // inside a transaction with a savepoint that is always rolled back so the
 // sandbox state is restored for the next student in the queue.
-// DML evaluations are serialised by the global in-process FIFO SubmissionQueue
-// (single worker, capacity 256, 30 s per-job timeout); SELECT remains lock-free
-// under `exam_student_readonly`.
+// DML evaluations are serialised per execution schema by the in-process
+// SchemaGate acquired below (ARCH-059) — this is the engine's own guarantee and
+// does not depend on the caller. Exam DML additionally arrives one job at a time
+// via the SubmissionQueue (single worker, capacity 256, 30 s per-job timeout),
+// which practice never touches; before the gate existed that left concurrent
+// practice DML able to deadlock (SQLSTATE 40P01, see
+// postgres_practice_concurrent_dml_test.go). SELECT remains lock-free under
+// `exam_student_readonly`.
 func (r *PostgresRepository) Evaluate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error) {
 	if question.Type == "QUERY" {
+		// SELECT is never gated: it takes the advisory lock shared, runs under
+		// the SELECT-only role, and is parallel-safe by construction.
 		return r.evaluateQuery(ctx, question, studentSQL, querySchemaFor(question, sandboxSchema))
 	}
+	// ARCH-059: at most one DML evaluation per execution schema, process-wide.
+	// sandboxSchema IS the execution schema for graded DML.
+	release, err := r.acquireDMLGate(ctx, sandboxSchema)
+	if err != nil {
+		return models.ValidationResult{}, err
+	}
+	defer release()
 	return r.evaluateDML(ctx, question, studentSQL, sandboxSchema)
 }
 
@@ -394,6 +454,17 @@ func (r *PostgresRepository) EvaluatePreview(ctx context.Context, studentID int,
 	if useDecoy {
 		role = rolePreviewStudent
 	}
+	// ARCH-059: keyed on `schema` as resolved immediately above — the schema the
+	// preview actually executes DML against — and NOT on sandboxSchema. On a
+	// dual-schema category those differ, and gating the grading schema here
+	// would leave the decoy unprotected while blocking a schema this call never
+	// touches. Keying at the point of resolution is why the gate lives in the
+	// engine rather than in a controller.
+	release, err := r.acquireDMLGate(ctx, schema)
+	if err != nil {
+		return PreviewResult{}, err
+	}
+	defer release()
 	return r.evaluateDMLPreview(ctx, question, studentSQL, schema, role)
 }
 
