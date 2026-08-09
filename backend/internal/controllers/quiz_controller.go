@@ -268,9 +268,13 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 			return
 		}
 		// ARCH-059: the engine shed this evaluation because another one held the
-		// same execution schema. Must sit ABOVE the DeadlineExceeded arm and
-		// answer 503, not 504 — nothing ran, so nothing timed out, and the
-		// request is retriable.
+		// same execution schema. Answers 503, not 504 — nothing ran, so nothing
+		// timed out, and the request is retriable. Kept above the
+		// DeadlineExceeded arm for readability (busy-then-timeout reads as the
+		// natural order of causes), not because ordering is load-bearing:
+		// ErrSchemaBusy deliberately does not wrap context.DeadlineExceeded, so
+		// the two arms can never both match the same err and a future reader
+		// must not treat this position as an invariant.
 		if errors.Is(err, repository.ErrSchemaBusy) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "schema_busy",
 				"message": "Another submission is being graded against this data. Please try again."})
@@ -413,9 +417,13 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 			return
 		}
 		// ARCH-059: the engine shed this evaluation because another one held the
-		// same execution schema. Must sit ABOVE the DeadlineExceeded arm and
-		// answer 503, not 504 — nothing ran, so nothing timed out, and the
-		// request is retriable.
+		// same execution schema. Answers 503, not 504 — nothing ran, so nothing
+		// timed out, and the request is retriable. Kept above the
+		// DeadlineExceeded arm for readability (busy-then-timeout reads as the
+		// natural order of causes), not because ordering is load-bearing:
+		// ErrSchemaBusy deliberately does not wrap context.DeadlineExceeded, so
+		// the two arms can never both match the same err and a future reader
+		// must not treat this position as an invariant.
 		if errors.Is(err, repository.ErrSchemaBusy) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "schema_busy",
 				"message": "Another submission is being graded against this data. Please try again."})

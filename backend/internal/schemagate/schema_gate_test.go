@@ -58,13 +58,18 @@ func TestSchemaGate_ZeroValueIsUsable(t *testing.T) {
 	}
 	release()
 
-	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
 	held, err := g.Acquire(ctx, "practice_cat_1")
 	if err != nil {
 		t.Fatalf("re-Acquire on zero value: %v", err)
 	}
 	defer held()
+	// waitCtx is created here, immediately before the Acquire it races, not
+	// earlier — see TestSchemaGate_DoubleReleaseIsSafe for why: creating it
+	// before intervening statements risks the context already being dead by
+	// the time Acquire runs, which would make the DeadlineExceeded assertion
+	// below pass vacuously instead of proving the gate excluded anything.
+	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
 	if _, err := g.Acquire(waitCtx, "practice_cat_1"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("zero value does not actually exclude: %v", err)
 	}

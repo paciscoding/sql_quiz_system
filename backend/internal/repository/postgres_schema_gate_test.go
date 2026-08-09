@@ -85,15 +85,54 @@ func TestSchemaGateEngine_DistinctSchemasDoNotSerialise(t *testing.T) {
 	repo := openTestRepo(t)
 
 	var p gateProbe
-	var wg sync.WaitGroup
-	for _, s := range []string{"practice_cat_gate_a", "practice_cat_gate_b"} {
-		wg.Add(1)
-		go func(schema string) {
-			defer wg.Done()
-			holdGate(t, repo, &p, schema, 100*time.Millisecond)
-		}(s)
+	// A barrier, not a sleep: each goroutine acquires its own schema's gate,
+	// then reports arrival and waits for the other before recording overlap.
+	// Neither can pass its Wait() until BOTH have acquired their gate, so
+	// p.enter() for both is only ever reached with both gates held at once —
+	// overlap is forced, not hoped for. If the gate wrongly serialised the two
+	// schemas, the second acquireDMLGate call would block behind the first
+	// forever (the first cannot release until the barrier releases it, and the
+	// barrier cannot release until the second arrives), so the whole thing is
+	// bounded by the select/timeout below rather than left to hang the suite.
+	var barrier sync.WaitGroup
+	barrier.Add(2)
+
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for _, s := range []string{"practice_cat_gate_a", "practice_cat_gate_b"} {
+			wg.Add(1)
+			go func(schema string) {
+				defer wg.Done()
+				release, err := repo.acquireDMLGate(context.Background(), schema)
+				if err != nil {
+					t.Errorf("acquireDMLGate(%q): %v", schema, err)
+					barrier.Done()
+					return
+				}
+				defer release()
+				barrier.Done()
+				barrier.Wait()
+				// Both goroutines are released from the barrier together, so
+				// this hold only has to survive ordinary scheduler jitter
+				// between two already-synchronized goroutines — nothing here
+				// waits on gate acquisition, which is what made the old
+				// sleep-only version flaky.
+				p.enter()
+				time.Sleep(50 * time.Millisecond)
+				p.leave()
+			}(s)
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("distinct schemas were serialised: the two acquires never overlapped " +
+			"(one blocked behind the other instead of running independently)")
 	}
-	wg.Wait()
 
 	if got := atomic.LoadInt32(&p.maxSeen); got != 2 {
 		t.Fatalf("distinct schemas were serialised (max concurrent = %d, want 2)", got)
