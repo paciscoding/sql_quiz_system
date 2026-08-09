@@ -384,3 +384,80 @@ func TestSchemaGateEngine_WaitBudgetIsNotTheEvaluationBudget(t *testing.T) {
 			"schemaGateWaitBudget must not be cut short by it", res.Status, res.Feedback)
 	}
 }
+
+// TestSchemaGateEngine_LecturerCaptureIsGated pins Fix 1 (ARCH-059/061 gap):
+// captureExpectedResult (called from CreatePracticeQuestion) replays the
+// lecturer's DML — seed plus correct SQL — against the very schema a student
+// can be mid-evaluation against, so it must take the same per-schema gate,
+// acquired before its own transaction begins, exactly like Evaluate does.
+//
+// Before this fix a lecturer capture racing a student's concurrent submission
+// could deadlock the same way ProductionPath
+// (postgres_practice_concurrent_dml_test.go) did — and worse, a capture
+// failure is PERSISTED as expected_result_status='failed' with a capture_error
+// naming the deadlock, turning one transient race into a durable 409
+// question_not_ready outage for every student on that question until someone
+// re-saves it. Gating converts that into a retriable ErrSchemaBusy that never
+// reaches persistence at all.
+func TestSchemaGateEngine_LecturerCaptureIsGated(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	catID, uid := mkPracticeCategory(t, repo, ctx, "gate_capture")
+	const tbl = "gate_capture_tbl"
+	importSQL := fmt.Sprintf(`
+		CREATE TABLE %s (ssn TEXT PRIMARY KEY, name TEXT);
+		INSERT INTO %s (ssn, name) VALUES ('111111111', 'Alice');`, tbl, tbl)
+	if err := repo.ImportSchemaIntoCategory(ctx, catID, importSQL, uid, false); err != nil {
+		t.Fatalf("ImportSchemaIntoCategory: %v", err)
+	}
+	schema, err := repo.GetPracticeCategorySchema(ctx, catID)
+	if err != nil {
+		t.Fatalf("GetPracticeCategorySchema: %v", err)
+	}
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
+
+	// Shorten the wait budget so a genuinely gated call sheds promptly instead
+	// of making this test wait out the production 15 s budget — same
+	// discipline as TestSchemaGateEngine_BusyReturnsErrSchemaBusy.
+	orig := schemaGateWaitBudget
+	schemaGateWaitBudget = 50 * time.Millisecond
+	defer func() { schemaGateWaitBudget = orig }()
+
+	// Hold the category's schema gate, standing in for a student submission
+	// that is mid-evaluation against it.
+	release, err := repo.acquireDMLGate(ctx, schema)
+	if err != nil {
+		t.Fatalf("acquireDMLGate: %v", err)
+	}
+	defer release()
+
+	q := &models.PracticeQuestion{
+		CreatedBy:   models.UserID(uid),
+		CategoryID:  models.CategoryID(catID),
+		TargetTable: tbl,
+		Type:        "DML",
+		DMLKind:     "DELETE",
+		Requirement: "gate capture fixture",
+		Points:      1,
+		CorrectSQL:  fmt.Sprintf("DELETE FROM %s WHERE ssn = '999999999'", tbl),
+		SeedSQL:     fmt.Sprintf("INSERT INTO %s (ssn, name) VALUES ('999999999', 'Seeded')", tbl),
+	}
+	if err := repo.CreatePracticeQuestion(ctx, q); !errors.Is(err, ErrSchemaBusy) {
+		t.Fatalf("lecturer capture against a held schema was not gated: want ErrSchemaBusy, got %v", err)
+	}
+
+	// The gate must shed the call BEFORE captureExpectedResult's transaction
+	// ever runs, so CreatePracticeQuestion must return before reaching its
+	// INSERT — no row for this question should have been persisted, captured
+	// or otherwise.
+	saved, listErr := repo.ListPracticeQuestions(ctx)
+	if listErr != nil {
+		t.Fatalf("ListPracticeQuestions: %v", listErr)
+	}
+	for _, pq := range saved {
+		if int(pq.CategoryID) == catID {
+			t.Fatalf("a gate-shed lecturer capture was persisted as a question row instead of being shed entirely: %+v", pq)
+		}
+	}
+}

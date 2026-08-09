@@ -438,6 +438,24 @@ func (r *PostgresRepository) CreatePracticeQuestion(ctx context.Context, q *mode
 // rows on the first run — deriveAutoSeed is never even called on that path,
 // which is what keeps already-working questions byte-identical to before.
 func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema string, q *models.PracticeQuestion, status *string, captureErr *string, expectedResult *[]byte, expectedCols *[]byte, expectedRowsAffected **int, autoSeed *[]byte) error {
+	// ARCH-059/061: this replays the lecturer's DML against the same
+	// practice_cat_N schema a student's Evaluate can be mid-transaction
+	// against, so it must take the same per-schema gate — before the
+	// transaction below begins, never after. SELECT-only questions (q.Type ==
+	// "QUERY") are exempt, mirroring Evaluate/EvaluatePreview: SELECT is
+	// parallel-safe by construction and gating it would serialise the hot path
+	// for no benefit. A gate timeout here is an infrastructure error, not a
+	// lecturer mistake — it is returned unchanged (not folded into
+	// status/captureErr, which the caller would persist as capture_error and
+	// blame on the lecturer's SQL) so callers propagate it like any other
+	// non-capture error.
+	if q.Type != "QUERY" {
+		release, err := r.acquireDMLGate(ctx, schema)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		safeSchema := pgx.Identifier{schema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", safeSchema)); err != nil {
@@ -626,6 +644,23 @@ func (r *PostgresRepository) PreviewPracticeCorrectSQL(ctx context.Context, cate
 			return nil, nil, resolveErr
 		}
 		targetTable = canonical
+	}
+
+	// ARCH-059/061: this runs the lecturer's DML against `previewSchema`,
+	// which for useDecoy==false IS the schema students are graded against —
+	// so it must take the same per-schema gate a student's Evaluate does,
+	// before the transaction below begins. Keyed on previewSchema (the
+	// resolved decoy or the real category schema), matching EvaluatePreview's
+	// own keying. QUERY previews are exempt, same as everywhere else: SELECT
+	// is parallel-safe and gating it buys nothing. A gate timeout is returned
+	// unchanged rather than surfaced as a SQL error, since it never reached
+	// the lecturer's SQL at all.
+	if qType != "QUERY" {
+		release, err := r.acquireDMLGate(ctx, previewSchema)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer release()
 	}
 
 	var results []map[string]interface{}

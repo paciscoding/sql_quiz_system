@@ -103,6 +103,24 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 
 	var err error
 	if resolveErr == nil {
+		// ARCH-059/061: this replays the lecturer's DML against captureSchema,
+		// the same schema a student's Evaluate can be mid-transaction against
+		// (sandboxSchema for exam DML resolves to the category/exam schema
+		// captureSchema is derived from above), so it must take the same
+		// per-schema gate — before the transaction below begins, never after.
+		// QUERY questions are exempt, mirroring Evaluate/EvaluatePreview:
+		// SELECT is parallel-safe by construction. A gate timeout is returned
+		// directly (not folded into status/captureErr, which would persist as
+		// capture_error and blame the lecturer's SQL for a transient
+		// scheduling conflict) — same treatment CreateQuestion already gives
+		// its other infrastructure errors (e.g. GetExamByID above).
+		if q.Type != "QUERY" {
+			release, gateErr := r.acquireDMLGate(ctx, captureSchema)
+			if gateErr != nil {
+				return 0, gateErr
+			}
+			defer release()
+		}
 		err = r.WithTransaction(ctx, func(tx pgx.Tx) error {
 			// Bug fix (ARCH-002d): set search_path BEFORE executing the lecturer's
 			// DML so an exam with a per-exam curriculum_schema mutates the right
@@ -462,6 +480,22 @@ func (r *PostgresRepository) PreviewCorrectSQLInSchema(ctx context.Context, qTyp
 			return nil, nil, err
 		}
 		targetTable = canonical
+	}
+
+	// ARCH-059/061: this runs the lecturer's DML against previewSchema, which
+	// for a grading (non-decoy) preview IS the schema students are graded
+	// against, so it must take the same per-schema gate a student's
+	// EvaluatePreview does, before the transaction below begins. Keyed on
+	// previewSchema exactly as resolved above, matching EvaluatePreview's own
+	// keying. QUERY previews are exempt: SELECT is parallel-safe and gating it
+	// buys nothing. A gate timeout is returned unchanged rather than surfaced
+	// as a SQL error, since it never reached the lecturer's SQL at all.
+	if qType != "QUERY" {
+		release, err := r.acquireDMLGate(ctx, previewSchema)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer release()
 	}
 
 	var results []map[string]interface{}
