@@ -268,14 +268,14 @@ Validates a submission and persists it to `app.submissions`.
   - **QUERY (SELECT):** lock-free against frozen `public.*` (or the exam's curriculum schema) under role `exam_student_readonly`.
   - **DML:** routed through the global single-worker FIFO `SubmissionQueue`; savepoint-rollback against `sandbox_exam_{examID}` under role `exam_student`.
 - **200:** `{"status": "correct"|"incorrect"|"syntax_error", "score": float, "feedback": "...", "is_correct": bool, "validation_details": <raw JSON>}`.
-- **Errors:** 400 (malformed body / question not assigned to an exam), 403 (exam not active / not enrolled), 500 (fetch/validate/persist failure), 503 (queue full or shutting down), 504 (evaluation deadline exceeded).
+- **Errors:** 400 (malformed body / question not assigned to an exam), 403 (exam not active / not enrolled), 500 (fetch/validate/persist failure), 503 (queue full or shutting down; **or** the per-schema DML gate shed this evaluation — `{"error": "schema_busy", "message": "Another submission is being graded against this data. Please try again."}`), 504 (evaluation deadline exceeded).
 
 ### Preview Answer (Student)
 - `POST /quiz/preview`
 - **Payload:** `{"question_number": int, "sql_text": "..."}`
 - **200:** `{"status": "preview"|"syntax_error", "feedback": "...", "rows": [...], "columns": [...], "row_count": int, "truncated": bool}` — `rows`/`columns` never null.
 - **Notable:** same queue branching and `active`+enrollment gates as submit. **Correctness is neutralised** — a `correct`/`incorrect` outcome is rewritten to `"preview"` with feedback cleared, so students can't infer right/wrong mid-run. Syntax errors are preserved. **Not persisted.**
-- **Errors:** 400, 403, 404 (question not found), 500, 503, 504.
+- **Errors:** 400, 403, 404 (question not found), 500, 503 (queue full/shutting down, or the DML gate's `schema_busy` — same body as `/quiz/submit` above), 504.
 
 ### Get Available Exams (Student)
 - `GET /quiz/exams` — optional query `include_inactive=true` returns all enrolled exams; otherwise only currently-relevant ones.
@@ -465,8 +465,8 @@ Unfreezing takes effect server-side on the next request (the 5 s cache is invali
 
 - `GET /practice/questions` → **200:** array of practice questions with `correct_sql`/`expected_result`/`expected_columns` **stripped**.
 - `GET /practice/questions/:id` → **200:** single practice question (sensitive fields stripped). **404:** not found.
-- `POST /practice/submit` — **Payload:** `{"practice_question_id": int, "sql_text": "..."}` (`student_id` from JWT). Resolves the question's category schema (must be imported), validates, and persists a `PracticeAttempt` regardless of outcome. **200:** validation `result` (`is_correct`, `validation_details`, ...). **400:** category not configured / category DB not configured / category schema empty. **404:** question not found. **500:** persist/validation failure.
-- `POST /practice/preview` — same payload. **200:** `{"status", "feedback", "rows": [...], "columns": [...], "row_count", "truncated"}`. Not persisted.
+- `POST /practice/submit` — **Payload:** `{"practice_question_id": int, "sql_text": "..."}` (`student_id` from JWT). Resolves the question's category schema (must be imported), validates, and persists a `PracticeAttempt` regardless of outcome. **200:** validation `result` (`is_correct`, `validation_details`, ...). **400:** category not configured / category DB not configured / category schema empty. **404:** question not found. **500:** persist/validation failure. **503:** the per-schema DML gate shed this evaluation because another submission (student or lecturer capture/preview) is being graded against the same category schema — `{"error": "practice_busy", "message": "Another submission for this category is being graded. Please try again."}`. Nothing is persisted for a 503; the client should retry.
+- `POST /practice/preview` — same payload. **200:** `{"status", "feedback", "rows": [...], "columns": [...], "row_count", "truncated"}`. Not persisted. **503:** same DML-gate condition and body as `/practice/submit` above.
 - `GET /practice/attempts` → **200:** array of the caller's attempts.
 - `GET /practice/summary` → **200:** the student's practice summary (answered / solved / points).
 - `GET /practice/categories/:id/introduction` → **200:** `{"category_id", "category_name", "introduction", "imported": bool, "tables": [...]}` (`imported:false`, `tables:[]` when the schema has no tables). **404:** category not found.
