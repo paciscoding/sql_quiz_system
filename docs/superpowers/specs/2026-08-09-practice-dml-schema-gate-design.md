@@ -5,6 +5,12 @@
 **ARCH range:** ARCH-058 … ARCH-061
 **Origin:** `feedback.md` OPEN-1, from the 2026-08-08 exam-vs-practice audit
 
+**Revision 2 — 2026-08-09.** The gate moves from `PracticeController` into the
+evaluation engine (`PostgresRepository.Evaluate` / `EvaluatePreview`). Revision 1
+placed it in the controller, which left `repo.Evaluate` — the single point every
+DML evaluation passes through — unprotected, and mis-keyed the preview path.
+See *Why the engine and not the controller*.
+
 ## Problem
 
 Exam and practice share one evaluation engine. Both reach
@@ -90,9 +96,36 @@ Case B on the exam path, not the clone.
 
 ## Goal
 
-Give practice DML the same *scheduling* guarantee exam DML has — at most one DML
-evaluation per category schema at a time — without moving the exam path, without
-adding database state, and without serialising all practice globally.
+Make the evaluation engine itself enforce what the exam queue only enforces by
+accident: **at most one DML evaluation per execution schema at a time,
+process-wide** — without adding database state and without serialising SELECT or
+serialising practice globally.
+
+## Why the engine and not the controller
+
+Revision 1 gated `PracticeController`. Three problems killed it.
+
+**1. The invariant belongs to the engine.** `repo.Evaluate` is the single
+convergence point for every DML evaluation in the system
+(`validation_service.go:92`, `:123` are its only callers). A guard placed above
+it protects the two call sites that remembered to ask. A guard placed *in* it
+protects the property — a third caller, a future controller, a test, or a script
+cannot forget.
+
+**2. It mis-keyed preview.** `EvaluatePreview` resolves the DML execution schema
+as `previewSchema` when a decoy exists and `sandboxSchema` only otherwise
+(`postgres_evaluation.go:389-397`). Revision 1 keyed preview on `schema`, so on
+every dual-schema category it would have gated a schema the DML never touched
+and left the one it did touch open.
+
+**3. It missed a live contention pair.** Practice preview resolves
+`question.CategoryPreviewSchema` (`practice_controller.go:258`) and exam preview
+can resolve the *same* value (`quiz_controller.go:352`). Two DML previews, one
+decoy schema, and only one of them is inside the queue. No controller-level gate
+sees that pair; a key computed where the schema is resolved does.
+
+The cost is that the exam path is no longer untouched. That is accepted
+deliberately — see *Known limitations*.
 
 ## Non-goals
 
@@ -100,22 +133,31 @@ adding database state, and without serialising all practice globally.
   runs against `practice_cat_N`, the lecturer's real imported data, with the
   savepoint as sole barrier. Separate decision, separate spec.
 - **No change to `SubmissionQueue`** — not its wiring, capacity, timeout, or
-  worker count.
-- **No change to the exam evaluation path.** Zero lines.
+  worker count. Exam *scheduling* is unchanged; exam DML still reaches the engine
+  one job at a time.
 - **No new Postgres objects.** No table, column, migration, DDL, or persisted
   state. The gate is Go memory only.
 - **Not multi-instance safe.** Process-local, matching the existing
   `SubmissionQueue` assumption. Stated as a limitation, not solved here.
-- Practice SELECT stays unserialised.
-- The remaining `feedback.md` findings (OPEN-2 … OPEN-6) are out of scope.
+- **SELECT is never gated**, on either path. `Evaluate` branches to
+  `evaluateQuery` before the gate is reached.
+- The remaining `feedback.md` findings (OPEN-2 … OPEN-7) are out of scope.
 
 ## Design decisions
 
 ### ARCH-058 — `SchemaGate`, a process-local per-schema serialiser
 
-New file `internal/services/schema_gate.go`:
+New package `internal/schemagate`, file `internal/schemagate/schema_gate.go`.
+
+**It cannot live in `internal/services`.** `services` imports `repository`
+(`validation_service.go`), so `repository` importing `services` would close an
+import cycle. A leaf package with no project dependencies is importable by both
+and keeps its tests genuinely DB-free, outside the `repository` package's test
+harness.
 
 ```go
+package schemagate
+
 // SchemaGate serialises work per schema name, in-process.
 // A buffered channel — not sync.Mutex — because waiting must be
 // ctx-cancellable and time-bounded; sync.Mutex.Lock is neither.
@@ -140,100 +182,119 @@ free another caller's slot.
 An empty schema string returns a no-op release and a nil error, mirroring
 `acquireSchemaEvalLock`'s treatment of the same case.
 
+**The zero value is usable.** `gateFor` allocates the map on first use under the
+mutex, so `SchemaGate` works as a plain struct field with no constructor call.
+That is what lets `PostgresRepository` hold it as a value and leave
+`NewPostgresRepository` (`postgres.go:185`) completely unedited — a repository
+built any other way still gets a working gate rather than a nil-pointer panic.
+`NewSchemaGate` remains for standalone use.
+
 Map entries are created lazily and never evicted. The population is bounded by
 the number of category schemas; a deleted category leaks one channel and one map
 entry. Not worth an eviction path.
 
-### ARCH-059 — Only practice DML takes the gate
+### ARCH-059 — The engine takes the gate, keyed on the resolved execution schema
 
-`PracticeController` owns one `*services.SchemaGate`, constructed inside
-`NewPracticeController`. The constructor signature does not change, so
-`cmd/main.go` is untouched and no new code reaches the exam path.
+`PostgresRepository` gains one `*schemagate.SchemaGate`, built in
+`NewPostgresRepository` (`postgres.go:152`). Two acquire sites, both on the DML
+branch only, both keyed on **the schema the code has already resolved as the
+execution target** — never on a schema recomputed by the caller:
 
-Two call sites, gated only when `q.Type == "DML"`:
-
-| Site | Call | Key |
+| Site | Key | Resolves to |
 |---|---|---|
-| `practice_controller.go:205` | `validator.Validate` | `schema` |
-| `practice_controller.go:268` | `validator.ValidatePreview` | `schema` |
+| `Evaluate` (`postgres_evaluation.go:25`) | `sandboxSchema` | `practice_cat_N` / `sandbox_exam_N` |
+| `EvaluatePreview` (`:365`) | the local `schema` after `previewSchema` fallback (`:389-397`) | decoy schema, else the grading schema |
 
-Both key on `schema` — the `practice_cat_N` returned by
-`resolveCategorySchema` — and **not** on `previewSchema`. `evaluateDMLPreview`
-takes its advisory lock on `schema` (`postgres_evaluation.go:498`), and the DML
-it runs executes there. Using one key for both sites is what makes preview and
-submit mutually exclusive, closing the preview-vs-submit race as well.
+Keying at the resolution point is the whole reason the gate moved down. The
+caller does not have to know which of two schemas the preview will actually
+execute against — the engine already computed it one line earlier.
 
-The critical section covers the validator call **only**. It is released before
-`CreatePracticeAttempt`: there is no reason to hold a category-wide gate across
-an unrelated INSERT.
+SELECT is untouched: `Evaluate` returns via `evaluateQuery` before the gate, and
+`EvaluatePreview` via `evaluateQueryPreview`.
 
-Release is deferred inside a closure, so a panic in the validator cannot strand
-the gate while still keeping the section tight:
+The critical section wraps the `evaluateDML*` call only. Release is `defer`red
+so a panic inside evaluation cannot strand a schema:
 
 ```go
-func() {
-	defer release()
-	result, err = ctrl.validator.Validate(ctx, int(student.ID), *q, req.SQLText, schema)
-}()
+release, err := r.acquireDMLGate(ctx, sandboxSchema)
+if err != nil {
+	return models.ValidationResult{}, err
+}
+defer release()
+return r.evaluateDML(ctx, question, studentSQL, sandboxSchema)
 ```
 
-Exam schemas would be uncontended anyway — both exam DML entry points pass
-through the single-worker queue — but the exam path is where a mistake is most
-expensive, so it gets no new code regardless.
+**No deadlock is constructible on the gate itself.** Exactly one gate is held
+per evaluation and the four `evaluate*` internals have no other callers
+(verified: `Evaluate` and `EvaluatePreview` are the only ones), so no evaluation
+nests inside another and there is no lock-ordering cycle. The gate is also taken
+strictly *before* `BEGIN`, so a holder never waits on a database lock while
+another goroutine waits on the Go gate behind it. Schema rebuild
+(`acquireSchemaRebuildLockTx`) does **not** take the gate, so it cannot
+participate in a cycle either.
 
-### ARCH-060 — The wait budget is a separate context from the evaluation context
+### ARCH-060 — The wait budget is a separate context, and failure is a sentinel
 
 ```go
-waitCtx, cancel := context.WithTimeout(ctx, practiceGateWaitBudget) // 15 * time.Second
+// schemaGateWaitBudget = 15 * time.Second
+waitCtx, cancel := context.WithTimeout(ctx, schemaGateWaitBudget)
 defer cancel()
-release, err := ctrl.dmlGate.Acquire(waitCtx, schema)
-// ...
-result, err := ctrl.validator.Validate(ctx, ...)   // ctx — never waitCtx
+release, err := r.dmlGate.Acquire(waitCtx, schema)
 ```
 
-Passing `waitCtx` into `Validate` would let queue-wait consume the execution
-window. That is exactly the defect the audit recorded on the exam side, where
-the 30 s job budget starts at *enqueue* and pre-empts `evaluateDML`'s own timer
-(`postgres_evaluation.go:191`). This design must not reproduce it, and a test
-pins the distinction.
+`waitCtx` bounds the wait and nothing else — `ctx`, not `waitCtx`, is what the
+`evaluateDML*` call receives, so queue-wait can never be deducted from the
+execution window. That is precisely the defect the audit recorded on the exam
+side, where the 30 s job budget starts at *enqueue* and pre-empts
+`evaluateDML`'s own timer (`postgres_evaluation.go:191`). A test pins it.
 
-`practiceGateWaitBudget = 15 * time.Second`, a named constant. Rationale:
-`evaluateDML` is capped at 30 s, so a genuinely stuck grader sheds waiters in
-half that rather than hanging them; a class of 30 at a realistic ~300 ms each
-drains in ~9 s, comfortably inside budget.
+15 s rationale: `evaluateDML` is capped at 30 s, so a genuinely wedged grader
+sheds waiters in half that rather than hanging them; a class of 30 at a realistic
+~300 ms each drains in ~9 s, inside budget.
 
-Failure handling at both call sites:
+**Failure must be distinguishable from a timeout**, because the exam controller
+already maps `context.DeadlineExceeded` to 504 (`quiz_controller.go:270`).
+Returning a bare `ctx.Err()` would make a busy schema look like a graded request
+that timed out. So `acquireDMLGate` separates the two causes:
 
-| Condition | Response | Attempt row |
-|---|---|---|
-| `context.DeadlineExceeded` waiting | 503 `practice_busy`, retriable | **none** |
-| `context.Canceled` (client gone) | abort, no body | none |
-| Validator error after acquiring | 500, unchanged | yes — existing behaviour |
-| Panic in validator | gate released, panic propagates to gin recovery | none |
+```go
+var ErrSchemaBusy = errors.New("schema is busy: another DML evaluation is in progress")
 
-The 503 case deliberately departs from practice's existing "persist the attempt
-regardless of outcome" rule: evaluation never ran, so there is no attempt to
-record. Persisting a spurious `is_correct=false` row for a request that was shed
-would corrupt the student's history.
+if err != nil {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()   // the CALLER's deadline/cancel — a real timeout
+	}
+	return nil, fmt.Errorf("%w: %s", ErrSchemaBusy, schema)  // our wait budget only
+}
+```
 
-The 503 body follows the `question_not_ready` shape already used at
-`practice_controller.go:191`:
+`ErrSchemaBusy` deliberately does **not** wrap `context.DeadlineExceeded`.
+
+`ValidationService` returns executor errors unwrapped
+(`validation_service.go:93-95`, `:124-126`), so `errors.Is` reaches both
+controllers intact.
+
+### ARCH-061 — Controllers map `ErrSchemaBusy` to 503; practice records nothing
+
+**Practice** (`practice_controller.go`) persists the attempt *before* it checks
+the evaluation error (`:205-224`), so without a change a shed request would
+write `is_correct=false` for SQL that never ran. The busy check therefore goes
+**before** `CreatePracticeAttempt`:
 
 ```json
 {"error": "practice_busy", "message": "Another submission for this category is being graded. Please try again."}
 ```
 
-**No deadlock is constructible on the gate itself.** Exactly one gate is held
-per request and never two at once, so there is no lock-ordering cycle.
+matching the `question_not_ready` body shape at `practice_controller.go:191`.
 
-### ARCH-061 — A narrow validator seam on the practice controller
+**Exam** (`quiz_controller.go:265`) already has an error ladder — `ErrQueueFull`
+→ 503, `DeadlineExceeded` → 504, else 500. `ErrSchemaBusy` joins the 503 arm,
+above the `DeadlineExceeded` arm. This is the one exam-path change in the design;
+it is three lines and it prevents a transient busy schema from being reported as
+a 500. Exam persists after the error check already, so nothing else moves.
 
-`PracticeController.validator` is currently the concrete
-`*services.ValidationService` (`practice_controller.go:87`), which leaves no way
-to observe call overlap without a live database.
-
-Introduce a minimal interface in `package controllers`, satisfied by the
-existing concrete type:
+**The validator seam stays**, and its justification is now stronger. Introduce in
+`package controllers`, satisfied by `*services.ValidationService`:
 
 ```go
 type practiceValidator interface {
@@ -242,13 +303,12 @@ type practiceValidator interface {
 }
 ```
 
-`NewPracticeController` accepts the interface; `cmd/main.go` keeps passing
-`*services.ValidationService` unchanged. `QuizController` is not touched — the
-seam is practice-only, matching the scope of this spec.
-
-This exists to make the gating *branch* testable without a database: that SELECT
-is not gated, and that a shed request writes no attempt row. Both are behaviours
-that would otherwise regress silently.
+`NewPracticeController` accepts the interface; `cmd/main.go:153` is unchanged.
+A fake that simply **returns `ErrSchemaBusy`** makes the 503-and-no-attempt-row
+assertion deterministic — no timing, no contention to arrange. Under revision 1
+this seam had to fake *timing*; now it fakes an *error*, which is strictly more
+reliable. Overlap itself is asserted where the gate lives, in the repository
+package.
 
 ## Known limitations
 
@@ -259,10 +319,31 @@ that would otherwise regress silently.
   deployment ever scales out, both need revisiting together.
 - **Damage scope untouched.** The gate closes concurrency hazards only. A
   bypassed savepoint still corrupts the lecturer's real data.
-- **Serialisation is now strict.** Practice DML per category goes from
+- **Serialisation is now strict.** DML per execution schema goes from
   concurrent-with-lock-contention to strictly one-at-a-time. Under a full class
   submitting simultaneously this changes latency in a direction that has not
   been measured. Case A's baseline measurement (below) exists to quantify it.
+- **The exam path is no longer untouched.** Accepted, and the cost is bounded:
+  - Exam DML evaluations reach the engine one at a time (single-worker queue), so
+    they never contend with *each other* — the acquire is an uncontended channel
+    send, tens of nanoseconds.
+  - They can now contend with **practice**, but only where the two share an
+    execution schema. That is exactly one case: a DML *preview* on a dual-schema
+    category, where practice (`practice_controller.go:258`) and exam
+    (`quiz_controller.go:352`) both resolve `question.CategoryPreviewSchema`.
+    Graded exam DML runs in `sandbox_exam_N` and can never collide with
+    `practice_cat_N`.
+  - In that one case the queue's single worker can block for up to
+    `schemaGateWaitBudget`, delaying other exam submissions behind it. The
+    alternative is worse: today those two run concurrent DML against one schema
+    with no serialisation anywhere, which is the same hazard OPEN-1 documents.
+  - The exam wait is bounded by one practice evaluation, since practice cannot
+    queue more than one holder per schema either.
+- **The wait can consume an exam job's budget.** `context.WithTimeout(ctx, …)`
+  keeps whichever deadline is earlier, so time spent waiting does come out of the
+  exam job's 30 s. Unavoidable at this layer — the engine cannot manufacture
+  budget the caller did not give it — and it only applies to the shared-decoy
+  case above.
 - **Stale student pools across the test suite (pre-existing, found while
   building the Case B probe).** `postgres_exam_categories_test.go:566`,
   `postgres_exam_categories_gap_test.go:105`, `postgres_preview_role_test.go`
@@ -294,9 +375,15 @@ Case B was written and run **first, against unmodified code**, in
 | `_CaseB_SerialControl` — identical fixture, run one at a time | PASS — both graded `success` |
 | `_CaseB_ProductionPath` — two concurrent `repo.Evaluate` | FAIL **by design** — one student shed |
 
-**Gate passed: `40P01` fires.** ARCH-058 … ARCH-061 proceed, and
-`_CaseB_ProductionPath`'s `t.Errorf` becomes the regression guard — it must be
-replaced by a pass assertion when the gate lands, not deleted.
+**Gate passed: `40P01` fires.** ARCH-058 … ARCH-061 proceed.
+
+Because the fix now lives *below* `repo.Evaluate`, `_CaseB_ProductionPath`
+becomes the direct regression test for it: its `t.Errorf` is replaced by an
+assertion that **both** concurrent submissions are graded normally. It is the
+one test that fails if the gate is removed, and it needs no new fixture to say
+so. `_CaseB_Mechanism` issues raw SQL in `evaluateDML`'s transaction shape,
+bypassing `Evaluate` entirely, so it still deadlocks — correctly, since it
+documents the hazard rather than the guard.
 
 Two properties of this file that must survive the fix:
 
@@ -323,16 +410,28 @@ Two properties of this file that must survive the fix:
 - a panic inside the critical section leaves the gate reusable
 - empty schema string yields a usable no-op release
 
-### Layer 2 — controller tests (fake validator via ARCH-061)
+### Layer 2 — engine tests (`repository` package, real Postgres)
 
-- two concurrent `Submit`, same category, DML → validator calls do not overlap
-- `Submit` versus `Preview`, same category → mutually exclusive
-- SELECT question → **not** gated; two concurrent calls do overlap
-- different categories → overlap
-- wait budget exhausted → 503 `practice_busy` **and no `practice_attempts` row**
-- the validator receives the request context, not `waitCtx` — pins ARCH-060
+The gate now lives here, so the mutual-exclusion assertions live here too:
 
-### Layer 3 — integration (`TEST_DATABASE_URL`, real Postgres)
+- `_CaseB_ProductionPath` — two concurrent `repo.Evaluate` on one practice
+  schema → both graded normally, no `40P01`
+- concurrent `Evaluate` (submit) versus `EvaluatePreview` on the same resolved
+  schema → do not overlap
+- `EvaluatePreview` with a non-empty `previewSchema` keys on the **decoy**, not
+  on `sandboxSchema` — the bug revision 1 would have shipped
+- two QUERY evaluations on one schema **do** overlap — SELECT is not gated
+- distinct schemas overlap — the gate is per-schema, not global
+- the evaluator receives `ctx`, not `waitCtx` — pins ARCH-060
+
+### Layer 3 — controller tests (fake validator via ARCH-061)
+
+- practice `Submit`, validator returns `ErrSchemaBusy` → 503 `practice_busy`
+  **and no `practice_attempts` row**
+- practice `Preview`, same → 503, same body
+- exam `SubmitAnswer`, same → 503 (not 500, not 504)
+
+### Layer 4 — integration (`TEST_DATABASE_URL`, real Postgres)
 
 - **Case A**: two concurrent submits, same question, fixed-PK seed → both
   succeed, no unique violation reaches the student. Run against unmodified code
