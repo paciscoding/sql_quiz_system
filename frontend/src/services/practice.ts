@@ -159,7 +159,14 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<any> {
   if (!response.ok) {
     let body: any = {}
     try { body = await response.json() } catch { /* ignore */ }
-    throw new ApiError(response.status, body.error || 'Request failed')
+    // Prefer the human-readable message over the machine slug, matching the
+    // precedence error_handler.ts's handleApiError already uses for a plain
+    // error object (message first, then error). Most error bodies only carry
+    // `error`, so this is a no-op for them; a 503 practice_busy/schema_busy
+    // body carries both, and without this the toast rendered the literal
+    // slug instead of the sentence telling the student to retry. `.status`
+    // (used by callers to branch on 409 etc.) is unaffected.
+    throw new ApiError(response.status, body.message || body.error || 'Request failed')
   }
   return response.json()
 }
