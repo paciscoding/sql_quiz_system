@@ -29,7 +29,7 @@ divergences are all in *what is handed to that engine and how it is scheduled*.
 ## OPEN-1 — Practice DML is unserialized against the live reference schema
 
 Severity: **high** (data-integrity + availability) — **deadlock confirmed by
-test, 2026-08-09**
+test 2026-08-09; CLOSED the same day by ARCH-058…061**
 
 Exam DML grades against a clone (`sandbox_exam_<id>`, `postgres_schema.go:755`).
 Practice has no sandbox at all — `sandbox_practice` / `ResetPracticeSandbox`
@@ -81,8 +81,16 @@ Note the fix is the **queue, not a sandbox**. A sandbox clone bounds damage
 *scope*; it does nothing about concurrency. What protects exam DML here is the
 single-worker `SubmissionQueue`, which practice never touches.
 
-Design: `docs/superpowers/specs/2026-08-09-practice-dml-schema-gate-design.md`
-(ARCH-058 … ARCH-061) — in-process per-schema gate, practice paths only.
+**Fixed 2026-08-09** — `docs/superpowers/specs/2026-08-09-practice-dml-schema-gate-design.md`
+(ARCH-058 … ARCH-061). An in-process per-schema gate inside
+`Evaluate`/`EvaluatePreview`, keyed on the schema those functions resolve as the
+execution target, so the guarantee belongs to the engine rather than to whichever
+controller remembered to ask for it. `TestPracticeConcurrentDML_CaseB_ProductionPath`
+now asserts both concurrent submissions grade `success`.
+
+No backfill. Any practice attempt already recorded as incorrect because its seed
+deadlocked is indistinguishable in `practice_attempts` from a genuinely wrong
+answer, so past practice scores cannot be repaired retroactively.
 
 Practice *serial* isolation was already well covered
 (`postgres_seedsql_isolation_test.go:119`,
@@ -214,6 +222,24 @@ Two things to decide: whether `CreateRestrictedUser` should re-init pools it
 invalidates, and whether eval-path tests should be required to distinguish
 infrastructure failure from a real negative. The OPEN-1 probe does the latter
 (`t.Fatalf("INCONCLUSIVE…")`), and that pattern is worth generalising.
+
+## OPEN-8 — A password test hardcodes an email and never cleans up
+
+Severity: **low** (test-only, but it fails work that did not cause it)
+
+`TestVerifyForgotPassword_HTTP` (`internal/controllers/forgot_password_http_test.go`)
+creates a user with the hardcoded address `verify@example.com` and deletes
+nothing afterwards. On the shared `TEST_DATABASE_URL` the row survives the run,
+so the next invocation collides on the unique email and the test fails.
+
+Found 2026-08-09 during the ARCH-058 work, where it failed a package run twice
+and had to be reproduced with the branch's changes stashed before it could be
+attributed. That is the real cost: a test that fails for reasons unrelated to
+the change under test makes every green run an argument rather than a fact.
+
+Two fixes worth considering, neither done here: give the fixture a unique
+address per run the way `mkCtrlUser` already does, or delete the row in a
+`t.Cleanup`. Same family as OPEN-7 — suite-wide state that no single test owns.
 
 ---
 

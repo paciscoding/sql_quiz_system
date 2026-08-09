@@ -9,9 +9,19 @@ package repository
 // lock SHARED, so concurrent evaluations against one practice_cat_N do not
 // exclude each other.
 //
-// The audit claimed that lets two practice submissions deadlock. That claim
-// was never reproduced. This file is the evidence gate: it runs against
-// UNMODIFIED code and decides whether the fix is justified.
+// (Fixed 2026-08-09 by ARCH-059: the gate moved into the engine, so the
+// scheduling difference between exam and practice no longer decides whether
+// concurrent DML is safe.)
+//
+// The audit claimed that lets two practice submissions deadlock. This file
+// reproduced it (SQLSTATE 40P01, 2026-08-09) and justified ARCH-058..061.
+//
+// It is now the regression test for that fix. The gate lives inside
+// repo.Evaluate, so ProductionPath — which calls Evaluate — must pass, while
+// Mechanism issues raw SQL in evaluateDML's transaction shape and bypasses the
+// gate on purpose, so it still reports 40P01. That contrast is the point: it
+// shows the deadlock is still constructible and that the gate is what stops
+// students meeting it.
 //
 // Construction. Seed SQL is lecturer-authored, INSERT-only, and may carry
 // several statements (validateSeedSQL / applyQuestionSeed in dml_autoseed.go),

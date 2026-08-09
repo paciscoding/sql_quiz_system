@@ -69,10 +69,15 @@ var studentLoginRoles = map[string]string{
 
 // studentPoolMaxConns sizes each class's pool. exam_student_readonly carries
 // graded SELECT (the hot path) so it is the largest; the DML pool is small
-// because graded DML is serialised by the single-worker SubmissionQueue; the
-// two decoy-preview pools are idle in most deployments. Worst case is
-// 20 (privileged r.pool) + 20 (these four) = 40 backends, well within
-// postgres:15-alpine's default max_connections of 100.
+// because DML is serialised per execution schema by the SchemaGate in
+// Evaluate/EvaluatePreview (ARCH-059) before it ever reaches this pool, with
+// exam DML additionally arriving one job at a time via the SubmissionQueue.
+// Until 2026-08-09 only the queue existed, which left practice DML
+// unserialised and able to deadlock — see
+// postgres_practice_concurrent_dml_test.go. The two decoy-preview pools are
+// idle in most deployments. Worst case is 20 (privileged r.pool) + 20 (these
+// four) = 40 backends, well within postgres:15-alpine's default
+// max_connections of 100.
 var studentPoolMaxConns = map[string]int32{
 	"exam_student_readonly":         8,
 	"exam_student":                  4,
