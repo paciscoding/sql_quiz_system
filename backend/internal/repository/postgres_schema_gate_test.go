@@ -192,7 +192,14 @@ func TestSchemaGateEngine_QueryIsNotGated(t *testing.T) {
 			t.Fatalf("QUERY evaluation errored: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("a SELECT evaluation blocked behind the DML gate; SELECT must never be gated")
+		// t.Error, not t.Fatal: Fatal exits via runtime.Goexit immediately,
+		// which would return from this test (and run the deferred release())
+		// while the goroutine above may still be inside Evaluate. Draining
+		// done first lets it finish before we return, so a genuine failure
+		// surfaces as this message instead of a confusing data race.
+		t.Error("a SELECT evaluation blocked behind the DML gate; SELECT must never be gated")
+		<-done
+		return
 	}
 }
 
@@ -201,7 +208,7 @@ func TestSchemaGateEngine_QueryIsNotGated(t *testing.T) {
 // real while the grading schema's gate is held.
 //
 // EvaluatePreview resolves its DML target as previewSchema when non-empty and
-// sandboxSchema only otherwise (postgres_evaluation.go:389-397), so both halves
+// sandboxSchema only otherwise (postgres_evaluation.go:456-463), so both halves
 // must hold:
 //
 //	previewSchema == ""  → executes against sandboxSchema → MUST block
@@ -250,8 +257,98 @@ func TestSchemaGateEngine_PreviewKeysOnExecutionSchema(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("a preview targeting a different schema blocked on the grading " +
+		// t.Error, not t.Fatal: Fatal exits via runtime.Goexit immediately,
+		// which would return from this test (and run the deferred
+		// schemaGateWaitBudget restore) while the goroutine above may still
+		// be inside EvaluatePreview reading schemaGateWaitBudget. Draining
+		// done first lets it finish before we return, so a genuine failure
+		// surfaces as this message instead of a confusing data race.
+		t.Error("a preview targeting a different schema blocked on the grading " +
 			"schema's gate — the key is sandboxSchema, not the execution schema")
+		<-done
+		return
+	}
+}
+
+// TestSchemaGateEngine_EvaluateKeysOnSandboxSchema pins the gate key used by
+// Evaluate itself (graded DML), mirroring
+// TestSchemaGateEngine_PreviewKeysOnExecutionSchema above but for the grading
+// path rather than the preview path. Evaluate calls
+// r.acquireDMLGate(ctx, sandboxSchema); a mutation that replaced
+// sandboxSchema there with a process-wide constant left the rest of this
+// suite passing untouched, because nothing else pins Evaluate's own key.
+func TestSchemaGateEngine_EvaluateKeysOnSandboxSchema(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	catID, uid, schema := mkCaseBFixture(t, repo, ctx)
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
+
+	q := caseBQuestions(uid)[0]
+
+	// The budget must stay comfortably ABOVE half 2's timeout below — same
+	// reasoning as TestSchemaGateEngine_PreviewKeysOnExecutionSchema: if it
+	// were shorter, a wrongly-gated call would be shed (quickly, well before
+	// the timeout) instead of blocking for the whole budget, and half 2 would
+	// pass while asserting nothing. The absolute numbers here are larger than
+	// that test's 2s/500ms because caseBQuestions[0]'s own seed carries a real
+	// ~0.60 s pg_sleep (caseBLateHold): half 2's legitimate, ungated
+	// completion must comfortably clear that on its own before we even get to
+	// the gating question.
+	orig := schemaGateWaitBudget
+	schemaGateWaitBudget = 4 * time.Second
+	defer func() { schemaGateWaitBudget = orig }()
+
+	// Half 1: hold the fixture's own schema's gate, then evaluate against that
+	// same schema. It must be shed. This fails if Evaluate keys on anything
+	// other than sandboxSchema. Scoped to its own function so the gate is
+	// released before half 2 starts — half 2 must run with `schema`'s gate
+	// free, or a correct implementation would legitimately block too and the
+	// two halves would stop being distinguishable.
+	func() {
+		release, err := repo.acquireDMLGate(ctx, schema)
+		if err != nil {
+			t.Fatalf("acquireDMLGate: %v", err)
+		}
+		defer release()
+
+		if _, err := repo.Evaluate(ctx, 1000, q, q.CorrectSQL, schema); !errors.Is(err, ErrSchemaBusy) {
+			t.Fatalf("Evaluate against the held schema was not gated: err=%v", err)
+		}
+	}()
+
+	// Half 2: hold a different, unrelated key — NOT `schema` — then evaluate
+	// against `schema` in a goroutine. It must complete promptly and must NOT
+	// be shed. This fails if Evaluate keys on a constant or any process-wide
+	// value: such a value would collide with whatever key is held here no
+	// matter which schema is actually being evaluated.
+	release, err := repo.acquireDMLGate(ctx, "gate_evaluate_unrelated_key")
+	if err != nil {
+		t.Fatalf("acquireDMLGate: %v", err)
+	}
+	defer release()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := repo.Evaluate(ctx, 1000, q, q.CorrectSQL, schema)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Evaluate against an unheld schema was gated or otherwise failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		// t.Error, not t.Fatal: see the matching comment in
+		// TestSchemaGateEngine_PreviewKeysOnExecutionSchema above — Fatal would
+		// return from this test (and run the deferred schemaGateWaitBudget
+		// restore) while the goroutine above may still be inside Evaluate
+		// reading schemaGateWaitBudget.
+		t.Error("an Evaluate call for a schema whose gate is not held blocked behind " +
+			"an unrelated schema's gate — the key must be sandboxSchema, not a constant")
+		<-done
+		return
 	}
 }
 

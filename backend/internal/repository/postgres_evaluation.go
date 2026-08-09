@@ -25,7 +25,7 @@ var ErrSchemaBusy = errors.New("schema is busy: another DML evaluation is in pro
 // schemaGateWaitBudget bounds how long a DML evaluation waits for its execution
 // schema before being shed with ErrSchemaBusy.
 //
-// Deliberately shorter than evaluateDML's own 30 s ceiling (see :191): a
+// Deliberately shorter than evaluateDML's own 30 s ceiling (see :258): a
 // genuinely wedged evaluation sheds waiters in half that time instead of
 // hanging them, while a full class at a realistic ~300 ms per submission drains
 // well inside it.
@@ -52,7 +52,14 @@ func (r *PostgresRepository) acquireDMLGate(ctx context.Context, schema string) 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("%w: %s", ErrSchemaBusy, schema)
+		// The schema name is deliberately NOT in the returned error. Executor
+		// errors reach the student verbatim via err.Error() in both
+		// controllers, and on a dual-schema question this identifier is the
+		// hidden grading or decoy schema — the same thing
+		// AutoSeedFailureFeedback is worded to withhold. Log it, do not return
+		// it.
+		log.Printf("schema gate: shed DML evaluation on %s after %s", schema, schemaGateWaitBudget)
+		return nil, ErrSchemaBusy
 	}
 	return release, nil
 }
