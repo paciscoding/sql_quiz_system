@@ -118,11 +118,23 @@ as `previewSchema` when a decoy exists and `sandboxSchema` only otherwise
 every dual-schema category it would have gated a schema the DML never touched
 and left the one it did touch open.
 
-**3. It missed a live contention pair.** Practice preview resolves
-`question.CategoryPreviewSchema` (`practice_controller.go:258`) and exam preview
-can resolve the *same* value (`quiz_controller.go:352`). Two DML previews, one
-decoy schema, and only one of them is inside the queue. No controller-level gate
-sees that pair; a key computed where the schema is resolved does.
+**3. It missed a live contention pair — within a single practice category.**
+Practice submit gates on `practice_cat_N`; practice preview executes against
+`practice_cat_N_preview` when a decoy exists. Both put `public` in
+`search_path`, so a seed touching an unqualified table that resolves to `public`
+is contended between them while the two keys differ. Only a key computed where
+the schema is resolved makes that visible at all.
+
+**Correction, 2026-08-10.** An earlier draft of this section claimed practice
+preview and *exam* preview could both resolve `question.CategoryPreviewSchema`
+and contend. They cannot. `quiz_controller.go:361` sits in the **QUERY** branch,
+and QUERY is never gated; exam DML preview resolves
+`ExamCategoryPreviewSandboxName` → `sandbox_exam_cat_N_preview` or
+`ExamPreviewSandboxName` → `sandbox_exam_N_preview`, and graded exam DML resolves
+`sandbox_exam_N`. The practice and exam namespaces are disjoint, so **exam and
+practice can never share a gate key.** Reasons 1 and 2 above are unaffected and
+still carry the decision; the consequences of this correction are recorded under
+*Known limitations*.
 
 The cost is that the exam path is no longer untouched. That is accepted
 deliberately — see *Known limitations*.
@@ -204,6 +216,26 @@ execution target** — never on a schema recomputed by the caller:
 |---|---|---|
 | `Evaluate` (`postgres_evaluation.go:25`) | `sandboxSchema` | `practice_cat_N` / `sandbox_exam_N` |
 | `EvaluatePreview` (`:365`) | the local `schema` after `previewSchema` fallback (`:389-397`) | decoy schema, else the grading schema |
+
+**Added 2026-08-10, after the whole-branch review.** The student paths are not
+the only ones that replay seeds against a graded schema. The lecturer-side
+capture and test-run paths — `captureExpectedResult` and
+`PreviewPracticeCorrectSQL` in `postgres_practice.go`, and their two exam
+equivalents in `postgres_questions.go` — run `applyQuestionSeed` plus the
+lecturer's DML against the same `practice_cat_N` a student is graded on, and
+originally took no gate at all. They now do.
+
+That omission mattered more than the student-vs-student case it mirrors. A
+lecturer saving Q2 while a student submits Q1 produces the same cycle, and if
+the *lecturer* loses, `captureExpectedResult` persists
+`expected_result_status='failed'` with a deadlock `capture_error` — so every
+student then hits 409 `question_not_ready` on that question until someone
+re-saves it. A transient race became a durable outage for one question.
+
+It also refutes, in the tree as it stood, this design's own argument for engine
+placement: "a third caller, a future controller, a test, or a script cannot
+forget." Four such callers already existed. The gate belongs in the engine, but
+the engine's entry points were not the only ones that needed it.
 
 Keying at the resolution point is the whole reason the gate moved down. The
 caller does not have to know which of two schemas the preview will actually
@@ -330,31 +362,46 @@ package.
   cross-schema seeds rather than eliminating it. Closing that would mean either
   restricting `validateSeedSQL` to the question's own schema or keying the gate
   on the set of tables a seed touches — both larger changes than this spec.
+
+  This is not only a cross-*category* hazard. Within one practice category,
+  submit gates on `practice_cat_N` while preview gates on
+  `practice_cat_N_preview`, so a seed touching an unqualified table that
+  resolves to `public` is ungated between those two.
 - **Serialisation is now strict.** DML per execution schema goes from
   concurrent-with-lock-contention to strictly one-at-a-time. Under a full class
   submitting simultaneously this changes latency in a direction that has not
   been measured. Case A's baseline measurement (below) exists to quantify it.
-- **The exam path is no longer untouched.** Accepted, and the cost is bounded:
-  - Exam DML evaluations reach the engine one at a time (single-worker queue), so
-    they never contend with *each other* — the acquire is an uncontended channel
-    send, tens of nanoseconds.
-  - They can now contend with **practice**, but only where the two share an
-    execution schema. That is exactly one case: a DML *preview* on a dual-schema
-    category, where practice (`practice_controller.go:258`) and exam
-    (`quiz_controller.go:352`) both resolve `question.CategoryPreviewSchema`.
-    Graded exam DML runs in `sandbox_exam_N` and can never collide with
-    `practice_cat_N`.
-  - In that one case the queue's single worker can block for up to
-    `schemaGateWaitBudget`, delaying other exam submissions behind it. The
-    alternative is worse: today those two run concurrent DML against one schema
-    with no serialisation anywhere, which is the same hazard OPEN-1 documents.
-  - The exam wait is bounded by one practice evaluation, since practice cannot
-    queue more than one holder per schema either.
-- **The wait can consume an exam job's budget.** `context.WithTimeout(ctx, …)`
-  keeps whichever deadline is earlier, so time spent waiting does come out of the
-  exam job's 30 s. Unavoidable at this layer — the engine cannot manufacture
-  budget the caller did not give it — and it only applies to the shared-decoy
-  case above.
+- **The exam path is no longer untouched, but its gate is uncontended by
+  construction.** Exam DML reaches the engine one job at a time (single-worker
+  queue), so exam evaluations never contend with each other; and per the
+  correction above, exam and practice schema namespaces are disjoint, so they
+  cannot contend with each other either. Every exam acquire is therefore an
+  uncontended channel send — tens of nanoseconds.
+  - Consequence: the `ErrSchemaBusy` → 503 arms in `quiz_controller.go` are
+    **defence-in-depth, not a reachable path today**, and they have no test. That
+    is deliberate. `QuizController` takes the concrete `*services.ValidationService`
+    with no interface seam, so testing them would mean introducing an exam-side
+    equivalent of ARCH-061's `practiceValidator` — a refactor of the path this
+    design set out not to disturb, in order to test code that cannot currently
+    execute. If exam and practice schemas are ever unified, add the seam and the
+    test together.
+  - **The wait could consume an exam job's budget** if it ever did contend:
+    `context.WithTimeout(ctx, …)` keeps whichever deadline is earlier, so wait
+    time would come out of the exam job's 30 s. Unavoidable at this layer — the
+    engine cannot manufacture budget the caller did not give it.
+  - The gate is FIFO, which the above relies on without it being obvious: Go
+    hands a released buffered-channel slot to the head of the blocked-sender
+    queue, so a stream of submitters cannot starve a waiter.
+- **A long lecturer import turns waiting students into misleading 503s.**
+  `ImportSchemaIntoCategory` and `DeletePracticeCategory` take the exclusive
+  rebuild advisory lock. Under the gate, the one evaluation holding the gate
+  blocks on `acquireSchemaEvalLock` inside its transaction, and everyone behind
+  it is shed after `schemaGateWaitBudget` with "Another submission for this
+  category is being graded" — which is not what is happening. Before this change
+  they all waited on the advisory lock and eventually succeeded. Retriable, so
+  not severe, but the message misattributes the cause. Fixing it means
+  distinguishing "shed behind an evaluation" from "shed behind a rebuild", which
+  the gate cannot see.
 - **Stale student pools across the test suite (pre-existing, found while
   building the Case B probe).** `postgres_exam_categories_test.go:566`,
   `postgres_exam_categories_gap_test.go:105`, `postgres_preview_role_test.go`

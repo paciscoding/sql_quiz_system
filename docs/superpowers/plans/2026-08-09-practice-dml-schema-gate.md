@@ -1325,7 +1325,7 @@ git commit -m "feat(practice): answer 503 without recording a shed submission (A
 
 ### Task 4: Exam controller maps `ErrSchemaBusy` to 503
 
-Exam DML can now meet the gate in exactly one situation: a DML *preview* on a dual-schema category, where exam (`quiz_controller.go:352`) and practice (`practice_controller.go:258`) both resolve `question.CategoryPreviewSchema`. Without this arm that surfaces as a 500.
+**Corrected 2026-08-10, after execution.** This task was written believing exam DML could meet the gate via a shared `question.CategoryPreviewSchema` decoy. It cannot: `quiz_controller.go:361` is in the QUERY branch and QUERY is never gated, and exam DML resolves `sandbox_exam_*` names that can never collide with `practice_cat_*`. The arms added here are therefore **defence-in-depth against an unreachable path**, and they ship untested — `QuizController` has no validator seam, and adding one to test code that cannot execute would disturb the exam path this design set out to leave alone. Keep the arms; a 500 or a 504 would be the wrong answer if the path ever becomes reachable.
 
 **Files:**
 - Modify: `backend/internal/controllers/quiz_controller.go` (the error ladder at `:265-276`)
