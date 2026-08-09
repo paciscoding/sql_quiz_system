@@ -450,7 +450,16 @@ Organises an exam's questions into per-category databases, mirroring the practic
 
 ## Practice
 
-Student practice endpoints return **423 Locked** (`{"error": "practice_unavailable_during_exam"}`) only when an active exam has its `block_practice_during_exam` toggle set. With the toggle off (default) practice stays live during exams. Lecturer practice endpoints are never frozen.
+Student practice endpoints return **423 Locked** (`{"error": "practice_unavailable_during_exam"}`) only when an active exam has its `block_practice_during_exam` toggle set. Lecturer practice endpoints are never frozen.
+
+**In practice this means every activated exam blocks practice.** The column defaults to `FALSE`, but activation (`PUT /lecturer/exams/:id/activate`) writes `block_practice_during_exam = TRUE` unconditionally, so the toggle is only ever off if a lecturer turns it off *after* activating that exam via `PUT /lecturer/exams/:id/practice-freeze`. Deactivation clears `is_active` but leaves the toggle set, and re-activating rewrites it to `TRUE` — a lecturer's "off" choice does not survive the next activation.
+
+Two further properties of the check worth knowing when writing clients:
+
+- **Global scope.** The gate is `EXISTS(is_active AND block_practice_during_exam)` with no join to class, enrolment, or category — one frozen exam blocks practice for *every* student in *every* category, enrolled or not.
+- **Keyed on `is_active`, not the schedule window.** A future-dated exam freezes practice the moment it is activated, before `scheduled_start_at`.
+
+Unfreezing takes effect server-side on the next request (the 5 s cache is invalidated on activate/deactivate/toggle), but nothing is pushed to the client — a student sitting on a 423 must retry or reload.
 
 ### Practice (Student)
 

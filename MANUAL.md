@@ -242,7 +242,7 @@ For the full design, see `ARCHITECTURE.md § Phase Lifecycle`. Headlines:
   - *DML:* Runs against `sandbox_exam_{examID}` under role `exam_student` (CRUD), serialised through the global in-process FIFO `SubmissionQueue` (one worker goroutine, channel capacity 256, 30 s per-job timeout) so only one student at a time mutates the sandbox.
 - **Hermetic DML Evaluation:** Each DML submission is wrapped in `BEGIN; SAVEPOINT student_eval; … ROLLBACK TO SAVEPOINT student_eval; COMMIT`. The student's writes never persist past the rollback, so the next student in the queue starts from the same byte-identical sandbox state.
 - **Persistence:** Every submission (success or failure) is recorded in `app.submissions` for audit and final scoring.
-- **Queueing:** All DML submissions across the whole system serialise through a single FIFO worker. When the queue is saturated, the submitter receives HTTP 503; on per-job timeout, HTTP 504. SELECT submissions don't queue at all.
+- **Queueing:** **Exam** DML submissions (and exam DML previews) serialise through a single FIFO worker. When the queue is saturated, the submitter receives HTTP 503; on per-job timeout, HTTP 504. SELECT submissions don't queue at all. **Practice submissions bypass the queue entirely** — practice DML runs directly against the category schema, relying on savepoint-rollback for isolation, so concurrent practice submissions are *not* serialised against one another.
 
 ---
 
