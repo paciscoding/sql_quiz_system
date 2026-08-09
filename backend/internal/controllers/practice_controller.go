@@ -82,18 +82,45 @@ func validateSeedFields(qType, dmlKind, seedSQL, correctSQL string) error {
 	return nil
 }
 
+// practiceValidator is the narrow slice of *services.ValidationService that the
+// practice handlers use (ARCH-061). It exists so the busy-schema branch is
+// testable with a fake that returns repository.ErrSchemaBusy directly, instead
+// of arranging real contention against a real database.
+// *services.ValidationService satisfies it, so cmd/main.go:153 is unchanged.
+type practiceValidator interface {
+	Validate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error)
+	ValidatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (models.ValidationResult, []map[string]interface{}, []string, int, bool, error)
+}
+
 type PracticeController struct {
 	repo      *repository.PostgresRepository
-	validator *services.ValidationService
+	validator practiceValidator
 	auth      *services.AuthService
 }
 
-func NewPracticeController(repo *repository.PostgresRepository, validator *services.ValidationService, auth *services.AuthService) *PracticeController {
+func NewPracticeController(repo *repository.PostgresRepository, validator practiceValidator, auth *services.AuthService) *PracticeController {
 	return &PracticeController{
 		repo:      repo,
 		validator: validator,
 		auth:      auth,
 	}
+}
+
+// abortIfSchemaBusy answers 503 when the engine shed this evaluation because
+// another one held the same schema (ARCH-059/060). It returns true when it has
+// written a response and the caller must return immediately.
+//
+// 503 and not 500: nothing ran, nothing is broken, and the request is
+// retriable. The body follows the question_not_ready shape used at :191.
+func (ctrl *PracticeController) abortIfSchemaBusy(c *gin.Context, err error) bool {
+	if !errors.Is(err, repository.ErrSchemaBusy) {
+		return false
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error":   "practice_busy",
+		"message": "Another submission for this category is being graded. Please try again.",
+	})
+	return true
 }
 
 // ListForStudent (GET /practice/questions)
@@ -204,6 +231,15 @@ func (ctrl *PracticeController) Submit(c *gin.Context) {
 	q := question.AsQuestion()
 	result, err := ctrl.validator.Validate(ctx, int(student.ID), *q, req.SQLText, schema)
 
+	// ARCH-061: this check MUST stay above the persistence below. Practice
+	// persists every attempt regardless of validation outcome, so a shed
+	// submission would otherwise be recorded as is_correct=false for SQL that
+	// never reached the database — corrupting the student's history for a
+	// request the server itself refused.
+	if ctrl.abortIfSchemaBusy(c, err) {
+		return
+	}
+
 	// Persist attempt regardless of validation outcome
 	attempt := models.PracticeAttempt{
 		StudentID:          student.ID,
@@ -266,6 +302,9 @@ func (ctrl *PracticeController) Preview(c *gin.Context) {
 
 	q := question.AsQuestion()
 	vResult, rows, columns, rowCount, truncated, err := ctrl.validator.ValidatePreview(ctx, int(student.ID), *q, req.SQLText, schema, previewSchema)
+	if ctrl.abortIfSchemaBusy(c, err) {
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
