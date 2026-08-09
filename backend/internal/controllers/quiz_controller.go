@@ -267,6 +267,15 @@ func (ctrl *QuizController) SubmitAnswer(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
+		// ARCH-059: the engine shed this evaluation because another one held the
+		// same execution schema. Must sit ABOVE the DeadlineExceeded arm and
+		// answer 503, not 504 — nothing ran, so nothing timed out, and the
+		// request is retriable.
+		if errors.Is(err, repository.ErrSchemaBusy) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "schema_busy",
+				"message": "Another submission is being graded against this data. Please try again."})
+			return
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "submission timed out"})
 			return
@@ -401,6 +410,15 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, services.ErrQueueFull) || errors.Is(err, services.ErrQueueShutdown) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		// ARCH-059: the engine shed this evaluation because another one held the
+		// same execution schema. Must sit ABOVE the DeadlineExceeded arm and
+		// answer 503, not 504 — nothing ran, so nothing timed out, and the
+		// request is retriable.
+		if errors.Is(err, repository.ErrSchemaBusy) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "schema_busy",
+				"message": "Another submission is being graded against this data. Please try again."})
 			return
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
