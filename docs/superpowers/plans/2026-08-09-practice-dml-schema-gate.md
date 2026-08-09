@@ -670,38 +670,61 @@ func TestSchemaGateEngine_QueryIsNotGated(t *testing.T) {
 }
 
 // TestSchemaGateEngine_PreviewKeysOnExecutionSchema pins the defect the
-// controller-level design would have shipped. EvaluatePreview runs DML against
-// previewSchema when a decoy exists (postgres_evaluation.go:389-397), so the
-// gate must key on that, not on sandboxSchema. Holding sandboxSchema's gate
-// must NOT block a preview that executes elsewhere.
+// controller-level design would have shipped, by calling EvaluatePreview for
+// real while the grading schema's gate is held.
+//
+// EvaluatePreview resolves its DML target as previewSchema when non-empty and
+// sandboxSchema only otherwise (postgres_evaluation.go:389-397), so both halves
+// must hold:
+//
+//	previewSchema == ""  → executes against sandboxSchema → MUST block
+//	previewSchema != ""  → executes elsewhere             → MUST NOT block
+//
+// The second half deliberately passes a schema that does not exist. The preview
+// will fail — that is fine and expected. What is being asserted is that it
+// fails *promptly* instead of waiting on a gate it should never have taken.
 func TestSchemaGateEngine_PreviewKeysOnExecutionSchema(t *testing.T) {
 	repo := openTestRepo(t)
+	ctx := context.Background()
 
-	// Hold the grading schema's gate.
-	release, err := repo.acquireDMLGate(context.Background(), "practice_cat_gate_grading")
+	catID, uid, schema := mkCaseBFixture(t, repo, ctx)
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
+
+	// The budget must stay comfortably ABOVE half 2's timeout below. If it were
+	// shorter, a wrongly-gated preview would be shed before the timeout fired
+	// and half 2 would pass while asserting nothing.
+	orig := schemaGateWaitBudget
+	schemaGateWaitBudget = 2 * time.Second
+	defer func() { schemaGateWaitBudget = orig }()
+
+	q := caseBQuestions(uid)[0]
+
+	// Hold the grading schema's gate for the rest of the test.
+	release, err := repo.acquireDMLGate(ctx, schema)
 	if err != nil {
 		t.Fatalf("acquireDMLGate: %v", err)
 	}
 	defer release()
 
-	// A preview that executes against a different (decoy) schema must be free.
-	done := make(chan error, 1)
+	// Half 1: no decoy — the preview executes against `schema`, so it must be
+	// gated, and with the budget shortened it is shed as ErrSchemaBusy.
+	if _, err := repo.EvaluatePreview(ctx, 1000, q, q.CorrectSQL, schema, ""); !errors.Is(err, ErrSchemaBusy) {
+		t.Fatalf("a preview executing against the held schema was not gated: err=%v", err)
+	}
+
+	// Half 2: a decoy target — the preview executes elsewhere, so it must not
+	// wait on this schema's gate. Any error is acceptable; blocking is not.
+	done := make(chan struct{})
 	go func() {
-		rel, err := repo.acquireDMLGate(context.Background(), "practice_cat_gate_decoy")
-		if err == nil {
-			rel()
-		}
-		done <- err
+		_, _ = repo.EvaluatePreview(ctx, 1000, q, q.CorrectSQL, schema, "gate_nonexistent_decoy")
+		close(done)
 	}()
 
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("decoy-schema acquire failed: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the decoy schema blocked behind the grading schema's gate — " +
-			"the key is not the execution schema")
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a preview targeting a different schema blocked on the grading " +
+			"schema's gate — the key is sandboxSchema, not the execution schema")
 	}
 }
 
