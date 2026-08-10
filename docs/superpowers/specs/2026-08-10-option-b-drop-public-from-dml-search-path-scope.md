@@ -137,3 +137,65 @@ well-bounded code change sitting behind a genuinely load-bearing audit — the
 risk is entirely in existing data, not in the four lines. Do not start it
 without a database that has real practice categories and exams on it, or the
 verification will be as vacuous as option A's was.
+
+## Corrections (2026-08-10, added after implementation and review)
+
+This section is appended, not merged into the body above. The body is what
+was reviewed before the branch started and is kept intact as that record;
+these are the three claims in it that turned out to be wrong, established by
+reading the code before planning the actual change
+(`docs/superpowers/plans/2026-08-10-option-b-drop-public-from-dml-search-path.md`,
+recorded in `.superpowers/sdd/progress.md`).
+
+1. **`target_table` was never in the blast radius.** The "What actually
+   breaks" section above, and proposed task 2's failing test, both treat
+   `target_table` as something this change could newly refuse. It cannot:
+   `ResolveTargetTable` (`postgres_target_table.go:54-62`) resolves the
+   lecturer's raw table name against `pg_class` **in the question's own
+   schema only**, and both capture paths call it **before** capture runs
+   (`postgres_practice.go:394`, `postgres_questions.go:94`). A target that
+   exists only in `public` is already refused today, independent of this
+   branch — that refusal is the pre-existing `target_table` case-bug fix, not
+   this change.
+
+2. **The real residual is non-target tables**, not `target_table`: unqualified
+   references inside `correct_sql` — `JOIN`/`FROM`/subquery targets — and
+   unqualified `INSERT` targets inside `seed_sql`. Nothing pre-resolves those
+   the way `ResolveTargetTable` pre-resolves the target, so they were the only
+   things this change actually needed to close. The proposed audit sketch
+   above ("resolve `target_table` … and any unqualified table named in
+   `correct_sql` / `seed_sql`") already accounted for this correctly for
+   `correct_sql`/`seed_sql`; the correction is that `target_table` did not
+   need to be in that sketch at all.
+
+3. **Evidence item 5 reached the right conclusion by the wrong route.** It
+   claims `evaluateDML` calls none of `postgres_core.go`'s
+   `queryWithTx`/`queryWithTxCols`, "verified: no `queryWithTx` reference in
+   `postgres_evaluation.go`". That verification method was too narrow: the
+   **capture sites** (`captureExpectedResult` and its practice equivalent) DO
+   call `queryWithTxCols`, which re-sets `search_path` to `<schema>, public`
+   after `evaluateDML`'s own narrower `SET LOCAL search_path` has already run
+   earlier in the same transaction. `postgres_core.go` is genuinely on a DML
+   capture path — the claim that it is "NOT on this path" is false as
+   written. The conclusion (leave `postgres_core.go` alone) is still correct,
+   but for a different reason: the *only* DML statement capture ever routes
+   through `queryWithTxCols` is the post-image `SELECT * FROM target_table`
+   after the lecturer's own SQL has already run, and finding 1 above
+   guarantees `target_table` already resolves in the owning schema — so the
+   re-widened `search_path` on that one `SELECT` never has an unqualified name
+   left for `public` to catch. Safe by construction, not by absence of the
+   call.
+
+**The proposed concurrency test in task 2 above no longer describes real
+behaviour.** It suggested asserting that two categories with unqualified
+seeds hitting one shared `public` table "both grade success" — i.e. that the
+schema gate alone was insufficient to stop the deadlock, so both would
+proceed to grade (successfully) against the shared table with no mutual
+exclusion at all. After this change, an unqualified seed naming a table
+absent from its own category schema fails to resolve — there is no shared
+table left to reach through `search_path`, so the seed errors at capture or
+replay instead of executing. The test that shipped
+(`postgres_public_fallback_test.go`, added in `9113c24`/`df57eef`/`2fd72cf`)
+asserts the opposite of the original proposal: that the reverted (buggy)
+`, public` path lets the shared table be reached, and the fixed path refuses
+it — a revert-check, not a "both succeed" concurrency assertion.

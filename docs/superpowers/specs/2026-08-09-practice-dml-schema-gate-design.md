@@ -426,27 +426,54 @@ package.
   in that same pre-flight, turning a per-student grade failure into one
   lecturer-facing activation error while it can still be fixed.
 
-- **Cross-schema seeds — the *unqualified* half is still OPEN, and it is the
-  more likely one in practice.** A lecturer writes `INSERT INTO employee …`,
-  not `INSERT INTO public.employee …`. If that bare name does not exist in the
-  question's own schema it falls through `search_path` to `public`, takes locks
-  on a shared table, and produces `40P01` in exactly the original shape — the
-  gate keys on the execution schema and cannot see it. The refusal above does
-  not touch this case and must never be described as if it did.
+- **Cross-schema seeds — the *unqualified* half is CLOSED 2026-08-10**, on
+  branch `fix/dml-public-fallback` (`9113c24`, tests hardened by `df57eef`,
+  `2fd72cf`). The hazard and the reasoning for why the gate above could never
+  have covered it — kept in full immediately below — are still what justify
+  this design's choice to key the gate on the execution schema: the gate
+  serialises access *within* a schema, and this hazard's lock was always taken
+  on a table in *another* schema, which no per-schema gate can see regardless
+  of how it is implemented.
 
-  Closing it means removing `public` from the DML `search_path` at
-  `postgres_evaluation.go:301` and `postgres_evaluation.go:597`, and at the two
-  capture sites that must move with them — `postgres_questions.go:129` and
-  `postgres_practice.go:461`. All four have to change together: leave the
-  capture sites on the wider path and a question captures green against
-  `public` and then fails at grade time, which is the failure mode this whole
-  design exists to stop. Deliberately out of scope for the
-  `fix/seed-schema-qualification` branch.
+  A lecturer writes `INSERT INTO employee …`, not `INSERT INTO
+  public.employee …`. If that bare name does not exist in the question's own
+  schema it falls through `search_path` to `public`, takes locks on a shared
+  table, and produces `40P01` in exactly the original shape — the gate keys on
+  the execution schema and cannot see it. The schema-qualified refusal above
+  never touched this case.
 
-  This is not only a cross-*category* hazard. Within one practice category,
-  submit gates on `practice_cat_N` while preview gates on
+  Closed by removing `public` from the DML `search_path` at
+  `postgres_evaluation.go:308` (`evaluateDML`) and `postgres_evaluation.go:604`
+  (`evaluateDMLPreview`), and at the two capture sites that had to move with
+  them — `postgres_questions.go:129` and `postgres_practice.go:499` — all four
+  in one commit: leaving the capture sites on the wider path would have let a
+  question capture green against `public` and then fail at grade time, which
+  is the failure mode this whole design exists to stop.
+  `postgres_core.go`'s `queryWithTx`/`queryWithTxCols` deliberately keep their
+  `, public` element — the only DML path reaching them is the post-image
+  `SELECT` on `target_table`, already resolved against the question's own
+  schema by `ResolveTargetTable` *before* capture runs, so it never depended
+  on the fallback.
+
+  This was not only a cross-*category* hazard. Within one practice category,
+  submit gated on `practice_cat_N` while preview gated on
   `practice_cat_N_preview`, so a seed touching an unqualified table that
-  resolves to `public` is ungated between those two.
+  resolved to `public` was ungated between those two. That gap closes as a
+  side effect: neither schema can reach a shared `public` table through
+  `search_path` anymore, so there is nothing left for the two to disagree
+  about.
+
+  **Audit before trusting this on a database with real lecturer content.**
+  `scripts/audit_public_fallback_questions.sql` (read-only) resolves, per
+  category/exam, every DML question whose `target_table` is absent from its
+  own schema but present in `public`. The pre-ship run reported all four
+  counts zero, but that was against the local docker-compose stack, which has
+  no practice categories and no exams — it proved the feature unused there,
+  not the change safe. Re-run it wherever real lecturer content lives before
+  trusting a zero. **No automatic re-capture**: a question captured before
+  this change keeps its stored capture and fails at grade time until a
+  lecturer re-saves it — deliberate, since auto re-capture would run lecturer
+  SQL unattended at deploy time.
 - **Serialisation is now strict.** DML per execution schema goes from
   concurrent-with-lock-contention to strictly one-at-a-time. Under a full class
   submitting simultaneously this changes latency in a direction that has not

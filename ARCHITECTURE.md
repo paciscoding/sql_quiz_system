@@ -181,7 +181,7 @@ The `exam_student_readonly` role has only `USAGE` on `public` and `SELECT` on it
 
 #### DML path — shared sandbox + global FIFO submission queue
 1. Submit the evaluation closure to the global FIFO submission queue (single worker, channel depth 256, 30 s per-job timeout). The queue admits one DML evaluation closure at a time.
-2. (On a pool connection acquired inside the evaluation closure) `BEGIN`; `SAVEPOINT student_eval`; `SET LOCAL search_path = sandbox_exam_{examID}, public`; `SET LOCAL ROLE exam_student`.
+2. (On a pool connection acquired inside the evaluation closure) `BEGIN`; `SAVEPOINT student_eval`; `SET LOCAL search_path = sandbox_exam_{examID}, pg_temp`; `SET LOCAL ROLE exam_student`.
 3. Execute the student's SQL.
 4. `SELECT * FROM target_table` (still inside the savepoint) and serialise to canonical JSON.
 5. `ROLLBACK TO SAVEPOINT student_eval` — sandbox state is restored for the next job in the queue.
@@ -217,7 +217,7 @@ Phase 2 compares the student's result-set against `app.questions.expected_result
 ### 2. DML Validation (Insert / Update / Delete)
 Phase 2 evaluates DML inside the shared per-exam sandbox, serialised by the global in-process FIFO submission queue:
 1. Submit the evaluation closure to the global FIFO submission queue (single worker, capacity 256, 30 s per-job timeout).
-2. On a pool connection: `BEGIN; SAVEPOINT student_eval; SET LOCAL ROLE exam_student; SET LOCAL search_path = sandbox_exam_{examID}, public`.
+2. On a pool connection: `BEGIN; SAVEPOINT student_eval; SET LOCAL ROLE exam_student; SET LOCAL search_path = sandbox_exam_{examID}, pg_temp`.
 3. Run student SQL.
 4. `SELECT * FROM target_table` to capture post-state.
 5. Compare the two post-images as a **multiset of rows under key-aware equality** (`decideDMLStatus` → `diffRowMultiset`) against `app.questions.expected_result`. DML forces all three strictness dimensions regardless of the stored flags: ordering is never graded, the `column_order` gate never applies, and attribute comparison is always key-aware.
@@ -271,7 +271,7 @@ Every evaluation path (`evaluateQuery`, `evaluateDML`, `evaluateDMLPreview`) tak
 
 ### 1. Security & Sandboxing
 *   **Q: How does the system prevent destructive SQL (e.g., `DROP TABLE`, `TRUNCATE`) on the DML path?**
-    *   **A:** Three layers of defense. (a) `exam_student` PG role has only CRUD privileges on the exam sandbox schema; DDL is denied. (b) Phase 2 runs inside a savepoint that is unconditionally rolled back, so even if a destructive statement somehow ran, it would be reverted. (c) `search_path` is scoped to `sandbox_exam_{examID}` + `public`, so unqualified writes can't reach `app.*`.
+    *   **A:** Three layers of defense. (a) `exam_student` PG role has only CRUD privileges on the exam sandbox schema; DDL is denied. (b) Phase 2 runs inside a savepoint that is unconditionally rolled back, so even if a destructive statement somehow ran, it would be reverted. (c) `search_path` is scoped to `sandbox_exam_{examID}` (plus `pg_temp`, named last — no `public` fallback since `fix/dml-public-fallback`, 2026-08-10), so unqualified writes can't reach `app.*` or another category's sandbox.
 *   **Q: How is the SELECT path kept safe given that data-modifying CTEs are legal Postgres?**
     *   **A:** The SELECT path runs under `exam_student_readonly`, which holds only `USAGE` on `public` and `SELECT` on its tables. The underlying `INSERT` / `UPDATE` / `DELETE` inside any data-modifying CTE fails on permissions; the parser doesn't need to inspect the SQL. No clone is required because nothing can mutate.
 *   **Q: Are the restricted roles created at startup?**
@@ -290,7 +290,7 @@ Every evaluation path (`evaluateQuery`, `evaluateDML`, `evaluateDMLPreview`) tak
 *   **Q: Where does the password for those LOGIN roles come from?**
     *   **A:** Generated fresh at every boot (`crypto/rand`, hex-encoded), never logged and never written to disk. One password shared by all four is safe because the boundary is *which role you authenticate as*, not the secret — and the `db` compose service publishes no port, so 5432 is reachable only on the compose network. Hex is deliberate: `CREATE`/`ALTER ROLE` cannot take a bind parameter, and a hex alphabet contains no quote, backslash or dollar sign to escape. **Open constraint:** boot provisioning needs the app connection to hold `CREATEROLE`, which `scripts/deprivilege_app_db_user.sql` deliberately removes. Applying that script without first moving the four roles out of band would make startup `log.Fatal`.
 *   **Q: Can a student shadow the DML target table with a temp table (ARCH-023)?**
-    *   **A:** No. `pg_temp` is named **last** in the evaluator's `SET LOCAL search_path TO <schema>, public, pg_temp`. Postgres searches `pg_temp` before everything else *unless* it is listed explicitly, in which case it is searched in the position given — so naming it last stops a `CREATE TEMP TABLE <target_table> AS SELECT …` from shadowing the real table for the post-image capture. Covered by `TestPgTempForgery_TargetTableShadowing_Rejected`.
+    *   **A:** No. `pg_temp` is named **last** in the evaluator's `SET LOCAL search_path TO <schema>, pg_temp` (the `public` element was dropped by `fix/dml-public-fallback`, 2026-08-10 — see *Practice Evaluation Concurrency* below). Postgres searches `pg_temp` before everything else *unless* it is listed explicitly, in which case it is searched in the position given — so naming it last stops a `CREATE TEMP TABLE <target_table> AS SELECT …` from shadowing the real table for the post-image capture. Covered by `TestPgTempForgery_TargetTableShadowing_Rejected`.
 *   **Q: Are database ids exposed to clients?**
     *   **A:** No. `internal/publicid` (Sqids, alphabet shuffled from `ID_SALT`) encodes per-entity opaque tokens for users, exams, categories, exam categories, practice questions, images, submissions and attempts; `internal/models/ids.go` wires the codec into JSON marshal/unmarshal so handlers keep working with plain `int`. `main.go` calls `publicid.Init` first and `log.Fatal`s on an empty/invalid salt rather than silently using the predictable alphabet. **Exam question ids stay plain integers** (`Question.ID int`) — that namespace is deliberately readable.
 
@@ -352,7 +352,7 @@ Each DML practice submission is executed within a transaction using the followin
 1. `BEGIN;`
 2. Take the shared per-schema advisory lock (`acquireSchemaEvalLock`).
 3. `SAVEPOINT student_eval;`
-4. `SET LOCAL search_path = practice_cat_{categoryID}, public;`
+4. `SET LOCAL search_path = practice_cat_{categoryID}, pg_temp;` (no `public` fallback, since `fix/dml-public-fallback`, 2026-08-10 — an unqualified name absent from the category's own schema now fails instead of silently resolving to a table shared by every category)
 5. `SET LOCAL ROLE exam_student;`
 6. Execute student SQL.
 7. `SELECT * FROM target_table;` (capture post-state for validation).

@@ -1,5 +1,64 @@
 # CHANGELOG.md
 
+## [2026-08-10] DML search_path drops the public fallback (branch `fix/dml-public-fallback`)
+
+**Behaviour change for lecturers, not an internal-only fix: a DML question whose SQL relies on an unqualified table name that only exists in `public` may now fail — at save/capture time if re-saved, or at grade time if not.** Read "Before deploying" below before rolling this out to a database that holds real lecturer content.
+
+### Fixed
+- DML capture and grading no longer resolve unqualified table names through
+  `public`. A lecturer's SQL that named a table absent from its own category
+  schema previously fell through to a table shared by every category — a
+  silent cross-category read or write, and a lock the per-schema DML gate
+  (ARCH-058…061) cannot see, so two categories grading concurrently could
+  deadlock (`SQLSTATE 40P01`) and the failure was reported to the student
+  instead of the lecturer. `, public` is dropped from `search_path` at all
+  five sites that must agree on name resolution: both evaluation sites
+  (`postgres_evaluation.go:308` `evaluateDML`, `:604` `evaluateDMLPreview`),
+  both capture sites (`postgres_questions.go:129` exam capture,
+  `postgres_practice.go:499` practice capture), and the concurrency test's
+  hand-replicated eval transaction (`postgres_practice_concurrent_dml_test.go`)
+  — moved together in one commit so a question can no longer capture green
+  against `public` and then fail at grade time. `pg_temp` stays named last at
+  the two evaluation sites (ARCH-023); the two capture sites have no
+  `pg_temp` and gained none. `postgres_core.go`'s `queryWithTx`/
+  `queryWithTxCols` deliberately keep their `, public` element: the only DML
+  path reaching them is the post-image `SELECT` on `target_table`, which
+  `ResolveTargetTable` has already resolved against the question's own
+  schema *before* capture runs, so it never needed the fallback in the first
+  place. (Commits `4570931`, `e5a9462` — audit script; `9113c24`, `df57eef`,
+  `2fd72cf` — the five-site change and its tests.)
+
+### Added
+- `scripts/audit_public_fallback_questions.sql` — a **read-only** catalog
+  report (`BEGIN; SET TRANSACTION READ ONLY`) that resolves, per practice
+  category and per exam, every DML question whose `target_table` is absent
+  from its own execution schema but present in `public`, plus totals
+  (`practice_dml_total`, `exam_dml_total`, `practice_categories_affected`,
+  `exams_affected`). Run it with
+  `psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql`.
+
+### Before deploying
+**Run the audit script against your own database first**, not just trust this note:
+`psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql`.
+Non-zero `practice_categories_affected` / `exams_affected` means some DML
+questions may reference a table they only ever reached through `public`;
+those questions will fail at grade time after this deploys, until a
+lecturer re-saves them (re-saving re-runs capture under the corrected
+resolution, which either succeeds against the question's own schema or
+surfaces the problem to the lecturer instead of the student). **There is
+no automatic re-capture** — that is a deliberate decision, not an
+oversight: auto re-capture would run arbitrary lecturer SQL unattended at
+deploy time. The audit output is a worklist a human must work through, not
+something the deploy can resolve on its own.
+
+**The audit run during development reported all four counts zero — this
+is NOT evidence the change is safe.** It was run against the local
+`docker-compose` stack, which holds only the `app` and `public` schemas:
+no practice categories and no exams exist there at all. The gate proved
+the feature *unused* on that database, not the change *safe*. Re-run it
+on every database that holds real lecturer content before trusting a zero
+there.
+
 ## [2026-08-10] Seed SQL may no longer name another schema (branch `fix/seed-schema-qualification`)
 
 **Behaviour change for lecturers, not an internal-only fix: a seed that saved yesterday may be refused today — on save AND at grade time.** Read the "Before you deploy" note below before rolling this out to a database that holds real lecturer seeds.

@@ -126,17 +126,30 @@ not equally settled:
   (double-quoted schema name) is still accepted and would execute. The other
   two — a non-ASCII dollar-quote tag, and `E'…\'…'` backslash escapes — degrade
   to a lecturer-visible error rather than a silent write.
-- *Unqualified targets: STILL OPEN*, and the more likely case in practice — a
-  lecturer writes `INSERT INTO employee …`. `search_path` still carries
-  `public` (`postgres_evaluation.go:301`, `:597`), so a bare name missing from
-  the question's own schema falls through to a shared table and deadlocks in
-  the original shape. Closing it means dropping `public` from those two sites
-  *and* from the two capture sites (`postgres_questions.go:129`,
-  `postgres_practice.go:461`) in one move, or a question captures green and
-  fails at grade time. Still includes the submit-vs-preview gap inside one
-  category: submit gates on `practice_cat_N`, preview on
-  `practice_cat_N_preview`, so an unqualified name resolving to `public` is
-  ungated between them.
+- *Unqualified targets: CLOSED 2026-08-10* on branch `fix/dml-public-fallback`
+  (`9113c24`, tests hardened by `df57eef`, `2fd72cf`). `, public` is dropped
+  from the DML `search_path` at both evaluation sites
+  (`postgres_evaluation.go:308` `evaluateDML`, `:604` `evaluateDMLPreview`)
+  and both capture sites (`postgres_questions.go:129`,
+  `postgres_practice.go:499`), moved together in one commit — exactly the
+  "in one move" bound this bullet used to describe, so a question can no
+  longer capture green against `public` and then fail at grade time. The
+  submit-vs-preview gap this bullet used to flag closes as a side effect:
+  `practice_cat_N` and `practice_cat_N_preview` can no longer reach a shared
+  `public` table through `search_path` at all, so there is nothing left for
+  the two to disagree about.
+
+  **Audit before trusting this on a database with real lecturer content.**
+  `scripts/audit_public_fallback_questions.sql` (read-only) resolves, per
+  category/exam, every DML question whose `target_table` is absent from its
+  own schema but present in `public`. The pre-ship run reported all four
+  counts zero, but against the local docker-compose stack, which has no
+  practice categories and no exams — that proved the feature unused there,
+  not the change safe. Re-run it wherever real lecturer content lives. **No
+  automatic re-capture**: a question captured before this change keeps its
+  stored capture and fails at grade time until a lecturer re-saves it —
+  deliberate, since auto re-capture would run lecturer SQL unattended at
+  deploy time.
 
 Practice *serial* isolation was already well covered
 (`postgres_seedsql_isolation_test.go:119`,
