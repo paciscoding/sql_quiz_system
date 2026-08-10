@@ -288,14 +288,14 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 // counterweight to TestValidateSeedSQL_RefusesSchemaQualifiedNames, pinning
 // those two forms as data.
 //
-// The doubled-'' case does NOT pin the '' branch of stripSQLLiterals, and is
+// The doubled-” case does NOT pin the ” branch of stripSQLLiterals, and is
 // kept only as a shape guard on the pipeline. Deleting that branch leaves this
 // test green, because the escape is parity-neutral: a naive close-then-reopen
 // ends the literal on the first quote and starts a new one on the second, so
 // the set of bytes left OUTSIDE literals is identical either way and only the
 // number of blanking spaces differs. A brute-force search over token sequences
 // built from ', ", $$, $q$, ;, a schema-qualified name and filler — every input
-// containing '' that checkSeedQuotesBalanced accepts — found no input whose
+// containing ” that checkSeedQuotesBalanced accepts — found no input whose
 // accept/refuse outcome changes. The branch stays in the implementation because
 // it matches PostgreSQL semantics and the sibling scanner
 // checkSeedQuotesBalanced; it is simply not test-pinned, and no test here
