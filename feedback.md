@@ -14,6 +14,39 @@ audit-pass corrections above described practice as deliberately unserialised,
 which the fix made false. OPEN-8 is CLOSED on the same branch. OPEN-2 … OPEN-7
 and OPEN-9 are still open.
 
+## Before deploying to the server
+
+`main` is at `8544293`. Full detail lives in `CHANGELOG.md`'s two "Before
+deploying" / "Before you deploy" sections — this is the short version for
+whoever is standing at the server about to pull the image.
+
+1. **Run both audits against the real prod DB first, not just this note.**
+   Both were only proven against the local docker-compose stack, which has
+   zero lecturer content — that proved the feature *unused* there, not the
+   change *safe* on real data.
+   ```
+   psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql
+   psql "$DATABASE_URL" -f scripts/audit_seed_sql_qualified_names.sql
+   ```
+2. **Read the non-zero rows before acting.** A reported name/row is something
+   that *could* be reached, not a confirmed broken question — confirm by hand.
+   Full per-count meaning (save-time vs. grade-time vs. preview-time) is in
+   `CHANGELOG.md`'s "Before deploying" section under the `fix/dml-public-fallback`
+   entry.
+3. **Back up the DB before pulling.** This changes grading behaviour on
+   already-captured questions; the backup is the rollback path if the audits
+   missed something on real data.
+4. **Confirm the image is actually built from `main` past `8544293`** — check
+   the git SHA the image was built from, not just the tag name.
+5. **After deploy: work the audit's non-zero list.** There is **no automatic
+   re-capture** — a question flagged by either audit keeps failing (at save
+   time, grade time, or both) until a lecturer opens and re-saves it. The
+   audit output is a worklist, not something the deploy resolves on its own.
+
+Unrelated to this change but boot-fatal, worth checking while you're in prod
+`.env` anyway: `ID_SALT` must be set and non-empty or the backend
+`log.Fatal`s on startup.
+
 ## Verdict on the four claims
 
 | Claim | Verdict | Note |
@@ -127,7 +160,10 @@ not equally settled:
   two — a non-ASCII dollar-quote tag, and `E'…\'…'` backslash escapes — degrade
   to a lecturer-visible error rather than a silent write.
 - *Unqualified targets: CLOSED 2026-08-10* on branch `fix/dml-public-fallback`
-  (`9113c24`, tests hardened by `df57eef`, `2fd72cf`). `, public` is dropped
+  (`9113c24`, tests hardened by `df57eef`, `2fd72cf`; the audit script itself
+  hardened by three further rounds — `33cd4ad` (exam grading/capture schema
+  coverage), `71e154a` (preview decoys, `pg_proc`/`pg_type`), `8544293` (bounded
+  claim corrections) — merged to `main` as `8544293`). `, public` is dropped
   from the DML `search_path` at both evaluation sites
   (`postgres_evaluation.go:308` `evaluateDML`, `:604` `evaluateDMLPreview`)
   and both capture sites (`postgres_questions.go:129`,
