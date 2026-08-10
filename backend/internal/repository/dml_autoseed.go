@@ -1112,10 +1112,11 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 	// would fall through to a 500.
 	//
 	// The remedy names the question's OWN schema on purpose. Replay runs under
-	// `search_path = <question schema>, public, pg_temp`, so advising a bare
-	// "unqualified name" would send a lecturer whose table is missing from their
-	// own schema straight into public — the very cross-schema write being
-	// refused here.
+	// `search_path = <question schema>, pg_temp` (ARCH-062: no `, public`), so
+	// a bare unqualified name whose table is missing from the question's own
+	// schema simply fails to resolve rather than silently landing in public —
+	// advising "unqualified" alone, without naming the schema, would leave the
+	// lecturer guessing which schema the name needs to exist in.
 	if m := schemaQualifiedNameRe.FindStringSubmatch(stripSQLLiterals(cleaned)); m != nil {
 		return nil, refusef(
 			"the seed SQL references the %q schema; use an unqualified table name that exists in the question's own schema instead, because a schema-qualified write to a shared table can deadlock against another category being graded at the same time",

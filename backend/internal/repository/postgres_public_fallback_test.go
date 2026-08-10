@@ -121,6 +121,7 @@ func TestPracticeCapture_NoPublicFallback_ForJoinedTable(t *testing.T) {
 	ctx := context.Background()
 
 	catID, uid := mkPracticeCategory(t, repo, ctx, "pubfall")
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
 	emp := uniqueUsername("pubfall_emp")
 	if err := repo.ImportSchemaIntoCategory(ctx, catID, fmt.Sprintf(
 		`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT, label TEXT);
@@ -162,9 +163,14 @@ func TestPracticeCapture_NoPublicFallback_ForJoinedTable(t *testing.T) {
 	}
 }
 
-// TestPracticeCapture_NoPublicFallback_LeavesSharedTableUntouched pins the
-// seed-SQL path (applyQuestionSeed / postgres_practice.go:461), a second and
-// independent site from the correct_sql join covered above.
+// TestPracticeCapture_NoPublicFallback_ForSeedTarget pins the seed-SQL path
+// (applyQuestionSeed / postgres_practice.go:461), a second and independent
+// site from the correct_sql join covered above.
+//
+// Named _ForSeedTarget (not _LeavesSharedTableUntouched, its former name):
+// the row-count check at the bottom is a secondary, non-discriminating
+// belt-and-braces assertion (see below) — the actual pin is the capture
+// status, same as the test above.
 //
 // DEVIATION FROM THE BRIEF, discovered at the red step: the brief's version
 // of this test asserted only the public-table row count and expected it to
@@ -186,11 +192,12 @@ func TestPracticeCapture_NoPublicFallback_ForJoinedTable(t *testing.T) {
 // seed-refusal message. The row-count assertion is kept as a secondary,
 // intentionally non-discriminating regression check: it must stay true
 // (capture must never leave a write behind) independent of this fix.
-func TestPracticeCapture_NoPublicFallback_LeavesSharedTableUntouched(t *testing.T) {
+func TestPracticeCapture_NoPublicFallback_ForSeedTarget(t *testing.T) {
 	repo := openTestRepo(t)
 	ctx := context.Background()
 
 	catID, uid := mkPracticeCategory(t, repo, ctx, "pubwrite")
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
 	emp := uniqueUsername("pubwrite_emp")
 	if err := repo.ImportSchemaIntoCategory(ctx, catID, fmt.Sprintf(
 		`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT);
@@ -227,8 +234,10 @@ func TestPracticeCapture_NoPublicFallback_LeavesSharedTableUntouched(t *testing.
 		t.Errorf("capture_error should name the unresolvable relation, got: %q", saved.CaptureError)
 	}
 
-	// Secondary, non-discriminating invariant (see doc comment above): capture
-	// is a dry run and must never leave a write behind, fix or no fix.
+	// Belt-and-braces only — this is NOT the discriminating assertion (the
+	// capture-status check above is). Capture is a dry run and must never
+	// leave a write behind, fix or no fix, so this must hold regardless of
+	// whether the public fallback is present.
 	var n int
 	if err := repo.pool.QueryRow(ctx,
 		fmt.Sprintf("SELECT count(*) FROM public.%s", shared)).Scan(&n); err != nil {
@@ -277,5 +286,164 @@ func TestExamCapture_PublicCurriculumSchema_StillWorks(t *testing.T) {
 	if got.ExpectedResultStatus != "captured" {
 		t.Fatalf("legacy exam on public curriculum schema must still capture; got %q (%s)",
 			got.ExpectedResultStatus, got.CaptureError)
+	}
+}
+
+// TestPracticeGrading_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable pins
+// the GRADING site (postgres_evaluation.go:308, evaluateDML). It is the
+// discriminating counterpart to TestPracticeCapture_NoPublicFallback_ForJoinedTable
+// above: capture already pinned its own site, but nothing previously exercised
+// grading, so restoring `, public` at the grading site alone (while capture
+// stayed fixed) would reopen the cross-category read/write and the
+// gate-invisible deadlock with CI fully green.
+//
+// Drives a real grading transaction through repo.Evaluate — the same
+// production entry point exercised by TestPracticeConcurrentDML_CaseB_*
+// (postgres_practice_concurrent_dml_test.go), which is the closest existing
+// model for this in the package. A student submits the model answer,
+// unqualified, against a table that exists ONLY in public. Before ARCH-062
+// that resolved through the fallback and graded normally; after it, the
+// grading transaction must fail to resolve the relation rather than reading
+// or writing a table shared by every category.
+//
+// Revert check (recorded in task-2-report.md): this test was run once with
+// `, public` temporarily restored at postgres_evaluation.go:308 — it FAILED
+// (res.Status came back "success" instead of "error"). With the fix in place
+// (no `, public`), it PASSES.
+func TestPracticeGrading_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	catID, uid := mkPracticeCategory(t, repo, ctx, "pubgrade")
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
+
+	emp := uniqueUsername("pubgrade_emp")
+	if err := repo.ImportSchemaIntoCategory(ctx, catID, fmt.Sprintf(
+		`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT, label TEXT);
+		 INSERT INTO %s (id, name) VALUES (1, 'Alice');`, emp, emp), uid, false); err != nil {
+		t.Fatalf("ImportSchemaIntoCategory: %v", err)
+	}
+	shared := mkPublicOnlyTable(t, repo, ctx, "pubgrade_shared")
+	// mkPublicOnlyTable creates the table as the superuser app pool, with no
+	// grants to exam_student. Without this GRANT, a search_path fallback that
+	// DID resolve the name would still fail — with "permission denied", not
+	// "does not exist" — which would make this test pass in both the fixed
+	// and reverted states for the wrong reason (a real production public
+	// table, unlike this fixture, predates the category-schema split and
+	// already carries exam_student grants from when it lived directly in
+	// public). Granting here isolates the assertion to name resolution alone.
+	if _, err := repo.pool.Exec(ctx,
+		fmt.Sprintf("GRANT SELECT, UPDATE ON public.%s TO exam_student", shared)); err != nil {
+		t.Fatalf("grant on public.%s: %v", shared, err)
+	}
+
+	schema, err := repo.GetPracticeCategorySchema(ctx, catID)
+	if err != nil {
+		t.Fatalf("GetPracticeCategorySchema: %v", err)
+	}
+
+	studentSQL := fmt.Sprintf(
+		"UPDATE %s SET label = s.label FROM %s s WHERE s.id = %s.id", emp, shared, emp)
+
+	q := models.Question{
+		ID:          1,
+		Type:        "DML",
+		DMLKind:     "UPDATE",
+		TargetTable: emp,
+		CorrectSQL:  studentSQL,
+		CreatedBy:   models.UserID(uid),
+		Points:      1,
+	}
+
+	res, evalErr := repo.Evaluate(ctx, 4000, q, studentSQL, schema)
+	if evalErr != nil {
+		t.Fatalf("Evaluate returned an unexpected Go error: %v", evalErr)
+	}
+	if res.Status != "error" {
+		t.Fatalf("expected grading to FAIL because %q resolves only in public; got status %q, feedback %q. "+
+			"The public fallback is still present in the grading search_path.", shared, res.Status, res.Feedback)
+	}
+
+	// Belt-and-braces: the grading transaction is always rolled back
+	// regardless of this fix, so the shared table must be untouched either
+	// way. Not the discriminating assertion — the status check above is.
+	var n int
+	if err := repo.pool.QueryRow(ctx,
+		fmt.Sprintf("SELECT count(*) FROM public.%s", shared)).Scan(&n); err != nil {
+		t.Fatalf("count public.%s: %v", shared, err)
+	}
+	if n != 1 {
+		t.Fatalf("grading reached public.%s: row count %d, want 1", shared, n)
+	}
+}
+
+// TestExamCapture_NonPublicCurriculumSchema_RejectsUnqualifiedPublicOnlyTable
+// pins the EXAM-CAPTURE site (postgres_questions.go:129, CreateQuestion) with
+// a NON-public curriculum schema.
+//
+// TestExamCapture_PublicCurriculumSchema_StillWorks above drives
+// captureSchema = "public", where `TO "public"` and `TO "public", public`
+// are identical — it pins nothing about this site. This test exercises the
+// mkExamWithCurriculumSchema curriculumSchema != "" branch (previously
+// unused) so captureSchema is a real, distinct schema, which is the only way
+// `, public` in the search_path is observable at all.
+//
+// Revert check (recorded in task-2-report.md): this test was run once with
+// `, public` temporarily restored at postgres_questions.go:129 — it FAILED
+// (capture status came back "captured" instead of "failed"). With the fix in
+// place, it PASSES.
+func TestExamCapture_NonPublicCurriculumSchema_RejectsUnqualifiedPublicOnlyTable(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	curriculumSchema := uniqueUsername("examcurric")
+	if _, err := repo.pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s", curriculumSchema)); err != nil {
+		t.Fatalf("create curriculum schema: %v", err)
+	}
+	defer func() {
+		_, _ = repo.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", curriculumSchema))
+	}()
+
+	emp := uniqueUsername("examcurric_emp")
+	if _, err := repo.pool.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE %s.%s (id INT PRIMARY KEY, name TEXT, label TEXT);
+		 INSERT INTO %s.%s (id, name) VALUES (1, 'Alice');`,
+		curriculumSchema, emp, curriculumSchema, emp)); err != nil {
+		t.Fatalf("create curriculum table: %v", err)
+	}
+
+	shared := mkPublicOnlyTable(t, repo, ctx, "examcurric_shared")
+
+	examID, uid := mkExamWithCurriculumSchema(t, repo, ctx, "nonpublic", curriculumSchema)
+
+	eid := models.ExamID(examID)
+	qid, err := repo.CreateQuestion(ctx, models.Question{
+		ExamID:      &eid,
+		CreatedBy:   models.UserID(uid),
+		Type:        "DML",
+		TargetTable: emp,
+		CorrectSQL: fmt.Sprintf(
+			"UPDATE %s SET label = s.label FROM %s s WHERE s.id = %s.id", emp, shared, emp),
+		Requirement: "reads a public-only table from a non-public curriculum schema",
+		Points:      1,
+	})
+	if err != nil {
+		t.Fatalf("CreateQuestion returned a hard error: %v", err)
+	}
+	if qid == 0 {
+		t.Fatal("CreateQuestion returned id 0")
+	}
+
+	got, err := repo.GetQuestion(ctx, qid)
+	if err != nil {
+		t.Fatalf("GetQuestion: %v", err)
+	}
+	if got.ExpectedResultStatus != "failed" {
+		t.Fatalf("expected capture to FAIL because %q resolves only in public; got status %q (%s). "+
+			"The public fallback is still present in the exam capture search_path.",
+			shared, got.ExpectedResultStatus, got.CaptureError)
+	}
+	if !strings.Contains(strings.ToLower(got.CaptureError), "does not exist") {
+		t.Errorf("capture_error should name the unresolvable relation, got: %q", got.CaptureError)
 	}
 }
