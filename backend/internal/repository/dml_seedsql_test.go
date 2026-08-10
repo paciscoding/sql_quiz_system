@@ -95,14 +95,21 @@ func TestValidateSeedSQL_Refuses(t *testing.T) {
 		{"truncate", "TRUNCATE employee", "TRUNCATE"},
 		{"insert then delete", "INSERT INTO employee (ssn) VALUES ('1'); DELETE FROM employee", "DELETE"},
 		{"unterminated quote", "INSERT INTO employee (fname) VALUES ('oops", "unterminated"},
-		// Pins the ordering of the two checks: the schema-qualification scan
-		// must run AFTER checkSeedQuotesBalanced, because literal-stripping is
-		// unreliable across unbalanced quotes. If the qualification check ran
-		// first here, it would see "public.foo" (inside the unterminated
-		// literal) as a live reference and refuse with the schema message
-		// instead of "unterminated" — which is the wrong reason to give a
-		// lecturer whose real bug is a missing closing quote.
+		// The schema-qualification scan must run AFTER checkSeedQuotesBalanced,
+		// because literal-stripping is unreliable across unbalanced quotes: a
+		// lecturer whose real bug is a missing closing quote must be told that,
+		// not handed a schema message about text swallowed by the runaway
+		// literal. This case documents that contract but does not on its own
+		// prove it — stripSQLLiterals blanks an unterminated single-quoted body
+		// to end of input, so "public.foo" is invisible to the scan from either
+		// position. The ordering itself is argued on the scan in
+		// dml_autoseed.go.
 		{"unterminated quote holding a schema name", "INSERT INTO employee (fname) VALUES ('oops public.foo", "unterminated"},
+		// Pins the other end of that ordering: the schema-qualification scan
+		// must run AFTER the INSERT-only loop. This statement is refusable on
+		// both counts, and the keyword refusal is the one the lecturer can act
+		// on — rewriting the schema name would still leave a DELETE.
+		{"delete naming a schema", "DELETE FROM public.employee WHERE ssn = '1'", "DELETE"},
 	}
 
 	for _, tc := range cases {

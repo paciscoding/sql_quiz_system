@@ -1050,6 +1050,18 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 		return nil, err
 	}
 
+	var stmts []string
+	for _, seg := range splitTopLevelSemicolons(cleaned) {
+		s := strings.TrimSpace(seg)
+		if s == "" {
+			continue
+		}
+		if !matchKeywordAt(s, 0, "INSERT") {
+			return nil, refusef("the seed SQL contains a %s statement; only INSERT statements are allowed, because the seed must add rows and nothing else", leadingSeedKeyword(s))
+		}
+		stmts = append(stmts, s)
+	}
+
 	// A seed may only touch the question's own schema. Replay runs inside the
 	// grading transaction after SET LOCAL ROLE exam_student, and that role
 	// holds DML on every real schema, so a schema-qualified target takes locks
@@ -1058,23 +1070,41 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 	// tables in opposite order then deadlock with SQLSTATE 40P01, and the
 	// student is blamed for it.
 	//
+	// Its position is deliberate at both ends. It runs AFTER
+	// checkSeedQuotesBalanced because literal-stripping cannot be done reliably
+	// out of unbalanced quotes — an unterminated literal holding `public.foo`
+	// would otherwise be refused for the wrong reason, when the lecturer's real
+	// bug is the missing closing quote. It also runs AFTER the INSERT-only loop
+	// above, so a statement that is refusable on both counts (`DELETE FROM
+	// public.employee`) gets the more on-point "only INSERT statements are
+	// allowed" message; both refusals are correct, and the keyword one is the
+	// one the lecturer can act on — rewriting the schema name would still leave
+	// a DELETE. Only that second ordering is pinned by a test ("delete naming a
+	// schema" in dml_seedsql_test.go); the first cannot currently be, because
+	// stripSQLLiterals blanks an unterminated literal to end of input, so the
+	// hidden name is invisible to the scan from either position. It is a
+	// contract about unbalanced quotes in general, not about that one shape.
+	//
 	// This reuses the denylist that already keeps a category import inside its
-	// own schema (postgres_schema.go). It runs AFTER checkSeedQuotesBalanced
-	// because literal-stripping cannot be done reliably out of unbalanced
-	// quotes, and it scans stripSQLLiterals(cleaned) — NOT stripSQLNoise(cleaned)
-	// — so that a schema name inside a VALUES literal stays data rather than a
-	// match. stripSQLNoise would be wrong here on two counts, both of which are
-	// escapes rather than over-strictness: cleaned has already had its comments
-	// removed by the quote-aware stripSQLComments above, so a `--` or `/*`
-	// sitting inside a legitimate string literal (e.g. `'a--b'`) is real data at
-	// this point, not a comment marker, yet stripSQLNoise's comment regexes are
-	// not quote-aware and would strip from that marker onward; and its literal
-	// regexes mis-locate literal boundaries around double-quoted identifiers and
-	// tagged dollar-quotes (see stripSQLLiterals). Either way a schema-qualified
-	// target that follows is hidden. The scan is not exhaustive — it does not
-	// see through a double-quoted target such as `"public"."employee"`, and it
-	// does not recognise a non-ASCII dollar-quote tag; both bounds and why they
-	// are tolerable are set out on stripSQLLiterals.
+	// own schema (postgres_schema.go). It scans stripSQLLiterals(cleaned) — NOT
+	// stripSQLNoise(cleaned) — so that a schema name inside a VALUES literal
+	// stays data rather than a match. stripSQLNoise would be wrong here on two
+	// counts, both of which are escapes rather than over-strictness: cleaned has
+	// already had its comments removed by the quote-aware stripSQLComments
+	// above, so a `--` or `/*` sitting inside a legitimate string literal (e.g.
+	// `'a--b'`) is real data at this point, not a comment marker, yet
+	// stripSQLNoise's comment regexes are not quote-aware and would strip from
+	// that marker onward; and its literal regexes mis-locate literal boundaries
+	// around double-quoted identifiers and tagged dollar-quotes (see
+	// stripSQLLiterals). Either way a schema-qualified target that follows is
+	// hidden. The scan is not exhaustive — it does not see through a
+	// double-quoted target such as `"public"."employee"`, and it does not
+	// recognise a non-ASCII dollar-quote tag; both bounds and why they are
+	// tolerable are set out on stripSQLLiterals.
+	//
+	// It scans `cleaned` whole rather than the collected statements, because
+	// splitTopLevelSemicolons is not the authority on where a literal ends and
+	// the two must not be allowed to disagree.
 	//
 	// The refusal is rebuilt with refusef rather than returned from
 	// validateNoSchemaQualifiedNames directly: every seed refusal must wrap
@@ -1093,17 +1123,6 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 		)
 	}
 
-	var stmts []string
-	for _, seg := range splitTopLevelSemicolons(cleaned) {
-		s := strings.TrimSpace(seg)
-		if s == "" {
-			continue
-		}
-		if !matchKeywordAt(s, 0, "INSERT") {
-			return nil, refusef("the seed SQL contains a %s statement; only INSERT statements are allowed, because the seed must add rows and nothing else", leadingSeedKeyword(s))
-		}
-		stmts = append(stmts, s)
-	}
 	if len(stmts) == 0 {
 		return nil, nil
 	}

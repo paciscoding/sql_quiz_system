@@ -25,8 +25,8 @@
 -- ============================================================================
 
 -- Guarantee we can never write, even by accident.
-SET default_transaction_read_only = on;
 BEGIN;
+SET TRANSACTION READ ONLY;
 
 \echo ''
 \echo '== 1. Practice questions whose seed names a schema =='

@@ -413,6 +413,19 @@ package.
   The bounds are recorded in full on `stripSQLLiterals` and `dollarQuoteTagAt`
   in `dml_autoseed.go`; that comment is the authority, this is the summary.
 
+- **A seed persisted before the refusal shipped still arms an exam.** The
+  refusal runs on the save paths and again on replay, but nothing re-validates
+  an already-*stored* seed. Such a question keeps
+  `expected_result_status = 'captured'`, and the activation pre-flight in
+  `SetExaminationActive` (`postgres_exams.go:59`) only counts questions whose
+  status is *not* `captured` — so it passes, the exam arms, and every student
+  on that question silently gets the configuration-error result until a human
+  notices. `scripts/audit_seed_sql_qualified_names.sql` is the only detective
+  control, and an operator has to remember to run it. The cheap fix — **not on
+  this branch** — is to run `ValidateSeedSQL` over each question's stored seed
+  in that same pre-flight, turning a per-student grade failure into one
+  lecturer-facing activation error while it can still be fixed.
+
 - **Cross-schema seeds — the *unqualified* half is still OPEN, and it is the
   more likely one in practice.** A lecturer writes `INSERT INTO employee …`,
   not `INSERT INTO public.employee …`. If that bare name does not exist in the
