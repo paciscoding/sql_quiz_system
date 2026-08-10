@@ -457,8 +457,20 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 		defer release()
 	}
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
+		// ARCH-062: no `, public`. Capture must resolve names exactly as
+		// grading does (postgres_evaluation.go:301), or a question captures
+		// green and fails at grade time — the shape of the shipped
+		// target_table case bug.
+		//
+		// The DML post-image below goes through queryWithTxCols, which re-sets
+		// search_path to `<schema>, public` (postgres_core.go:132). That is
+		// harmless and is left alone on purpose: the post-image is
+		// `SELECT * FROM <target_table>`, and ResolveTargetTable
+		// (postgres_target_table.go:54) has already proved target_table exists
+		// in <schema>, which is searched first. The re-set can never resolve
+		// the post-image through public.
 		safeSchema := pgx.Identifier{schema}.Sanitize()
-		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", safeSchema)); err != nil {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safeSchema)); err != nil {
 			return err
 		}
 

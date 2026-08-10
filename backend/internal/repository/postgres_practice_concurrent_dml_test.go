@@ -207,7 +207,7 @@ func runSeedShapedTxn(ctx context.Context, repo *PostgresRepository, schema stri
 		return fmt.Errorf("savepoint: %w", err)
 	}
 	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public, pg_temp", safeSchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, pg_temp", safeSchema)); err != nil {
 		return fmt.Errorf("search_path: %w", err)
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student"); err != nil {

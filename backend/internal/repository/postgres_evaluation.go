@@ -297,8 +297,15 @@ func (r *PostgresRepository) evaluateDML(ctx context.Context, question models.Qu
 	// single-statement `CREATE TEMP TABLE <target_table> AS SELECT ...`
 	// cannot shadow the real target table for the post-image capture below.
 	// See TestPgTempForgery_TargetTableShadowing_Rejected.
+	//
+	// ARCH-062: `public` is deliberately NOT in this list. With it present an
+	// unqualified name absent from the question's own schema resolved to a
+	// table shared by every category — a silent cross-category read or write,
+	// and the cross-schema lock that the ARCH-058 per-schema gate cannot see
+	// (the gate keys on the execution schema; the lock lands in another one).
+	// The QUERY branch (line 209) has always run without it.
 	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public, pg_temp", safeSchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, pg_temp", safeSchema)); err != nil {
 		return models.ValidationResult{}, err
 	}
 	if _, err := tx.Exec(ctx, "SET LOCAL ROLE exam_student"); err != nil {
@@ -594,7 +601,7 @@ func (r *PostgresRepository) evaluateDMLPreview(ctx context.Context, question mo
 	// ARCH-023: pg_temp appended LAST — see the matching comment in
 	// evaluateDML for why position matters.
 	safeSchema := pgx.Identifier{schema}.Sanitize()
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, public, pg_temp", safeSchema)); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path = %s, pg_temp", safeSchema)); err != nil {
 		pr.Result.Status = "error"
 		pr.Result.Feedback = fmt.Sprintf("SQL Error: %v", err)
 		return pr, nil

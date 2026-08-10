@@ -126,7 +126,7 @@ func (r *PostgresRepository) CreateQuestion(ctx context.Context, q models.Questi
 			// DML so an exam with a per-exam curriculum_schema mutates the right
 			// schema instead of always hitting public.
 			safeCaptureSchema := pgx.Identifier{captureSchema}.Sanitize()
-			if _, spErr := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s, public", safeCaptureSchema)); spErr != nil {
+			if _, spErr := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safeCaptureSchema)); spErr != nil {
 				return spErr
 			}
 
