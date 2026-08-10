@@ -51,9 +51,9 @@
   by NAME, not by argument signature) and **types** (`pg_type` — standalone
   composites, domains, enums, ranges, multiranges). Explicitly **not** covered:
   operators, operator classes/families, collations, conversions, text-search
-  objects and statistics objects, which `search_path` also resolves but which
-  nothing in this codebase creates; and the QUERY paths, which do not use the
-  five DML `search_path` sites.
+  configurations/dictionaries/parsers/templates and statistics objects, which
+  `search_path` also resolves but which nothing in this codebase creates; and
+  the QUERY paths, which do not use the five DML `search_path` sites.
 
   It audits the schemas DML *actually executes in*, which differ between
   capture, grading and preview: practice capture and grading both use

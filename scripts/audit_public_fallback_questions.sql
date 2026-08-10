@@ -36,13 +36,23 @@
 --     REPORTED below, and the QUERY paths, which this script does not model);
 --   * that object classes outside the list below are covered. Operators,
 --     operator classes/families, collations, conversions, text-search
---     configurations/dictionaries/parsers and statistics objects are ALSO
---     resolved through search_path and are NOT audited here. They are omitted
---     because nothing in this codebase creates them (curriculum import runs
---     lecturer DDL, so a determined lecturer still could) and because a name
---     collision for them is not expressible in the plain DML this system runs.
---     If your curriculum imports ever start creating them, this script must
---     grow a section for them — it will NOT warn you today;
+--     configurations/dictionaries/parsers/templates and statistics objects
+--     are ALSO resolved through search_path and are NOT audited here. They
+--     are omitted because nothing in this codebase creates them (curriculum
+--     import runs lecturer DDL, so a determined lecturer still could) and
+--     because a name collision for them is not expressible in the plain DML
+--     this system runs. If your curriculum imports ever start creating them,
+--     this script must grow a section for them — it will NOT warn you today;
+--   * that a routine's absence from an execution schema means no routine of
+--     that name is reachable at ANY argument signature. Section 5 (see
+--     ROUTINES below) matches routines by NAME only: a routine already
+--     defined in the execution schema under the same name but different
+--     argument types suppresses the row, even though PostgreSQL resolves an
+--     unqualified call against candidates from every schema on search_path
+--     and only hides an earlier schema's routine at IDENTICAL argument
+--     types — so `public.fee(numeric)` stays reachable, and still breaks
+--     after the fallback is dropped, even where the execution schema
+--     defines only `fee(text)`;
 --   * anything about a database whose execution schemas changed after the run.
 --     The report is a snapshot; re-run it immediately before the deploy.
 --

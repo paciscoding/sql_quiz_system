@@ -153,8 +153,12 @@ not equally settled:
   `sandbox_exam_<exam>`, never in `curriculum_schema`; DML preview of a
   `dual_schema` question runs in a *decoy* schema that is neither
   (`practice_categories.preview_schema_name`,
-  `sandbox_exam_cat_<cat>_preview`, `sandbox_exam_<exam>_preview`), built by
-  the same tables-only clone path, so a `public` view can break every
+  `sandbox_exam_cat_<cat>_preview`, `sandbox_exam_<exam>_preview`). Only the
+  two **exam** decoys are built by the same tables-only clone path; the
+  **practice** decoy is not cloned at all — `ImportPreviewSchemaIntoCategory`
+  (`postgres_preview_schema.go:282-296`) runs the lecturer's SQL directly
+  into it under `SET LOCAL search_path`, so it can carry its own views and
+  functions. Either way a `public` view or function can break every
   student's preview while grading still works. Legacy exams on the default
   `curriculum_schema='public'` are audited, not excluded, and a schema that
   does not exist yet is reported in its own "unknown, not zero" section rather
@@ -168,8 +172,9 @@ not equally settled:
   really can leave a `CREATE FUNCTION` in `public` that no sandbox ever
   clones) and types (`pg_type`: standalone composites, domains, enums, ranges,
   multiranges). NOT covered, and named as such in the header: operators,
-  operator classes/families, collations, conversions, text-search objects and
-  statistics objects — also `search_path`-resolved, but nothing in this
+  operator classes/families, collations, conversions, text-search
+  configurations/dictionaries/parsers/templates and statistics objects —
+  also `search_path`-resolved, but nothing in this
   codebase creates them; and the QUERY paths, which do not use the five DML
   `search_path` sites. An empty report therefore proves "no name of those
   classes in those schemas", not "nothing can break".

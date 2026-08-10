@@ -484,9 +484,13 @@ package.
   `dual_schema` question executes in a decoy schema that is neither the
   capture nor the grading schema (`practice_categories.preview_schema_name`,
   `sandbox_exam_cat_<cat>_preview`, `sandbox_exam_<exam>_preview`;
-  `postgres_evaluation.go:596-604`), cloned by that same tables-only path — so
-  a `public` view can break every student's preview while grading still
-  works, and preview is therefore its own audited population. Legacy exams on
+  `postgres_evaluation.go:596-604`). Only the two **exam** decoys are cloned
+  by that same tables-only path; the **practice** decoy is not cloned at
+  all — `ImportPreviewSchemaIntoCategory` (`postgres_preview_schema.go:282-296`)
+  runs the lecturer's SQL directly into it under `SET LOCAL search_path`, so
+  it can carry its own views and functions. Either way a `public` view or
+  function can break every student's preview while grading still works, and
+  preview is therefore its own audited population. Legacy exams on
   the default `curriculum_schema='public'` are audited rather than excluded,
   and an execution schema that does not exist yet (a sandbox for an exam never
   activated, or a decoy nobody has previewed into) is reported in its own
@@ -500,7 +504,8 @@ package.
   DDL allowlist) and types (`pg_type`: standalone composites, domains, enums,
   ranges, multiranges). Not covered, and named as such in the header:
   operators, operator classes/families, collations, conversions, text-search
-  objects, statistics objects, and the QUERY paths. The pre-ship run reported all
+  configurations/dictionaries/parsers/templates, statistics objects, and the
+  QUERY paths. The pre-ship run reported all
   counts zero, but that was against the local docker-compose stack, which has
   no practice categories and no exams — it proved the feature unused there,
   not the change safe. Re-run it wherever real lecturer content lives before
