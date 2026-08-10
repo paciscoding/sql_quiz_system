@@ -45,7 +45,7 @@ Every practice DML evaluation runs this shape against `practice_cat_N`:
 BEGIN
 pg_advisory_xact_lock_shared(key(practice_cat_N))   -- shared: no mutual exclusion
 SAVEPOINT student_eval
-SET LOCAL search_path TO practice_cat_N, public, pg_temp
+SET LOCAL search_path TO practice_cat_N, pg_temp   -- `public` was here when this was written; dropped 2026-08-10, see Known limitations
 SET LOCAL ROLE exam_student
 <seed replay inserts>          -- ARCH-041, inside this transaction
 <student DML>
@@ -120,10 +120,12 @@ and left the one it did touch open.
 
 **3. It missed a live contention pair — within a single practice category.**
 Practice submit gates on `practice_cat_N`; practice preview executes against
-`practice_cat_N_preview` when a decoy exists. Both put `public` in
-`search_path`, so a seed touching an unqualified table that resolves to `public`
-is contended between them while the two keys differ. Only a key computed where
-the schema is resolved makes that visible at all.
+`practice_cat_N_preview` when a decoy exists. At the time, both put `public` in
+`search_path`, so a seed touching an unqualified table that resolved to `public`
+was contended between them while the two keys differed. Only a key computed
+where the schema is resolved made that visible at all. (This no longer occurs:
+`public` was dropped from the DML `search_path` on 2026-08-10 — see *Known
+limitations*.)
 
 **Correction, 2026-08-10.** An earlier draft of this section claimed practice
 preview and *exam* preview could both resolve `question.CategoryPreviewSchema`

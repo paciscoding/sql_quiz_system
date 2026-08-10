@@ -153,7 +153,7 @@ recorded in `.superpowers/sdd/progress.md`).
    `ResolveTargetTable` (`postgres_target_table.go:54-62`) resolves the
    lecturer's raw table name against `pg_class` **in the question's own
    schema only**, and both capture paths call it **before** capture runs
-   (`postgres_practice.go:394`, `postgres_questions.go:94`). A target that
+   (`postgres_practice.go:393`, `postgres_questions.go:94`). A target that
    exists only in `public` is already refused today, independent of this
    branch — that refusal is the pre-existing `target_table` case-bug fix, not
    this change.
