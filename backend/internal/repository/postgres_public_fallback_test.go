@@ -332,6 +332,9 @@ func TestPracticeGrading_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable(t *t
 	// table, unlike this fixture, predates the category-schema split and
 	// already carries exam_student grants from when it lived directly in
 	// public). Granting here isolates the assertion to name resolution alone.
+	// This is why the reverted-buggy path fails below with "does not exist"
+	// rather than "permission denied" — do NOT delete this block as setup
+	// noise; the res.Feedback assertion below is what enforces that it stays.
 	if _, err := repo.pool.Exec(ctx,
 		fmt.Sprintf("GRANT SELECT, UPDATE ON public.%s TO exam_student", shared)); err != nil {
 		t.Fatalf("grant on public.%s: %v", shared, err)
@@ -362,6 +365,11 @@ func TestPracticeGrading_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable(t *t
 	if res.Status != "error" {
 		t.Fatalf("expected grading to FAIL because %q resolves only in public; got status %q, feedback %q. "+
 			"The public fallback is still present in the grading search_path.", shared, res.Status, res.Feedback)
+	}
+	if !strings.Contains(strings.ToLower(res.Feedback), "does not exist") {
+		t.Fatalf("expected feedback to name the unresolvable relation (\"does not exist\"), got: %q. "+
+			"A different error (e.g. permission denied) means the failure isn't discriminating name "+
+			"resolution — check the GRANT block above is still present.", res.Feedback)
 	}
 
 	// Belt-and-braces: the grading transaction is always rolled back

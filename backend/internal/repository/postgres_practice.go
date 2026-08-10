@@ -458,9 +458,23 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 	}
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		// ARCH-062: no `, public`. For the DML branch below, capture must
-		// resolve names exactly as grading does (postgres_evaluation.go:301),
-		// or a question captures green and fails at grade time — the shape of
-		// the shipped target_table case bug.
+		// resolve PERMANENT schema names the same way grading does
+		// (evaluateDML, postgres_evaluation.go:308) — neither side falls
+		// back to public — or a question captures green and fails at grade
+		// time — the shape of the shipped target_table case bug. This is
+		// not a claim that capture and grading resolve identically in every
+		// respect: capture's SET LOCAL search_path below omits pg_temp, so
+		// pg_temp is searched FIRST here (Postgres searches pg_temp before
+		// every schema in search_path unless it is named explicitly),
+		// unlike grading, which names pg_temp LAST specifically so it
+		// cannot shadow the target table (ARCH-023,
+		// postgres_evaluation.go:292-299, pinned by
+		// TestPgTempForgery_TargetTableShadowing_Rejected). That is
+		// harmless here: capture runs on the superuser app pool, executes a
+		// single lecturer statement, and no production code creates temp
+		// tables on that pool. Do not add pg_temp to this statement to
+		// "match" grading — that would be a behaviour change and is out of
+		// scope.
 		//
 		// The DML post-image below goes through queryWithTxCols, which re-sets
 		// search_path to `<schema>, public` (postgres_core.go:132). That is
@@ -470,15 +484,17 @@ func (r *PostgresRepository) captureExpectedResult(ctx context.Context, schema s
 		// in <schema>, which is searched first. The re-set can never resolve
 		// the post-image through public.
 		//
-		// The QUERY branch below (q.CorrectSQL, ~20 lines down) is NOT covered
-		// by that "resolves exactly as grading does" claim: it also goes
-		// through queryWithTxCols with the lecturer's arbitrary CorrectSQL, so
-		// it still re-resolves through public while evaluateQuery
-		// (postgres_evaluation.go:209) grades under `<schema>, pg_temp` with no
-		// public fallback. A QUERY question that reads a public-only table can
-		// still capture green and fail for every student. That divergence is a
-		// real, pre-existing bug — not introduced by ARCH-062 — and is
-		// intentionally left unfixed here; it is tracked separately.
+		// The QUERY branch below (the r.queryWithTxCols call using
+		// q.CorrectSQL, a few lines down in the `if q.Type == "QUERY"` block)
+		// is NOT covered by the "resolves the same as grading" claim above:
+		// it also goes through queryWithTxCols with the lecturer's
+		// arbitrary CorrectSQL, so it still re-resolves through public while
+		// evaluateQuery (postgres_evaluation.go:209) grades under
+		// `<schema>, pg_temp` with no public fallback. A QUERY question that
+		// reads a public-only table can still capture green and fail for
+		// every student. That divergence is a real, pre-existing bug — not
+		// introduced by ARCH-062 — and is intentionally left unfixed here;
+		// it is tracked separately.
 		safeSchema := pgx.Identifier{schema}.Sanitize()
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL search_path TO %s", safeSchema)); err != nil {
 			return err
