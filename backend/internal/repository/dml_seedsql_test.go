@@ -245,6 +245,14 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 			"INSERT INTO t (a$x$b) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($x$hi$x$)",
 			"public",
 		},
+		// A '$' preceded by a non-ASCII identifier byte (PostgreSQL admits
+		// non-ASCII letters in identifiers) is identifier continuation too, not
+		// a tag opener — the token-boundary guard above must not be ASCII-only.
+		{
+			"identifier ending in a non-ASCII byte before $$ does not open a dollar-quote",
+			"INSERT INTO té$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($$hi$$)",
+			"public",
+		},
 	}
 
 	for _, tc := range cases {
@@ -384,10 +392,16 @@ func TestStripSQLLiterals(t *testing.T) {
 			"INSERT INTO t (a) VALUES ($q$oops",
 			"INSERT INTO t (a) VALUES ($q$oops",
 		},
+		// $1$x$1$ is not two positional parameters bracketing a tag: the digit
+		// after the first '$' means isDollarTagStartByte must refuse it as an
+		// opener, so nothing here is blanked. If the digit rule regressed to
+		// accept digits, "x" would read as a tag and the body would blank to a
+		// single space — unlike the old $1-only case, this one actually pins the
+		// digit rule rather than passing regardless of it.
 		{
-			"a bind placeholder is not a dollar-quote tag",
-			"INSERT INTO t (a) VALUES ($1)",
-			"INSERT INTO t (a) VALUES ($1)",
+			"a bind placeholder followed by an unrelated $x$ is not a dollar-quote tag",
+			"INSERT INTO t (a) VALUES ($1$x$1$)",
+			"INSERT INTO t (a) VALUES ($1$x$1$)",
 		},
 		// A '$' preceded by an identifier byte is identifier continuation, not a
 		// tag opener — PostgreSQL only begins dollar-quoting at a token boundary.
@@ -397,6 +411,15 @@ func TestStripSQLLiterals(t *testing.T) {
 			"an identifier ending in $$ does not open a dollar-quote",
 			"INSERT INTO t$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($$hi$$)",
 			"INSERT INTO t$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ( )",
+		},
+		// PostgreSQL identifiers admit non-ASCII letters, so a '$' preceded by one
+		// is identifier continuation too, not a tag opener. The token-boundary
+		// guard's preceding-byte check must reject any byte >= 0x80, not just the
+		// ASCII identifier bytes isAutoSeedIdentByte recognises.
+		{
+			"an identifier ending in a non-ASCII byte before $$ does not open a dollar-quote",
+			"INSERT INTO té$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($$hi$$)",
+			"INSERT INTO té$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ( )",
 		},
 	}
 

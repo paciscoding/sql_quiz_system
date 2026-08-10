@@ -849,28 +849,46 @@ const (
 // check, not merely an over-strict rejection — which is why the mechanism had
 // to change rather than the patterns.
 //
-// Known bounds — this list is not "the one thing", it is all of them:
+// Known bounds — this records what has actually been checked, not a claim
+// that nothing else is out there. It has already been wrong twice about being
+// exhaustive (see git history on this comment), so treat every new escape
+// candidate as unverified until it is traced through all four scanners, not
+// waved through because "the list says that's all of them":
 //
 //   - It does not see through a double-quoted target such as
 //     `"public"."employee"`. That is an accepted limitation of the shared
 //     schemaQualifiedNameRe (see Known limitations); catching it here would
 //     diverge from that regex's other caller.
-//   - isDollarTagStartByte is ASCII-only, so a tag using a non-ASCII letter
-//     (`$é$…$é$`) is not recognised as a delimiter and its body stays visible
-//     to the denylist. If that body holds an apostrophe the scanner mis-pairs
-//     it with a later one and can blank a qualified target between them — but
-//     splitTopLevelSemicolons is '$'-blind in exactly the same way, so it
-//     mis-pairs identically and hands back ONE statement holding every
-//     command. The pool's extended protocol accepts at most one command per
-//     Parse, so that fails as a lecturer-facing exec error rather than
-//     executing a hidden cross-schema write. Bounded, so not worth Unicode
-//     tag support here.
+//   - isDollarTagStartByte is ASCII-only, so a tag whose first character is a
+//     non-ASCII letter (`$é$…$é$`) is not recognised as a delimiter and its
+//     body stays visible to the denylist. (This is narrower than it once was:
+//     dollarQuoteTagAt's token-boundary guard now treats any byte >= 0x80 as
+//     identifier continuation, so a non-ASCII byte immediately before `$$` no
+//     longer opens a false literal — see that function's doc comment. What
+//     remains is only the tag's own first character.) If a body opened this
+//     way holds an apostrophe the scanner mis-pairs it with a later one and
+//     can blank a qualified target between them — but splitTopLevelSemicolons
+//     is '$'-blind in exactly the same way, so it mis-pairs identically and
+//     hands back ONE statement holding every command. The pool's extended
+//     protocol accepts at most one command per Parse, so that fails as a
+//     lecturer-facing exec error rather than executing a hidden cross-schema
+//     write. Bounded, so not worth Unicode tag support here.
 //   - It cannot help a legitimate tagged body containing an apostrophe, e.g.
 //     `$q$it's$q$`, because the '$'-blind checkSeedQuotesBalanced upstream
 //     refuses it first with "unterminated quoted value". That is a
 //     pre-existing over-strict refusal in the seed path, not something this
 //     scanner introduced and not something it can undo — tagged bodies are
 //     handled here, but they do not reach here in that shape.
+//   - It does not know backslash escapes inside an E'...' literal (e.g.
+//     E'it\'s'), so `\'` desyncs it the same way an unescaped `'` would. That
+//     is not an escape, though: stripSQLComments, checkSeedQuotesBalanced,
+//     and splitTopLevelSemicolons are all exactly as blind to `E'...'` as
+//     this scanner is, so all four disagree with the server about the
+//     literal's extent in the same place and by the same amount. The result
+//     is one statement, not a hidden second one, and it fails at exec time as
+//     the extended protocol's one-command-per-Parse limit the same way the
+//     non-ASCII tag gap above does — a lecturer-facing error, not a silent
+//     cross-schema write.
 func stripSQLLiterals(sql string) string {
 	var b strings.Builder
 	inSingle, inDouble := false, false
@@ -945,6 +963,15 @@ func stripSQLLiterals(sql string) string {
 // every statement executed and any schema-qualified target lying between the
 // two tags was hidden from the check.
 //
+// The preceding-byte test treats any byte >= 0x80 as identifier continuation
+// too, alongside isAutoSeedIdentByte and '$' itself. PostgreSQL identifiers
+// admit non-ASCII letters, so `té$$` is one ordinary identifier to the server
+// the same as `t$$` is — an ASCII-only guard left that case open, opening a
+// literal after the non-ASCII byte and reintroducing the same forward-blank
+// escape the token-boundary rule exists to close. isAutoSeedIdentByte itself
+// is deliberately not widened: it is shared with callers elsewhere in this
+// file for which ASCII-only is correct.
+//
 // Erring toward "not an opener" is the safe direction: an unrecognised opener
 // leaves a body exposed to the denylist, which can only produce an extra
 // refusal for the lecturer, never a missed cross-schema write. It costs one
@@ -956,7 +983,7 @@ func dollarQuoteTagAt(sql string, i int) (string, bool) {
 	if i >= n || sql[i] != '$' {
 		return "", false
 	}
-	if i > 0 && (isAutoSeedIdentByte(sql[i-1]) || sql[i-1] == '$') {
+	if i > 0 && (isAutoSeedIdentByte(sql[i-1]) || sql[i-1] == '$' || sql[i-1] >= 0x80) {
 		return "", false
 	}
 	j := i + 1
