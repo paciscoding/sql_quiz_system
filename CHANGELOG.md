@@ -1,5 +1,25 @@
 # CHANGELOG.md
 
+## [2026-08-10] Seed SQL may no longer name another schema (branch `fix/seed-schema-qualification`)
+
+**Behaviour change for lecturers, not an internal-only fix: a seed that saved yesterday may be refused today — on save AND at grade time.** Read the "Before you deploy" note below before rolling this out to a database that holds real lecturer seeds.
+
+### Changed
+- **A DML question's seed SQL is refused if it names another schema** (`validateSeedSQL`, `backend/internal/repository/dml_autoseed.go`). `INSERT INTO public.employee (…) VALUES (…)` in a seed block is now rejected with a 400 naming the offending schema and telling the lecturer to use an unqualified table name that exists in the question's own schema. Why: seed replay runs inside the grading transaction as a role holding DML on *every* real schema, so a schema-qualified target takes locks the ARCH-059 per-schema gate cannot see — the gate keys on the execution schema alone. Two categories graded at the same time whose seeds write the same shared table in opposite order then deadlock (`SQLSTATE 40P01`), and the *student* is blamed for the lecturer's SQL.
+- The check reuses the existing `schemaQualifiedNameRe` denylist from `postgres_schema.go` (the same rule that keeps a category import inside its own schema), plus a new character scanner `stripSQLLiterals` that blanks string-literal bodies first — so a schema name inside a `VALUES` literal stays data and is not refused.
+- Enforcement is on **both** the save paths (`postgres_questions.go`, `postgres_practice.go`) and the replay path, so an already-persisted seed that names a schema stops grading, not just stops saving. This is the reason for the deploy note below.
+
+### Added
+- `scripts/audit_seed_sql_qualified_names.sql` — a **read-only** report (`SET default_transaction_read_only = on`, `BEGIN`/`ROLLBACK`) listing every already-persisted practice and exam seed whose SQL names a schema, plus totals. Run it with `psql "$DATABASE_URL" -f scripts/audit_seed_sql_qualified_names.sql`. It scans raw `seed_sql` while the Go check strips literals first, so it over-reports: a seed matching only inside a quoted value is listed but will not actually be refused. Read each row before acting on it.
+
+### Before you deploy
+**Run the audit script against your own database first.** The pre-ship audit reported `practice_questions_affected=0` and `exam_questions_affected=0` — but also `practice_seeds_total=0` and `exam_seeds_total=0`: it was run against the local `docker-compose` stack, which has no lecturer seeds at all. The change is therefore **not** proven against real seed data; the audit passed because the feature was unused there. On a database that holds real seeds, every row the script lists needs a lecturer to edit that seed before this version goes live, or those questions stop grading.
+
+### Known limitations (recorded in full in `docs/superpowers/specs/2026-08-09-practice-dml-schema-gate-design.md`, *Known limitations*)
+- **The refusal is not complete, and must not be described as if it were.** `INSERT INTO "public"."employee" …` — a **double-quoted** schema name — is *not* refused and would genuinely execute a cross-schema write: the shared regex needs the schema word followed by optional whitespace and a dot, and a closing `"` is neither. Not closed here because widening that regex would change behaviour for its other caller, `ImportSchemaIntoCategory`, which has accepted the same bypass since ARCH-027.
+- Two further bounds degrade to a lecturer-visible error rather than a silent write: a non-ASCII dollar-quote *tag* (`$é$…$é$`) is not recognised as a delimiter and the seed fails at exec time on the one-command-per-Parse limit; and `E'it\'s'` backslash escapes are refused upstream as "an unterminated quoted value" (pre-existing over-strictness in the seed path).
+- **This closes the schema-qualified half only. The unqualified case is still open, and is the more likely one in practice** — a lecturer writes `INSERT INTO employee …`, not `INSERT INTO public.employee …`. If that bare name does not exist in the question's own schema it falls through `search_path` to `public` and deadlocks in the original shape. Closing it means removing `public` from the DML `search_path` at `postgres_evaluation.go:301` and `:597` together with the two capture sites `postgres_questions.go:129` and `postgres_practice.go:461` — deliberately out of scope for this branch.
+
 ## [2026-05-25] Requirements batch — scheduled exams, SSE live-start, exam roster, lecturer schema (round `reqbatch-2026-05-25`)
 
 Source: the now-deleted `NEW_ADDITION_REQUIREMENT.md` (10 items). Designed as ARCH-001..011 / TODO-001..027 in `.pipelinestates/pipeline-state.json` (this round; prior P0/P1/P2 history archived to `.pipelinestates/pipeline-state.json.bak.before-reqbatch-2026-05-25`). Four user decisions (2026-05-25): SSE realtime over Nginx-LB/WebSocket; lecturers may import schema; timestamp-driven **lazy** scheduling (no background scheduler); scheduled-start fires via fallback-poll (no `time.AfterFunc`); a passed end-time stops submissions but keeps the exam armed (no auto-archive).

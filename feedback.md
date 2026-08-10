@@ -107,11 +107,36 @@ and every student hits 409 `question_not_ready` on that question until someone
 re-saves it. Gated in the same branch.
 
 **Residual, not closed** — all recorded in the design's *Known limitations*, not
-repeated here: cross-schema seeds can still deadlock (`search_path` carries
-`public`, and `validateSeedSQL` permits schema-qualified INSERT targets),
-including between submit and preview inside one category; a long lecturer import
-now sheds waiters with a 503 that misattributes the cause; the gate is
-process-local, so a second backend instance would not see it.
+repeated here: a long lecturer import now sheds waiters with a 503 that
+misattributes the cause; the gate is process-local, so a second backend instance
+would not see it.
+
+The cross-schema seed residual has since **split in two**, and the halves are
+not equally settled:
+
+- *Schema-qualified targets: CLOSED 2026-08-10* on branch
+  `fix/seed-schema-qualification` (`ee330ed`, hardened by `e28a249`, `21d4b69`,
+  `ea3b6a0`, `867731e`). `validateSeedSQL` refuses a seed that names another
+  schema, on save and again at grade time, reusing the existing
+  `schemaQualifiedNameRe` denylist plus a literal-blanking scanner. The earlier
+  wording above — "`validateSeedSQL` permits schema-qualified INSERT targets" —
+  is no longer true and the estimate that closing it needed a table-set-keyed
+  gate was wrong; an existing validator covered it. Three bounds remain, of
+  which only one is a real hole: `INSERT INTO "public"."employee"`
+  (double-quoted schema name) is still accepted and would execute. The other
+  two — a non-ASCII dollar-quote tag, and `E'…\'…'` backslash escapes — degrade
+  to a lecturer-visible error rather than a silent write.
+- *Unqualified targets: STILL OPEN*, and the more likely case in practice — a
+  lecturer writes `INSERT INTO employee …`. `search_path` still carries
+  `public` (`postgres_evaluation.go:301`, `:597`), so a bare name missing from
+  the question's own schema falls through to a shared table and deadlocks in
+  the original shape. Closing it means dropping `public` from those two sites
+  *and* from the two capture sites (`postgres_questions.go:129`,
+  `postgres_practice.go:461`) in one move, or a question captures green and
+  fails at grade time. Still includes the submit-vs-preview gap inside one
+  category: submit gates on `practice_cat_N`, preview on
+  `practice_cat_N_preview`, so an unqualified name resolving to `public` is
+  ungated between them.
 
 Practice *serial* isolation was already well covered
 (`postgres_seedsql_isolation_test.go:119`,

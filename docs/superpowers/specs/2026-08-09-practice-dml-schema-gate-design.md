@@ -351,17 +351,72 @@ package.
   deployment ever scales out, both need revisiting together.
 - **Damage scope untouched.** The gate closes concurrency hazards only. A
   bypassed savepoint still corrupts the lecturer's real data.
-- **Cross-schema seeds can still deadlock.** The gate keys on the execution
-  schema, but every evaluation runs with `search_path = <schema>, public,
-  pg_temp` (`postgres_evaluation.go:301`), and `validateSeedSQL`
-  (`dml_autoseed.go:852`) only requires each statement to be an `INSERT` — it
-  does not forbid a schema-qualified target, and `exam_student` holds DML on
-  every real schema. Two evaluations on *different* gated schemas whose seeds
-  both write the same `public.*` table therefore still produce `40P01` in
-  exactly the original shape. The gate narrows the hazard to lecturer-authored
-  cross-schema seeds rather than eliminating it. Closing that would mean either
-  restricting `validateSeedSQL` to the question's own schema or keying the gate
-  on the set of tables a seed touches — both larger changes than this spec.
+- **Cross-schema seeds — the schema-*qualified* half is CLOSED.** Shipped on
+  branch `fix/seed-schema-qualification` (`ee330ed`, hardened by `e28a249`,
+  `21d4b69`, `ea3b6a0`, `867731e`). `validateSeedSQL` (`dml_autoseed.go:1039`)
+  now refuses a seed that names another schema, so `INSERT INTO
+  public.employee …` can no longer take locks the gate cannot see. The refusal
+  runs on the save paths (`postgres_questions.go:30`,
+  `postgres_practice.go:375` and `:710`) and again on the replay path
+  (`applyQuestionSeed`), so it is enforced at grade time too, not only in the
+  authoring form.
+
+  **The remedy this section originally proposed was wrong; do not re-cost the
+  work from it.** It said closing this "would mean either restricting
+  `validateSeedSQL` to the question's own schema or keying the gate on the set
+  of tables a seed touches — both larger changes than this spec". Neither was
+  needed for this half. An existing validator already covered it: the check
+  reuses `schemaQualifiedNameRe` (`postgres_schema.go:258`), the same denylist
+  that keeps a category import inside its own schema, plus one purpose-built
+  character scanner, `stripSQLLiterals` (`dml_autoseed.go:892`), which blanks
+  string-literal bodies before the scan so a schema name inside a `VALUES`
+  literal stays data. No new gate key and no second rule to keep in agreement
+  with the first.
+
+  Three bounds remain, and they are **not equally severe** — do not read them
+  as one list of equivalent nits:
+
+  - **A double-quoted schema name is not refused, and it would genuinely
+    execute a cross-schema write.** `INSERT INTO "public"."employee" …` passes:
+    `schemaQualifiedNameRe` needs the schema word followed by optional
+    whitespace and then a dot, and a closing `"` is neither. This is the one
+    bound that is a real hole rather than a degraded failure. It was left
+    because widening that regex would change behaviour for its other caller,
+    `ImportSchemaIntoCategory`, which has accepted the same bypass since
+    ARCH-027. Closing it belongs with the unqualified work below, not here.
+  - **A non-ASCII dollar-quote tag** (`$é$…$é$`) is not recognised as a
+    delimiter (`isDollarTagStartByte` is ASCII-only), so such a body stays
+    visible to the denylist and its apostrophes can mis-pair and blank a
+    qualified target. This degrades rather than escapes:
+    `splitTopLevelSemicolons` is `$`-blind in exactly the same way, so the seed
+    comes back as ONE statement holding every command, and the pool's extended
+    protocol accepts at most one command per Parse — a lecturer-facing exec
+    error, not a silent write.
+  - **`E'it\'s'` backslash escapes** desync all four scanners identically, so
+    such a seed is refused upstream by `checkSeedQuotesBalanced` as "an
+    unterminated quoted value". That is an over-strict refusal — a bound on
+    what a lecturer may write, not an escape from the check. It is pre-existing
+    in the seed path, not introduced here.
+
+  The bounds are recorded in full on `stripSQLLiterals` and `dollarQuoteTagAt`
+  in `dml_autoseed.go`; that comment is the authority, this is the summary.
+
+- **Cross-schema seeds — the *unqualified* half is still OPEN, and it is the
+  more likely one in practice.** A lecturer writes `INSERT INTO employee …`,
+  not `INSERT INTO public.employee …`. If that bare name does not exist in the
+  question's own schema it falls through `search_path` to `public`, takes locks
+  on a shared table, and produces `40P01` in exactly the original shape — the
+  gate keys on the execution schema and cannot see it. The refusal above does
+  not touch this case and must never be described as if it did.
+
+  Closing it means removing `public` from the DML `search_path` at
+  `postgres_evaluation.go:301` and `postgres_evaluation.go:597`, and at the two
+  capture sites that must move with them — `postgres_questions.go:129` and
+  `postgres_practice.go:461`. All four have to change together: leave the
+  capture sites on the wider path and a question captures green against
+  `public` and then fails at grade time, which is the failure mode this whole
+  design exists to stop. Deliberately out of scope for the
+  `fix/seed-schema-qualification` branch.
 
   This is not only a cross-*category* hazard. Within one practice category,
   submit gates on `practice_cat_N` while preview gates on
