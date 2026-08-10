@@ -827,17 +827,118 @@ const (
 	maxSeedSQLBytes   = 8192
 )
 
-// stripSQLLiterals removes dollar-quoted and single-quoted string bodies,
-// leaving comments alone. validateSeedSQL needs this rather than
-// stripSQLNoise: its input has already had comments removed by the
-// quote-aware stripSQLComments, and stripSQLNoise would strip comments a
-// second time with regexes that are NOT quote-aware — so a '--' or '/*'
-// inside a legitimate string literal would swallow the rest of the seed and
-// hide a schema-qualified target behind it.
+// stripSQLLiterals blanks every string-literal body in sql — single-quoted
+// and dollar-quoted — replacing each with a single space so token boundaries
+// survive, and leaves comments alone (validateSeedSQL has already removed them
+// with the quote-aware stripSQLComments). Double-quoted regions are
+// IDENTIFIERS, not literals: they are scanned over so their contents can never
+// be mistaken for a literal delimiter, but they are copied through unchanged.
+//
+// It is a character scanner, and that is the whole point. The obvious
+// implementation — reDollarQuote/reSingleQuote from postgres_schema.go — is
+// what shipped, and it was wrong twice for the same reason: those regexes
+// disagree with the character scanners this seed path is built out of
+// (stripSQLComments, checkSeedQuotesBalanced, splitTopLevelSemicolons) about
+// where a literal begins and ends, and every byte of disagreement is a place a
+// schema-qualified target can hide. reSingleQuote knows nothing of
+// double-quoted identifiers, so the apostrophe in `INSERT INTO "we'ird" ...`
+// pairs with a later real quote and blanks the qualified target lying between
+// them; reDollarQuote only knows the anonymous $$...$$ form, so a tagged
+// $q$...$q$ body leaves its apostrophes exposed to do the same. In both cases
+// the seed is still accepted, so the disagreement is an escape from this
+// check, not merely an over-strict rejection — which is why the mechanism had
+// to change rather than the patterns.
+//
+// The one thing it deliberately does NOT do is see through a double-quoted
+// target such as `"public"."employee"`. That is an accepted limitation of the
+// shared schemaQualifiedNameRe (see Known limitations); catching it here would
+// diverge from that regex's other caller.
 func stripSQLLiterals(sql string) string {
-	sql = reDollarQuote.ReplaceAllString(sql, " ")
-	sql = reSingleQuote.ReplaceAllString(sql, " ")
-	return sql
+	var b strings.Builder
+	inSingle, inDouble := false, false
+	n := len(sql)
+	i := 0
+	for i < n {
+		c := sql[i]
+
+		if inSingle {
+			// A doubled '' is an escaped quote, not the end of the literal.
+			if c == '\'' {
+				if i+1 < n && sql[i+1] == '\'' {
+					i += 2
+					continue
+				}
+				inSingle = false
+			}
+			i++
+			continue
+		}
+		if inDouble {
+			b.WriteByte(c)
+			if c == '"' {
+				inDouble = false
+			}
+			i++
+			continue
+		}
+		if c == '\'' {
+			inSingle = true
+			b.WriteByte(' ') // one space stands in for the whole body
+			i++
+			continue
+		}
+		if c == '"' {
+			inDouble = true
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if tag, ok := dollarQuoteTagAt(sql, i); ok {
+			if rel := strings.Index(sql[i+len(tag):], tag); rel >= 0 {
+				b.WriteByte(' ')
+				i += len(tag) + rel + len(tag)
+				continue
+			}
+			// No matching closing tag: this is not a literal whose extent can
+			// be trusted, so it is copied through verbatim rather than blanked
+			// to the end of the input. An unterminated body must never swallow
+			// a qualified target that follows it.
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// dollarQuoteTagAt reports whether a dollar-quote opening delimiter starts at
+// sql[i], and returns it including both '$' characters — "$$" for the
+// anonymous form, "$tag$" for the tagged one. Per PostgreSQL, a tag begins
+// with a letter or underscore, so a positional parameter such as $1 is not
+// mistaken for one. The returned tag is matched literally to find the close,
+// which is exactly what a Go regex cannot do: RE2 has no backreferences.
+func dollarQuoteTagAt(sql string, i int) (string, bool) {
+	n := len(sql)
+	if i >= n || sql[i] != '$' {
+		return "", false
+	}
+	j := i + 1
+	if j < n && sql[j] != '$' {
+		if !isDollarTagStartByte(sql[j]) {
+			return "", false
+		}
+		j++
+		for j < n && isAutoSeedIdentByte(sql[j]) {
+			j++
+		}
+	}
+	if j >= n || sql[j] != '$' {
+		return "", false
+	}
+	return sql[i : j+1], true
+}
+
+func isDollarTagStartByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 // normalizeSeedSQL is the single definition of "no seed". A field holding only
@@ -889,21 +990,32 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 	// because literal-stripping cannot be done reliably out of unbalanced
 	// quotes, and it scans stripSQLLiterals(cleaned) — NOT stripSQLNoise(cleaned)
 	// — so that a schema name inside a VALUES literal stays data rather than a
-	// match. stripSQLNoise would be wrong here: cleaned has already had its
-	// comments removed by the quote-aware stripSQLComments above, so a `--` or
-	// `/*` sitting inside a legitimate string literal (e.g. `'a--b'`) is real
-	// data at this point, not a comment marker — but stripSQLNoise's comment
-	// regexes are not quote-aware and would strip from that marker to the next
-	// one, swallowing any schema-qualified target that follows and hiding
-	// exactly the deadlock vector this check exists to catch.
+	// match. stripSQLNoise would be wrong here on two counts, both of which are
+	// escapes rather than over-strictness: cleaned has already had its comments
+	// removed by the quote-aware stripSQLComments above, so a `--` or `/*`
+	// sitting inside a legitimate string literal (e.g. `'a--b'`) is real data at
+	// this point, not a comment marker, yet stripSQLNoise's comment regexes are
+	// not quote-aware and would strip from that marker onward; and its literal
+	// regexes mis-locate literal boundaries around double-quoted identifiers and
+	// tagged dollar-quotes (see stripSQLLiterals). Either way a schema-qualified
+	// target that follows is hidden. The scan still does not see through a
+	// double-quoted target such as `"public"."employee"`, which remains an
+	// accepted limitation of the shared denylist rather than something this
+	// check catches.
 	//
 	// The refusal is rebuilt with refusef rather than returned from
 	// validateNoSchemaQualifiedNames directly: every seed refusal must wrap
 	// ErrAutoSeedUnsupported so callers answer 400, and ErrSchemaQualifiedName
 	// would fall through to a 500.
+	//
+	// The remedy names the question's OWN schema on purpose. Replay runs under
+	// `search_path = <question schema>, public, pg_temp`, so advising a bare
+	// "unqualified name" would send a lecturer whose table is missing from their
+	// own schema straight into public — the very cross-schema write being
+	// refused here.
 	if m := schemaQualifiedNameRe.FindStringSubmatch(stripSQLLiterals(cleaned)); m != nil {
 		return nil, refusef(
-			"the seed SQL references the %q schema; use an unqualified table name instead, because the seed already runs with the question's own schema first on the search_path, and a schema-qualified write to a shared table can deadlock against another category being graded at the same time",
+			"the seed SQL references the %q schema; use an unqualified table name that exists in the question's own schema instead, because a schema-qualified write to a shared table can deadlock against another category being graded at the same time",
 			m[1],
 		)
 	}

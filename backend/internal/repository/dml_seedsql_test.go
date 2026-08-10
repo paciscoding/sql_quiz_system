@@ -197,6 +197,40 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 			"INSERT INTO t (a) VALUES ('a/*b'); INSERT INTO public.employee (ssn) VALUES ('x*/y')",
 			"public",
 		},
+		// The three cases below are all the same defect: a regex literal-stripper
+		// disagrees with the character scanners around it (stripSQLComments,
+		// checkSeedQuotesBalanced, splitTopLevelSemicolons) about where a literal
+		// starts and ends, and every byte of disagreement is somewhere a
+		// schema-qualified target can hide. Each one is accepted by
+		// checkSeedQuotesBalanced and split into two real statements, so the
+		// second statement genuinely executes — this is an escape, not a
+		// degradation into a parse error.
+
+		// A single quote inside a double-quoted IDENTIFIER is not a literal
+		// delimiter. A regex that does not know identifiers from literals pairs
+		// it with the next real quote and blanks the qualified target between.
+		{
+			"apostrophe inside a double-quoted identifier hides a later cross-schema target",
+			`INSERT INTO "we'ird" (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES ('1')`,
+			"public",
+		},
+		// A tagged dollar-quote body is a literal too. A stripper that only knows
+		// the anonymous $$...$$ form leaves the tags in place, so the apostrophes
+		// inside the two bodies pair with each other and blank the qualified
+		// target between them.
+		{
+			"tagged dollar-quoted bodies hide a later cross-schema target",
+			"INSERT INTO t (a) VALUES ($q$'$q$); INSERT INTO public.employee (ssn) VALUES ($q$'$q$)",
+			"public",
+		},
+		// The doubled '' escape does not end a literal. Getting this wrong makes
+		// the stripper close the first literal early and re-open on the next
+		// quote, straddling the qualified target.
+		{
+			"doubled-quote literal followed by a real cross-schema target",
+			"INSERT INTO t (a) VALUES ('it''s'); INSERT INTO public.employee (ssn) VALUES ('1')",
+			"public",
+		},
 	}
 
 	for _, tc := range cases {
@@ -217,15 +251,25 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 
 // TestValidateSeedSQL_QualifiedNameInDataIsNotRefused guards the false positive
 // that makes a denylist dangerous: a schema name appearing in a VALUES literal
-// or a comment is data, not a reference, and refusing it would reject seeds
-// that are entirely legitimate. The scan runs after stripSQLComments and over
-// stripSQLNoise's output, which is what makes these safe.
+// is data, not a reference, and refusing it would reject seeds that are
+// entirely legitimate.
+//
+// Only the three string-literal cases constrain the literal scanner
+// (stripSQLLiterals) that the schema-qualification check reads: they are the
+// counterweight to TestValidateSeedSQL_RefusesSchemaQualifiedNames, pinning the
+// plain, doubled-'' and dollar-quoted forms as data. Of the rest, the two
+// comment cases never reach the check at all — stripSQLComments removes them
+// first — and "app_settings"/"e.ssn" do not match schemaQualifiedNameRe in the
+// first place. Those four are shape guards on the surrounding pipeline, kept so
+// a future change to it cannot start rejecting them unnoticed.
 func TestValidateSeedSQL_QualifiedNameInDataIsNotRefused(t *testing.T) {
 	cases := []struct {
 		name string
 		in   string
 	}{
 		{"inside a string literal", "INSERT INTO note (body) VALUES ('see public.foo for details')"},
+		{"inside a literal that uses the doubled-quote escape", "INSERT INTO note (body) VALUES ('it''s public.foo')"},
+		{"inside an anonymous dollar-quoted literal", "INSERT INTO note (body) VALUES ($$public.foo$$)"},
 		{"inside a line comment", "-- do not touch public.foo\nINSERT INTO employee (ssn) VALUES ('1')"},
 		{"inside a block comment", "/* public.foo is off limits */ INSERT INTO employee (ssn) VALUES ('1')"},
 		// A table whose name merely starts with a denylisted word must survive:
