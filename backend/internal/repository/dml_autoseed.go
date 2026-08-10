@@ -863,6 +863,31 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 		return nil, err
 	}
 
+	// A seed may only touch the question's own schema. Replay runs inside the
+	// grading transaction after SET LOCAL ROLE exam_student, and that role
+	// holds DML on every real schema, so a schema-qualified target takes locks
+	// the ARCH-059 gate cannot see — the gate keys on the execution schema
+	// alone. Two categories graded at once whose seeds write the same shared
+	// tables in opposite order then deadlock with SQLSTATE 40P01, and the
+	// student is blamed for it.
+	//
+	// This reuses the denylist that already keeps a category import inside its
+	// own schema (postgres_schema.go). It runs AFTER checkSeedQuotesBalanced
+	// because stripSQLNoise cannot strip literals reliably out of unbalanced
+	// quotes, and it scans stripSQLNoise(cleaned) rather than cleaned so that a
+	// schema name inside a VALUES literal stays data rather than a match.
+	//
+	// The refusal is rebuilt with refusef rather than returned from
+	// validateNoSchemaQualifiedNames directly: every seed refusal must wrap
+	// ErrAutoSeedUnsupported so callers answer 400, and ErrSchemaQualifiedName
+	// would fall through to a 500.
+	if m := schemaQualifiedNameRe.FindStringSubmatch(stripSQLNoise(cleaned)); m != nil {
+		return nil, refusef(
+			"the seed SQL references the %q schema; a seed may only write to the question's own schema, because a seed that writes a shared table can deadlock against another category being graded at the same time",
+			m[1],
+		)
+	}
+
 	var stmts []string
 	for _, seg := range splitTopLevelSemicolons(cleaned) {
 		s := strings.TrimSpace(seg)

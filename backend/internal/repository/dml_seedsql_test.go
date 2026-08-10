@@ -142,3 +142,89 @@ func TestNormalizeSeedSQL(t *testing.T) {
 		t.Errorf("normalizeSeedSQL trimmed to %q", got)
 	}
 }
+
+// TestValidateSeedSQL_RefusesSchemaQualifiedNames proves a seed may only touch
+// the question's own schema. Seed replay runs inside the grading transaction as
+// exam_student, which holds DML on every real schema, so a cross-schema seed
+// takes locks the ARCH-059 gate cannot see — the gate keys on the execution
+// schema alone. Two categories graded at once then deadlock (SQLSTATE 40P01).
+func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		wantName string
+	}{
+		{"public", "INSERT INTO public.employee (ssn) VALUES ('1')", "public"},
+		{"app", "INSERT INTO app.system_users (id) VALUES (1)", "app"},
+		{"pg_catalog", "INSERT INTO pg_catalog.pg_class (relname) VALUES ('x')", "pg_catalog"},
+		{"information_schema", "INSERT INTO information_schema.tables (x) VALUES (1)", "information_schema"},
+		{"another practice category", "INSERT INTO practice_cat_3.employee (ssn) VALUES ('1')", "practice_cat_3"},
+		{"a preview decoy", "INSERT INTO practice_cat_3_preview.employee (ssn) VALUES ('1')", "practice_cat_3_preview"},
+		{"an exam sandbox", "INSERT INTO sandbox_exam_1.employee (ssn) VALUES ('1')", "sandbox_exam_1"},
+		{"an exam category", "INSERT INTO exam_cat_2.employee (ssn) VALUES ('1')", "exam_cat_2"},
+		{"a curriculum", "INSERT INTO curriculum_exam_4.employee (ssn) VALUES ('1')", "curriculum_exam_4"},
+		{"pg_temp", "INSERT INTO pg_temp.employee (ssn) VALUES ('1')", "pg_temp"},
+		{"uppercase", "INSERT INTO PUBLIC.employee (ssn) VALUES ('1')", "PUBLIC"},
+		{"space before the dot", "INSERT INTO public . employee (ssn) VALUES ('1')", "public"},
+		// The scan must cover every statement, not just the first: a seed that
+		// opens innocently and escapes on statement two is the interesting case.
+		{
+			"second statement escapes",
+			"INSERT INTO employee (ssn) VALUES ('1'); INSERT INTO public.employee (ssn) VALUES ('2')",
+			"public",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateSeedSQL(tc.in)
+			if err == nil {
+				t.Fatalf("validateSeedSQL(%q) accepted, want refusal", tc.in)
+			}
+			if !errors.Is(err, ErrAutoSeedUnsupported) {
+				t.Fatalf("refusal does not wrap ErrAutoSeedUnsupported: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantName) {
+				t.Errorf("refusal %q does not name the offending schema %q", err.Error(), tc.wantName)
+			}
+		})
+	}
+}
+
+// TestValidateSeedSQL_QualifiedNameInDataIsNotRefused guards the false positive
+// that makes a denylist dangerous: a schema name appearing in a VALUES literal
+// or a comment is data, not a reference, and refusing it would reject seeds
+// that are entirely legitimate. The scan runs after stripSQLComments and over
+// stripSQLNoise's output, which is what makes these safe.
+func TestValidateSeedSQL_QualifiedNameInDataIsNotRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"inside a string literal", "INSERT INTO note (body) VALUES ('see public.foo for details')"},
+		{"inside a line comment", "-- do not touch public.foo\nINSERT INTO employee (ssn) VALUES ('1')"},
+		{"inside a block comment", "/* public.foo is off limits */ INSERT INTO employee (ssn) VALUES ('1')"},
+		// A table whose name merely starts with a denylisted word must survive:
+		// the regex requires the dot, so "app_settings" is not "app.".
+		{"table name prefixed with a keyword", "INSERT INTO app_settings (k) VALUES ('a')"},
+		{"column qualified by its own table", "INSERT INTO employee (ssn) SELECT e.ssn FROM employee e"},
+	}
+
+	// NOTE: `INSERT INTO "public"."employee" ...` also lands here — accepted,
+	// not because it is legitimate but because the shared denylist cannot see
+	// through double-quoted identifiers. Deliberately NOT added as a case: a
+	// test asserting that a deadlock vector is accepted would read as approval.
+	// It is recorded under Known limitations and in the spec instead.
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := validateSeedSQL(tc.in)
+			if err != nil {
+				t.Fatalf("validateSeedSQL(%q) refused a legitimate seed: %v", tc.in, err)
+			}
+			if len(got) == 0 {
+				t.Fatalf("validateSeedSQL(%q) returned no statements", tc.in)
+			}
+		})
+	}
+}
