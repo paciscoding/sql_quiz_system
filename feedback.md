@@ -357,6 +357,30 @@ together.
   gate-shed submission records nothing — but that is one sentinel, not a general
   rule. Every other infrastructure failure still writes a bogus attempt row, and
   there is still no 504 mapping.
+- `scripts/audit_seed_sql_qualified_names.sql` (added 2026-08-10, alongside the
+  existing `audit_*.sql` family) is the pre-deploy report for the
+  schema-qualified seed refusal: read-only, lists every persisted
+  `app.practice_questions.seed_sql` / `app.questions.seed_sql` that names a
+  schema. **Run it against any database that actually holds lecturer seeds
+  before deploying that refusal.** The database audited on 2026-08-10 returned
+  `practice_questions_affected=0` and `exam_questions_affected=0`, but also
+  `practice_seeds_total=0` / `exam_seeds_total=0` — the local docker-compose
+  stack has no seeds at all, so the audit proved the feature unused there, not
+  the change safe. The refusal fires on save *and* at grade time, so a seed that
+  saved months ago can start failing.
+- That script's one known false positive is deliberate and documented in its own
+  header: it scans raw `seed_sql`, whereas `validateSeedSQL` blanks string
+  literals before matching, so a schema name appearing only inside a quoted
+  value is listed but will not actually refuse. Read each row before acting.
+- **No detective control at activation.** A persisted schema-qualified seed
+  keeps `expected_result_status='captured'`, so the exam-activation pre-flight
+  (`postgres_exams.go:59`, the `ErrCaptureNotReady` return inside
+  `SetExaminationActive`) passes, the exam arms, and every student on that
+  question silently receives the configuration-error result until a human
+  notices. The audit script is the only control and an operator has to remember
+  to run it. Cheap follow-up, not done: call `ValidateSeedSQL` over each
+  question's stored seed in that same pre-flight, turning a per-student grade
+  failure into one lecturer-facing activation error while it is still fixable.
 
 ### Running the backend tests
 
