@@ -849,10 +849,28 @@ const (
 // check, not merely an over-strict rejection — which is why the mechanism had
 // to change rather than the patterns.
 //
-// The one thing it deliberately does NOT do is see through a double-quoted
-// target such as `"public"."employee"`. That is an accepted limitation of the
-// shared schemaQualifiedNameRe (see Known limitations); catching it here would
-// diverge from that regex's other caller.
+// Known bounds — this list is not "the one thing", it is all of them:
+//
+//   - It does not see through a double-quoted target such as
+//     `"public"."employee"`. That is an accepted limitation of the shared
+//     schemaQualifiedNameRe (see Known limitations); catching it here would
+//     diverge from that regex's other caller.
+//   - isDollarTagStartByte is ASCII-only, so a tag using a non-ASCII letter
+//     (`$é$…$é$`) is not recognised as a delimiter and its body stays visible
+//     to the denylist. If that body holds an apostrophe the scanner mis-pairs
+//     it with a later one and can blank a qualified target between them — but
+//     splitTopLevelSemicolons is '$'-blind in exactly the same way, so it
+//     mis-pairs identically and hands back ONE statement holding every
+//     command. The pool's extended protocol accepts at most one command per
+//     Parse, so that fails as a lecturer-facing exec error rather than
+//     executing a hidden cross-schema write. Bounded, so not worth Unicode
+//     tag support here.
+//   - It cannot help a legitimate tagged body containing an apostrophe, e.g.
+//     `$q$it's$q$`, because the '$'-blind checkSeedQuotesBalanced upstream
+//     refuses it first with "unterminated quoted value". That is a
+//     pre-existing over-strict refusal in the seed path, not something this
+//     scanner introduced and not something it can undo — tagged bodies are
+//     handled here, but they do not reach here in that shape.
 func stripSQLLiterals(sql string) string {
 	var b strings.Builder
 	inSingle, inDouble := false, false
@@ -912,13 +930,33 @@ func stripSQLLiterals(sql string) string {
 
 // dollarQuoteTagAt reports whether a dollar-quote opening delimiter starts at
 // sql[i], and returns it including both '$' characters — "$$" for the
-// anonymous form, "$tag$" for the tagged one. Per PostgreSQL, a tag begins
-// with a letter or underscore, so a positional parameter such as $1 is not
-// mistaken for one. The returned tag is matched literally to find the close,
+// anonymous form, "$tag$" for the tagged one. A tag begins with a letter or
+// underscore, so a positional parameter such as $1 is not mistaken for one —
+// but only ASCII letters are recognised, see isDollarTagStartByte. The
+// returned tag is matched literally to find the close,
 // which is exactly what a Go regex cannot do: RE2 has no backreferences.
+//
+// A dollar-quote only opens at a TOKEN BOUNDARY. '$' is a legal
+// identifier-continuation character in PostgreSQL, so `t$$`, `t$x$` and
+// `a$x$b` are ordinary identifiers to the server, not literals. Without the
+// preceding-byte test below the scanner opened a literal there and blanked
+// forward to the next matching tag — across a ';' as well, because
+// splitTopLevelSemicolons is '$'-blind and still split the seed normally, so
+// every statement executed and any schema-qualified target lying between the
+// two tags was hidden from the check.
+//
+// Erring toward "not an opener" is the safe direction: an unrecognised opener
+// leaves a body exposed to the denylist, which can only produce an extra
+// refusal for the lecturer, never a missed cross-schema write. It costs one
+// known false positive — after a positional parameter, as in `$1$$body$$`,
+// the '$' following the digit is not treated as an opener even though the
+// server would open a literal there.
 func dollarQuoteTagAt(sql string, i int) (string, bool) {
 	n := len(sql)
 	if i >= n || sql[i] != '$' {
+		return "", false
+	}
+	if i > 0 && (isAutoSeedIdentByte(sql[i-1]) || sql[i-1] == '$') {
 		return "", false
 	}
 	j := i + 1
@@ -937,6 +975,14 @@ func dollarQuoteTagAt(sql string, i int) (string, bool) {
 	return sql[i : j+1], true
 }
 
+// isDollarTagStartByte reports whether b may begin a dollar-quote tag. It is
+// ASCII-ONLY, and deliberately narrower than PostgreSQL: real tags follow
+// unquoted-identifier rules, which admit non-ASCII letters, so `$é$…$é$` is a
+// valid tag this scanner does not recognise. Its main job is the distinction
+// that matters here — a digit cannot start a tag, so a positional parameter
+// such as $1 is never mistaken for one. See stripSQLLiterals for why the
+// non-ASCII gap is a bounded, lecturer-visible exec error rather than a silent
+// cross-schema write.
 func isDollarTagStartByte(b byte) bool {
 	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
@@ -998,10 +1044,10 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 	// not quote-aware and would strip from that marker onward; and its literal
 	// regexes mis-locate literal boundaries around double-quoted identifiers and
 	// tagged dollar-quotes (see stripSQLLiterals). Either way a schema-qualified
-	// target that follows is hidden. The scan still does not see through a
-	// double-quoted target such as `"public"."employee"`, which remains an
-	// accepted limitation of the shared denylist rather than something this
-	// check catches.
+	// target that follows is hidden. The scan is not exhaustive — it does not
+	// see through a double-quoted target such as `"public"."employee"`, and it
+	// does not recognise a non-ASCII dollar-quote tag; both bounds and why they
+	// are tolerable are set out on stripSQLLiterals.
 	//
 	// The refusal is rebuilt with refusef rather than returned from
 	// validateNoSchemaQualifiedNames directly: every seed refusal must wrap

@@ -223,12 +223,26 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 			"INSERT INTO t (a) VALUES ($q$'$q$); INSERT INTO public.employee (ssn) VALUES ($q$'$q$)",
 			"public",
 		},
-		// The doubled '' escape does not end a literal. Getting this wrong makes
-		// the stripper close the first literal early and re-open on the next
-		// quote, straddling the qualified target.
+		// A dollar-quote only opens at a token boundary: '$' is a legal
+		// identifier-continuation byte, so `t$$`, `t$x$` and `a$x$b` are ordinary
+		// identifiers to the server. A stripper that opens a literal there scans
+		// forward to the next matching tag and blanks everything in between —
+		// across the ';' as well, because splitTopLevelSemicolons is '$'-blind and
+		// still splits the seed normally. Every statement therefore executes, and
+		// the cross-schema write in the middle is hidden.
 		{
-			"doubled-quote literal followed by a real cross-schema target",
-			"INSERT INTO t (a) VALUES ('it''s'); INSERT INTO public.employee (ssn) VALUES ('1')",
+			"identifier ending in $$ does not open a dollar-quote",
+			"INSERT INTO t$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($$hi$$)",
+			"public",
+		},
+		{
+			"identifier ending in a tagged $x$ does not open a dollar-quote",
+			"INSERT INTO t$x$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($x$hi$x$)",
+			"public",
+		},
+		{
+			"$x$ inside an identifier does not open a dollar-quote",
+			"INSERT INTO t (a$x$b) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($x$hi$x$)",
 			"public",
 		},
 	}
@@ -254,20 +268,37 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 // is data, not a reference, and refusing it would reject seeds that are
 // entirely legitimate.
 //
-// Only the three string-literal cases constrain the literal scanner
+// Only the plain and dollar-quoted literal cases constrain the literal scanner
 // (stripSQLLiterals) that the schema-qualification check reads: they are the
-// counterweight to TestValidateSeedSQL_RefusesSchemaQualifiedNames, pinning the
-// plain, doubled-'' and dollar-quoted forms as data. Of the rest, the two
-// comment cases never reach the check at all — stripSQLComments removes them
-// first — and "app_settings"/"e.ssn" do not match schemaQualifiedNameRe in the
-// first place. Those four are shape guards on the surrounding pipeline, kept so
-// a future change to it cannot start rejecting them unnoticed.
+// counterweight to TestValidateSeedSQL_RefusesSchemaQualifiedNames, pinning
+// those two forms as data.
+//
+// The doubled-'' case does NOT pin the '' branch of stripSQLLiterals, and is
+// kept only as a shape guard on the pipeline. Deleting that branch leaves this
+// test green, because the escape is parity-neutral: a naive close-then-reopen
+// ends the literal on the first quote and starts a new one on the second, so
+// the set of bytes left OUTSIDE literals is identical either way and only the
+// number of blanking spaces differs. A brute-force search over token sequences
+// built from ', ", $$, $q$, ;, a schema-qualified name and filler — every input
+// containing '' that checkSeedQuotesBalanced accepts — found no input whose
+// accept/refuse outcome changes. The branch stays in the implementation because
+// it matches PostgreSQL semantics and the sibling scanner
+// checkSeedQuotesBalanced; it is simply not test-pinned, and no test here
+// should claim otherwise.
+//
+// Of the rest, the two comment cases never reach the check at all —
+// stripSQLComments removes them first — and "app_settings"/"e.ssn" do not match
+// schemaQualifiedNameRe in the first place. Those are shape guards on the
+// surrounding pipeline too, kept so a future change to it cannot start
+// rejecting them unnoticed.
 func TestValidateSeedSQL_QualifiedNameInDataIsNotRefused(t *testing.T) {
 	cases := []struct {
 		name string
 		in   string
 	}{
 		{"inside a string literal", "INSERT INTO note (body) VALUES ('see public.foo for details')"},
+		// Shape guard only — see the note above: this case does not pin the ''
+		// branch of stripSQLLiterals, it passes with or without it.
 		{"inside a literal that uses the doubled-quote escape", "INSERT INTO note (body) VALUES ('it''s public.foo')"},
 		{"inside an anonymous dollar-quoted literal", "INSERT INTO note (body) VALUES ($$public.foo$$)"},
 		{"inside a line comment", "-- do not touch public.foo\nINSERT INTO employee (ssn) VALUES ('1')"},
@@ -292,6 +323,87 @@ func TestValidateSeedSQL_QualifiedNameInDataIsNotRefused(t *testing.T) {
 			}
 			if len(got) == 0 {
 				t.Fatalf("validateSeedSQL(%q) returned no statements", tc.in)
+			}
+		})
+	}
+}
+
+// TestStripSQLLiterals pins the scanner itself rather than only its one caller.
+// Everything the schema-qualification check can see is whatever this function
+// leaves outside a literal, so each case asserts the exact returned string: a
+// byte that survives when it should have been blanked is a false refusal, and a
+// byte that is blanked when it should have survived is an escape.
+func TestStripSQLLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"a single-quoted body is blanked to one space",
+			"INSERT INTO t (a) VALUES ('hi')",
+			"INSERT INTO t (a) VALUES ( )",
+		},
+		{
+			"a doubled '' does not end the literal",
+			"INSERT INTO t (a) VALUES ('it''s')",
+			"INSERT INTO t (a) VALUES ( )",
+		},
+		{
+			"a double-quoted identifier is copied through, apostrophe included",
+			`INSERT INTO "we'ird" (a) VALUES (1)`,
+			`INSERT INTO "we'ird" (a) VALUES (1)`,
+		},
+		{
+			"an anonymous dollar-quoted body is blanked",
+			"INSERT INTO t (a) VALUES ($$hi$$)",
+			"INSERT INTO t (a) VALUES ( )",
+		},
+		{
+			"a tagged dollar-quoted body is blanked",
+			"INSERT INTO t (a) VALUES ($q$hi$q$)",
+			"INSERT INTO t (a) VALUES ( )",
+		},
+		{
+			"an unterminated single quote blanks to end of input",
+			"INSERT INTO t (a) VALUES ('oops",
+			"INSERT INTO t (a) VALUES ( ",
+		},
+		{
+			"an unterminated double quote is copied through",
+			`INSERT INTO "oops (a) VALUES (1)`,
+			`INSERT INTO "oops (a) VALUES (1)`,
+		},
+		// An unterminated dollar-quote is copied VERBATIM rather than blanked to
+		// end of input: its extent cannot be trusted, and blanking would let it
+		// swallow a qualified target that follows. validateSeedSQL never reaches
+		// this state for single quotes (checkSeedQuotesBalanced refuses first),
+		// but it is '$'-blind, so this input does reach the scanner.
+		{
+			"an unterminated dollar-quote is copied verbatim, not blanked",
+			"INSERT INTO t (a) VALUES ($q$oops",
+			"INSERT INTO t (a) VALUES ($q$oops",
+		},
+		{
+			"a bind placeholder is not a dollar-quote tag",
+			"INSERT INTO t (a) VALUES ($1)",
+			"INSERT INTO t (a) VALUES ($1)",
+		},
+		// A '$' preceded by an identifier byte is identifier continuation, not a
+		// tag opener — PostgreSQL only begins dollar-quoting at a token boundary.
+		// Treating `t$$` as an opener made the scanner blank forward to the next
+		// '$$', erasing a real cross-schema statement lying between them.
+		{
+			"an identifier ending in $$ does not open a dollar-quote",
+			"INSERT INTO t$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ($$hi$$)",
+			"INSERT INTO t$$ (a) VALUES (1); INSERT INTO public.employee (ssn) VALUES (2); INSERT INTO u (b) VALUES ( )",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripSQLLiterals(tc.in); got != tc.want {
+				t.Errorf("stripSQLLiterals(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 			}
 		})
 	}
