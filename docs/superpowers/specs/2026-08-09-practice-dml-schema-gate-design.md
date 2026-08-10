@@ -381,9 +381,17 @@ package.
     `schemaQualifiedNameRe` needs the schema word followed by optional
     whitespace and then a dot, and a closing `"` is neither. This is the one
     bound that is a real hole rather than a degraded failure. It was left
-    because widening that regex would change behaviour for its other caller,
-    `ImportSchemaIntoCategory`, which has accepted the same bypass since
-    ARCH-027. Closing it belongs with the unqualified work below, not here.
+    because widening that regex would change behaviour for every caller of
+    `validateNoSchemaQualifiedNames` (`postgres_schema.go:283`), not only
+    `ImportSchemaIntoCategory` (`postgres_schema.go:308`), which has accepted
+    the same bypass since ARCH-027 — also `ImportSchemaIntoExamCurriculum`
+    (`postgres_schema.go:420`), `ImportSchemaIntoExamCategory`
+    (`postgres_exam_categories.go:522`), `ImportSchemaIntoExamCategoryPreview`
+    (`postgres_exam_categories.go:649`), `ImportSchemaIntoCategoryPreview`
+    (`postgres_preview_schema.go:222`), and
+    `ImportSchemaIntoExamCurriculumPreview`
+    (`postgres_preview_schema.go:351`). Closing it belongs with the
+    unqualified work below, not here.
   - **A non-ASCII dollar-quote tag** (`$é$…$é$`) is not recognised as a
     delimiter (`isDollarTagStartByte` is ASCII-only), so such a body stays
     visible to the denylist and its apostrophes can mis-pair and blank a
@@ -392,11 +400,15 @@ package.
     comes back as ONE statement holding every command, and the pool's extended
     protocol accepts at most one command per Parse — a lecturer-facing exec
     error, not a silent write.
-  - **`E'it\'s'` backslash escapes** desync all four scanners identically, so
-    such a seed is refused upstream by `checkSeedQuotesBalanced` as "an
-    unterminated quoted value". That is an over-strict refusal — a bound on
-    what a lecturer may write, not an escape from the check. It is pre-existing
-    in the seed path, not introduced here.
+  - **`E'it\'s'` backslash escapes** desync all four scanners identically;
+    the outcome splits on parity. An odd count of `\'` escapes (as in
+    `E'it\'s'` itself) desyncs `checkSeedQuotesBalanced` into refusing the
+    seed upstream as "an unterminated quoted value"; a balanced-parity
+    variant survives that check instead and fails later at exec time
+    (`dml_autoseed.go:883-892`). Either way that is an over-strict refusal or
+    a lecturer-facing exec error, not an escape from the check — a bound on
+    what a lecturer may write. It is pre-existing in the seed path, not
+    introduced here.
 
   The bounds are recorded in full on `stripSQLLiterals` and `dollarQuoteTagAt`
   in `dml_autoseed.go`; that comment is the authority, this is the summary.
