@@ -11,7 +11,8 @@ Concurrency section). **No code was changed in the audit pass.**
 **Status 2026-08-10.** OPEN-1 is now CLOSED by branch `fix/practice-dml-schema-gate`
 (ARCH-058 … ARCH-061), which also rewrote those same docs a second time — the
 audit-pass corrections above described practice as deliberately unserialised,
-which the fix made false. OPEN-2 … OPEN-9 are still open.
+which the fix made false. OPEN-8 is CLOSED on the same branch. OPEN-2 … OPEN-7
+and OPEN-9 are still open.
 
 ## Verdict on the four claims
 
@@ -243,7 +244,7 @@ invalidates, and whether eval-path tests should be required to distinguish
 infrastructure failure from a real negative. The OPEN-1 probe does the latter
 (`t.Fatalf("INCONCLUSIVE…")`), and that pattern is worth generalising.
 
-## OPEN-8 — Tests hardcode email addresses and never clean up
+## OPEN-8 — Tests hardcode email addresses and never clean up — **CLOSED 2026-08-10**
 
 Severity: **low** (test-only, but it fails work that did not cause it)
 
@@ -265,6 +266,23 @@ the change under test makes every green run an argument rather than a fact.
 Two fixes worth considering, neither done here: give the fixture a unique
 address per run the way `mkCtrlUser` already does, or delete the row in a
 `t.Cleanup`. Same family as OPEN-7 — suite-wide state that no single test owns.
+
+**Fixed 2026-08-10.** The first option, because the codebase had already chosen
+it: `mkUserWithEmail` in the services package appends a `+<UnixNano>` tag to the
+local part for exactly this reason. Its controllers-package twin
+`mkCtrlUserWithEmail` had been written without that block, and
+`TestParity_SingleVsBulk` bypasses both helpers (it builds a
+`StudentUpsertInput` directly), so it now derives the address from the
+already-unique `sn`. Both paths still hand ONE address to the single and bulk
+halves, which is what the parity assertion needs.
+
+The "assume others exist" warning above was checked, not left standing: every
+`@example.com` in a `_test.go` was reviewed, and the remaining ones are either
+non-DB (SMTP header fixtures, parser input) or already routed through the
+uniquifying helper. Verified by reverting the fix and reproducing both failures
+on demand (`SQLSTATE 23505` / `email already in use`), then running the full
+suite twice in a row against the same dirty database — clean both times. That
+second run is the point: a green suite is now a fact rather than an argument.
 
 ## OPEN-9 — The exam 503 arms are unreachable and untested
 

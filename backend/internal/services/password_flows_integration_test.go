@@ -86,7 +86,11 @@ func TestParity_SingleVsBulk(t *testing.T) {
 		SecLab:        "B1",
 		FirstName:     "Pa",
 		LastName:      "Rity",
-		Email:         "parity@example.com",
+		// Unique per run: the bulk row below is never deleted, so a literal
+		// address would collide with the previous run on the account-email
+		// unique index. Both paths still share ONE address, which is what the
+		// parity assertion needs.
+		Email: sn + "@example.com",
 	}
 
 	// Single path.

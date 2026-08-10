@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,11 +205,20 @@ func mkCtrlUserWithEmail(t *testing.T, repo *repository.PostgresRepository, role
 		t.Fatal(err)
 	}
 	username := fmt.Sprintf("http_fp_%s_%d", role, time.Now().UnixNano())
+	// Uniquify the address so the account-email unique index does not collide
+	// with a row this test left behind on a previous run against the same
+	// shared DB. Mirrors mkUserWithEmail in the services package. The returned
+	// user carries the actual address; assert against *user.Email.
+	if at := strings.IndexByte(email, '@'); at >= 0 {
+		email = fmt.Sprintf("%s+%d%s", email[:at], time.Now().UnixNano(), email[at:])
+	} else {
+		email = fmt.Sprintf("%s+%d", email, time.Now().UnixNano())
+	}
 	id, err := repo.CreateUser(context.Background(), models.User{Username: username, Password: string(hash), Role: role, Email: &email})
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	return models.User{ID: models.UserID(id), Username: username, Role: role}
+	return models.User{ID: models.UserID(id), Username: username, Role: role, Email: &email}
 }
 
 // TestVerifyForgotPassword_HTTP proves the public verify endpoint: every
