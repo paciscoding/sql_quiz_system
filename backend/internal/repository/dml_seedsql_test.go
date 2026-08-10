@@ -95,6 +95,14 @@ func TestValidateSeedSQL_Refuses(t *testing.T) {
 		{"truncate", "TRUNCATE employee", "TRUNCATE"},
 		{"insert then delete", "INSERT INTO employee (ssn) VALUES ('1'); DELETE FROM employee", "DELETE"},
 		{"unterminated quote", "INSERT INTO employee (fname) VALUES ('oops", "unterminated"},
+		// Pins the ordering of the two checks: the schema-qualification scan
+		// must run AFTER checkSeedQuotesBalanced, because literal-stripping is
+		// unreliable across unbalanced quotes. If the qualification check ran
+		// first here, it would see "public.foo" (inside the unterminated
+		// literal) as a live reference and refuse with the schema message
+		// instead of "unterminated" — which is the wrong reason to give a
+		// lecturer whose real bug is a missing closing quote.
+		{"unterminated quote holding a schema name", "INSERT INTO employee (fname) VALUES ('oops public.foo", "unterminated"},
 	}
 
 	for _, tc := range cases {
@@ -171,6 +179,22 @@ func TestValidateSeedSQL_RefusesSchemaQualifiedNames(t *testing.T) {
 		{
 			"second statement escapes",
 			"INSERT INTO employee (ssn) VALUES ('1'); INSERT INTO public.employee (ssn) VALUES ('2')",
+			"public",
+		},
+		// A `--` inside a legitimate string literal is data, not a comment
+		// marker — but stripSQLNoise's comment regexes are not quote-aware, so
+		// if the qualification check re-strips comments from text that
+		// stripSQLComments already cleaned, the `--` swallows the rest of the
+		// seed (including the schema-qualified statement after it) and the
+		// deadlock vector goes undetected.
+		{
+			"line comment marker inside a string literal hides a later cross-schema target",
+			"INSERT INTO t (a) VALUES ('a--b'); INSERT INTO public.employee (ssn) VALUES ('1')",
+			"public",
+		},
+		{
+			"block comment marker inside a string literal hides a later cross-schema target",
+			"INSERT INTO t (a) VALUES ('a/*b'); INSERT INTO public.employee (ssn) VALUES ('x*/y')",
 			"public",
 		},
 	}

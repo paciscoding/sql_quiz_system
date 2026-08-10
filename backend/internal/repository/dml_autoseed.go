@@ -827,6 +827,19 @@ const (
 	maxSeedSQLBytes   = 8192
 )
 
+// stripSQLLiterals removes dollar-quoted and single-quoted string bodies,
+// leaving comments alone. validateSeedSQL needs this rather than
+// stripSQLNoise: its input has already had comments removed by the
+// quote-aware stripSQLComments, and stripSQLNoise would strip comments a
+// second time with regexes that are NOT quote-aware — so a '--' or '/*'
+// inside a legitimate string literal would swallow the rest of the seed and
+// hide a schema-qualified target behind it.
+func stripSQLLiterals(sql string) string {
+	sql = reDollarQuote.ReplaceAllString(sql, " ")
+	sql = reSingleQuote.ReplaceAllString(sql, " ")
+	return sql
+}
+
 // normalizeSeedSQL is the single definition of "no seed". A field holding only
 // whitespace is stored as the empty string, never as "   ", so the
 // seedSQL != "" precedence test in applyQuestionSeed and in the capture paths
@@ -873,17 +886,24 @@ func validateSeedSQL(seedSQL string) ([]string, error) {
 	//
 	// This reuses the denylist that already keeps a category import inside its
 	// own schema (postgres_schema.go). It runs AFTER checkSeedQuotesBalanced
-	// because stripSQLNoise cannot strip literals reliably out of unbalanced
-	// quotes, and it scans stripSQLNoise(cleaned) rather than cleaned so that a
-	// schema name inside a VALUES literal stays data rather than a match.
+	// because literal-stripping cannot be done reliably out of unbalanced
+	// quotes, and it scans stripSQLLiterals(cleaned) — NOT stripSQLNoise(cleaned)
+	// — so that a schema name inside a VALUES literal stays data rather than a
+	// match. stripSQLNoise would be wrong here: cleaned has already had its
+	// comments removed by the quote-aware stripSQLComments above, so a `--` or
+	// `/*` sitting inside a legitimate string literal (e.g. `'a--b'`) is real
+	// data at this point, not a comment marker — but stripSQLNoise's comment
+	// regexes are not quote-aware and would strip from that marker to the next
+	// one, swallowing any schema-qualified target that follows and hiding
+	// exactly the deadlock vector this check exists to catch.
 	//
 	// The refusal is rebuilt with refusef rather than returned from
 	// validateNoSchemaQualifiedNames directly: every seed refusal must wrap
 	// ErrAutoSeedUnsupported so callers answer 400, and ErrSchemaQualifiedName
 	// would fall through to a 500.
-	if m := schemaQualifiedNameRe.FindStringSubmatch(stripSQLNoise(cleaned)); m != nil {
+	if m := schemaQualifiedNameRe.FindStringSubmatch(stripSQLLiterals(cleaned)); m != nil {
 		return nil, refusef(
-			"the seed SQL references the %q schema; a seed may only write to the question's own schema, because a seed that writes a shared table can deadlock against another category being graded at the same time",
+			"the seed SQL references the %q schema; use an unqualified table name instead, because the seed already runs with the question's own schema first on the search_path, and a schema-qualified write to a shared table can deadlock against another category being graded at the same time",
 			m[1],
 		)
 	}
