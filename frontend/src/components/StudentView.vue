@@ -568,10 +568,15 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           <span v-if="previewStale" class="muted" style="font-size: 0.75rem; margin-left: auto;">Stale - run again to refresh</span>
         </div>
         <p v-if="previewResult.status === 'syntax_error'" style="margin: 0 0 var(--space-3) 0; font-weight: 600; color: var(--color-danger);">{{ previewResult.feedback }}</p>
-        <ResultTable :rows="previewResult.rows" :columns="previewResult.columns" max-height="320px" />
-        <p v-if="previewResult.truncated" class="muted" style="font-size: 0.8rem; margin-top: var(--space-2);">
-          Showing 200 of {{ previewResult.row_count }} rows.
-        </p>
+        <template v-if="currentQuestion && currentQuestion.type !== 'QUERY' && previewResult.status !== 'syntax_error'">
+          <p class="muted" style="margin: 0;">{{ previewResult.row_count }} row(s) in the table after your statement. Row contents are not shown for INSERT/UPDATE/DELETE test runs.</p>
+        </template>
+        <template v-else>
+          <ResultTable :rows="previewResult.rows" :columns="previewResult.columns" max-height="320px" />
+          <p v-if="previewResult.truncated" class="muted" style="font-size: 0.8rem; margin-top: var(--space-2);">
+            Showing 200 of {{ previewResult.row_count }} rows.
+          </p>
+        </template>
       </div>
 
       <div v-if="result" class="card result-panel" :class="result.status">

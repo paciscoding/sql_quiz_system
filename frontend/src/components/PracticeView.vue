@@ -36,6 +36,7 @@ const sqlText = ref('')
 const result = ref<ValidationResult | null>(null)
 const previewRows = ref<Record<string, any>[]>([])
 const previewCols = ref<string[]>([])
+const previewRowCount = ref<number | null>(null)
 const attempts = ref<PracticeAttempt[]>([])
 const practiceUnavailable = ref(false)
 const editorWrapRef = ref<HTMLElement | null>(null)
@@ -67,6 +68,7 @@ watch(selectedQuestion, () => {
   result.value = null
   previewRows.value = []
   previewCols.value = []
+  previewRowCount.value = null
 })
 
 const selectQuestion = (q: PracticeQuestion) => {
@@ -108,10 +110,17 @@ const doPreview = async () => {
   previewLoading.value = true
   previewRows.value = []
   previewCols.value = []
+  previewRowCount.value = null
   try {
     const res = await preview(selectedQuestion.value.id, sqlText.value)
     previewRows.value = res.rows
     previewCols.value = res.columns
+    // DML preview no longer carries row contents (row_count/status only) —
+    // see validation_service.go ValidatePreview. QUERY previews still get
+    // full rows/columns above, so this stays null for them.
+    previewRowCount.value = selectedQuestion.value.question_type !== 'QUERY' && res.status !== 'syntax_error'
+      ? res.row_count
+      : null
   } catch (err) {
     if (err instanceof PracticeUnavailableError) {
       practiceUnavailable.value = true
@@ -390,6 +399,12 @@ function RefillData(text: string) {
               <span class="muted small">Query Result</span>
             </div>
             <ResultTable :rows="previewRows" :columns="previewCols" max-height="320px" />
+          </div>
+          <div v-else-if="previewRowCount !== null" class="result-panel preview-result">
+            <div class="result-header">
+              <span class="muted small">Query Result</span>
+            </div>
+            <p class="muted" style="margin: 0;">{{ previewRowCount }} row(s) in the table after your statement. Row contents are not shown for INSERT/UPDATE/DELETE test runs.</p>
           </div>
 
           <!-- Submit Result Panel -->

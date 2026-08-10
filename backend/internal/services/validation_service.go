@@ -125,15 +125,26 @@ func (s *ValidationService) ValidatePreview(ctx context.Context, studentID int, 
 		return models.ValidationResult{}, nil, nil, 0, false, err
 	}
 
+	// DML preview never discloses row contents to the student: the full
+	// target-table post-image is captured internally (decideStatus below
+	// needs it to diff against the teacher's snapshot) but must not leave
+	// this function for a non-QUERY question. Only status and row_count
+	// reach the caller. QUERY previews are unaffected — they show the
+	// student's own SELECT output, which was already theirs to see.
+	rows, columns := pr.Rows, pr.Columns
+	if q.Type != "QUERY" {
+		rows, columns = nil, nil
+	}
+
 	if pr.Result.Status == "error" {
 		return models.ValidationResult{
 			Status:   "syntax_error",
 			Feedback: pr.Result.Feedback,
-		}, pr.Rows, pr.Columns, pr.RowCount, pr.Truncated, nil
+		}, rows, columns, pr.RowCount, pr.Truncated, nil
 	}
 
 	finalResult := s.decideStatus(pr.Result, pr.Rows, pr.Columns, q)
-	return finalResult, pr.Rows, pr.Columns, pr.RowCount, pr.Truncated, nil
+	return finalResult, rows, columns, pr.RowCount, pr.Truncated, nil
 }
 
 func (s *ValidationService) decideStatus(execResult models.ValidationResult, studentData []map[string]interface{}, studentColumns []string, q models.Question) models.ValidationResult {

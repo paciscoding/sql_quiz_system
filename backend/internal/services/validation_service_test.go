@@ -248,6 +248,79 @@ func TestValidationService_ValidatePreview(t *testing.T) {
 	})
 }
 
+// TestValidationService_ValidatePreview_DML_RedactsRowContents verifies that a
+// DML (non-QUERY) preview never exposes the target table's post-image rows to
+// the caller, while the correctness verdict is still computed from the full,
+// unredacted post-image internally (decideStatus/decideDMLStatus consume
+// pr.Rows before it is stripped). Two sub-cases (matching and mismatched data)
+// prove the verdict tracks the real diff rather than always defaulting to one
+// status once rows are nil.
+func TestValidationService_ValidatePreview_DML_RedactsRowContents(t *testing.T) {
+	mock := &MockExecutor{}
+	service := NewValidationService(mock)
+	ctx := context.Background()
+
+	teacherData := []map[string]interface{}{{"dnumber": float64(2), "dname": "Accounting"}}
+	teacherJSON, _ := json.Marshal(teacherData)
+	question := models.Question{
+		ID:             1,
+		Type:           "DML",
+		Points:         10.0,
+		ExpectedResult: teacherJSON,
+		TargetTable:    "department",
+	}
+
+	t.Run("matching post-image: correct verdict, rows still redacted", func(t *testing.T) {
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string, previewSchema string) (repository.PreviewResult, error) {
+			return repository.PreviewResult{
+				Result:   models.ValidationResult{Status: "success"},
+				Rows:     []map[string]interface{}{{"dnumber": float64(2), "dname": "Accounting"}},
+				Columns:  []string{"dnumber", "dname"},
+				RowCount: 1,
+			}, nil
+		}
+
+		vResult, vRows, vCols, vCount, _, err := service.ValidatePreview(ctx, 123, question, "INSERT INTO department VALUES (2, 'Accounting')", "sandbox_practice", "")
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if vResult.Status != "correct" {
+			t.Errorf("Expected status 'correct' (verdict must use the unredacted internal post-image), got %q", vResult.Status)
+		}
+		if vRows != nil {
+			t.Errorf("Expected rows redacted (nil) for a DML preview, got %v", vRows)
+		}
+		if vCols != nil {
+			t.Errorf("Expected columns redacted (nil) for a DML preview, got %v", vCols)
+		}
+		if vCount != 1 {
+			t.Errorf("Expected row_count to still pass through (1), got %d", vCount)
+		}
+	})
+
+	t.Run("mismatched post-image: incorrect verdict, rows still redacted", func(t *testing.T) {
+		mock.EvaluatePreviewFunc = func(ctx context.Context, studentID int, q models.Question, sql string, schema string, previewSchema string) (repository.PreviewResult, error) {
+			return repository.PreviewResult{
+				Result:   models.ValidationResult{Status: "success"},
+				Rows:     []map[string]interface{}{{"dnumber": float64(9), "dname": "Wrong"}},
+				Columns:  []string{"dnumber", "dname"},
+				RowCount: 1,
+			}, nil
+		}
+
+		vResult, vRows, vCols, _, _, err := service.ValidatePreview(ctx, 123, question, "INSERT INTO department VALUES (9, 'Wrong')", "sandbox_practice", "")
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if vResult.Status != "incorrect" {
+			t.Errorf("Expected status 'incorrect', got %q", vResult.Status)
+		}
+		if vRows != nil || vCols != nil {
+			t.Errorf("Expected rows/columns redacted even on an incorrect verdict, got rows=%v cols=%v", vRows, vCols)
+		}
+	})
+}
+
 // TestValidationService_SandboxPracticeSchema verifies that when "sandbox_practice"
 // is passed as the sandboxSchema, the mock executor receives that exact string,
 // and that the existing exam schema ("sandbox_exam_1") behaviour is byte-identical.
