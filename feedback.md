@@ -6,7 +6,12 @@ exam runs, and that savepoint handling is identical.
 
 Documentation was corrected in the same pass (`README.md:11`, `MANUAL.md:245`,
 `API_SPEC.md` → Practice, `ARCHITECTURE.md:78` and the Practice Evaluation
-Concurrency section). **No code was changed.** Everything below is still open.
+Concurrency section). **No code was changed in the audit pass.**
+
+**Status 2026-08-10.** OPEN-1 is now CLOSED by branch `fix/practice-dml-schema-gate`
+(ARCH-058 … ARCH-061), which also rewrote those same docs a second time — the
+audit-pass corrections above described practice as deliberately unserialised,
+which the fix made false. OPEN-2 … OPEN-9 are still open.
 
 ## Verdict on the four claims
 
@@ -77,9 +82,10 @@ graded `"error"` with a **nil Go error** (`postgres_evaluation.go:258-289`), so
 a server-side concurrency defect reaches the student as a broken-question
 message and the lecturer as a bogus bug report.
 
-Note the fix is the **queue, not a sandbox**. A sandbox clone bounds damage
-*scope*; it does nothing about concurrency. What protects exam DML here is the
-single-worker `SubmissionQueue`, which practice never touches.
+Note a sandbox is **not** the fix. A sandbox clone bounds damage *scope*; it does
+nothing about concurrency. What protected exam DML at audit time was the
+single-worker `SubmissionQueue`, which practice never touches — so the audit
+concluded the answer was queue-shaped. The shipped fix is neither: see below.
 
 **Fixed 2026-08-09** — `docs/superpowers/specs/2026-08-09-practice-dml-schema-gate-design.md`
 (ARCH-058 … ARCH-061). An in-process per-schema gate inside
@@ -91,6 +97,20 @@ now asserts both concurrent submissions grade `success`.
 No backfill. Any practice attempt already recorded as incorrect because its seed
 deadlocked is indistinguishable in `practice_attempts` from a genuinely wrong
 answer, so past practice scores cannot be repaired retroactively.
+
+The whole-branch review then found the same hazard on the **lecturer** paths —
+`captureExpectedResult` and the test-run previews replay the same seeds against
+the same schema, and originally took no gate. Worse consequence than the student
+case: if the lecturer loses the race, `expected_result_status='failed'` persists
+and every student hits 409 `question_not_ready` on that question until someone
+re-saves it. Gated in the same branch.
+
+**Residual, not closed** — all recorded in the design's *Known limitations*, not
+repeated here: cross-schema seeds can still deadlock (`search_path` carries
+`public`, and `validateSeedSQL` permits schema-qualified INSERT targets),
+including between submit and preview inside one category; a long lecturer import
+now sheds waiters with a 503 that misattributes the cause; the gate is
+process-local, so a second backend instance would not see it.
 
 Practice *serial* isolation was already well covered
 (`postgres_seedsql_isolation_test.go:119`,
@@ -246,6 +266,29 @@ Two fixes worth considering, neither done here: give the fixture a unique
 address per run the way `mkCtrlUser` already does, or delete the row in a
 `t.Cleanup`. Same family as OPEN-7 — suite-wide state that no single test owns.
 
+## OPEN-9 — The exam 503 arms are unreachable and untested
+
+Severity: **low** (dead defensive code, but the reasoning behind it was wrong once)
+
+`quiz_controller.go` maps `repository.ErrSchemaBusy` to 503 in both
+`SubmitAnswer` and `PreviewAnswer`. Neither arm can execute today: exam DML
+resolves `sandbox_exam_N` / `sandbox_exam_cat_N_preview` and practice resolves
+`practice_cat_N*`, so the two can never share a gate key, and exam DML reaches
+the engine one job at a time anyway.
+
+They ship with **no test**. `QuizController` takes the concrete
+`*services.ValidationService` with no interface seam, so testing them means
+adding an exam-side equivalent of ARCH-061's `practiceValidator` — refactoring
+the exam path in order to test code that cannot run. That trade was declined.
+
+Recorded because the design originally justified these arms with a contention
+scenario that does not exist (it claimed practice and exam preview could share
+`question.CategoryPreviewSchema`; that resolution sits in the QUERY branch, and
+QUERY is never gated). The arms are right — a 500 or a 504 would be the wrong
+answer — but the premise was wrong, and a future reader should not rebuild on
+it. If exam and practice schemas are ever unified, add the seam and the test
+together.
+
 ---
 
 ### Smaller notes
@@ -264,10 +307,13 @@ address per run the way `mkCtrlUser` already does, or delete the row in a
 - Practice preview discloses the real `correct`/`incorrect` status
   (`practice_controller.go:290-293`); exam preview rewrites it to `"preview"`
   (`quiz_controller.go:423-428`). Documented as intentional.
-- Practice persists the attempt *before* checking the eval error
-  (`practice_controller.go:205-224`), writing `is_correct=false` /
-  `validation_details=NULL` on infrastructure failures, and has no 503/504
-  mapping. Exam checks the error first (`quiz_controller.go:265-292`).
+- Practice still persists the attempt *before* checking the eval error, writing
+  `is_correct=false` / `validation_details=NULL` on infrastructure failures.
+  Exam checks the error first. **Partly addressed 2026-08-10:** the schema-gate
+  work added an `ErrSchemaBusy` → 503 check *above* the persistence, so a
+  gate-shed submission records nothing — but that is one sentinel, not a general
+  rule. Every other infrastructure failure still writes a bogus attempt row, and
+  there is still no 504 mapping.
 
 ### Running the backend tests
 
