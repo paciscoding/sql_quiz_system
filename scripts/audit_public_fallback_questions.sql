@@ -12,9 +12,16 @@
 --
 -- What this reports: for every schema that owns DML questions, each `public`
 -- table whose name is ABSENT from that schema. Those names — and only those —
--- are what the fallback can currently resolve. A name already present in the
--- owning schema is found there first and never reaches public; a name absent
--- from public cannot be reached through it at all.
+-- are what the fallback can currently resolve. Presence in the owning schema
+-- is tested by EXACT name match (c.relname = p.relname), not case-insensitive
+-- match: Postgres resolves an unqualified name by folding it to lowercase
+-- once at parse time, then matching relname exactly per schema in
+-- search_path order, so an owning schema holding "Products" does not
+-- intercept a lookup for products — public's copy is still reachable, and
+-- a case-insensitive presence test would wrongly hide that. A name already
+-- present (exactly) in the owning schema is found there first and never
+-- reaches public; a name absent from public cannot be reached through it
+-- at all.
 --
 -- This is a sound over-approximation: it lists names that COULD be reached,
 -- not names any question actually references. Zero rows is a proof that the
@@ -58,13 +65,19 @@ WHERE EXISTS (SELECT 1
                WHERE q.category_id = pc.id
                  AND q.question_type = 'DML')
   AND pc.schema_name <> 'public'
+  -- Exact match, not lower()=lower(): Postgres folds an unquoted identifier
+  -- once at parse time, then matches relname EXACTLY per schema — it never
+  -- case-folds catalog contents. A schema owning "Products" does NOT
+  -- intercept a lookup for products, so public's copy is still reachable.
+  -- (audit_dml_vacuous_questions.sql uses the lenient form on purpose, to
+  -- avoid false "broken" claims — the opposite failure mode from here.)
   AND NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = pc.schema_name
           AND c.relkind IN ('r','p','v','m','f')
-          AND lower(c.relname) = lower(p.relname)
+          AND c.relname = p.relname
       )
 ORDER BY pc.id, p.relname;
 
@@ -97,7 +110,7 @@ WHERE EXISTS (SELECT 1
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = COALESCE(NULLIF(e.curriculum_schema, ''), 'public')
           AND c.relkind IN ('r','p','v','m','f')
-          AND lower(c.relname) = lower(p.relname)
+          AND c.relname = p.relname
       )
 ORDER BY e.id, p.relname;
 
@@ -126,7 +139,7 @@ SELECT
                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                       WHERE n.nspname = pc.schema_name
                         AND c.relkind IN ('r','p','v','m','f')
-                        AND lower(c.relname) = lower(p.relname)))
+                        AND c.relname = p.relname))
       AS practice_categories_affected,
   (SELECT count(DISTINCT e.id)
      FROM app.examinations e
@@ -140,7 +153,7 @@ SELECT
                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                       WHERE n.nspname = COALESCE(NULLIF(e.curriculum_schema, ''), 'public')
                         AND c.relkind IN ('r','p','v','m','f')
-                        AND lower(c.relname) = lower(p.relname)))
+                        AND c.relname = p.relname))
       AS exams_affected;
 
 ROLLBACK;
