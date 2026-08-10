@@ -31,38 +31,64 @@
 ### Added
 - `scripts/audit_public_fallback_questions.sql` — a **read-only** catalog
   report (`BEGIN; SET TRANSACTION READ ONLY`) that lists, per *execution
-  schema*, every relation **name** in `public` that is absent from that
-  schema — i.e. the names the dropped fallback could still have resolved
-  there. It is a deliberate **over-approximation of names, not a per-question
-  verdict**: a reported name may be referenced by no question at all, and the
-  report never says which question is broken. An empty report is a proof that
-  this change is a no-op for that database; a non-empty one is a worklist to
-  check by hand. Questions whose `target_table` itself lives only in `public`
-  are **deliberately excluded** — `ResolveTargetTable` already refuses them at
+  schema*, every **name** in `public` that is absent from that schema — i.e.
+  the names the dropped fallback could still have resolved there. It is a
+  deliberate **over-approximation of names, not a per-question verdict**: a
+  reported name may be referenced by no question at all, and the report never
+  says which question is broken. A non-empty report is a worklist to check by
+  hand. Questions whose `target_table` itself lives only in `public` are
+  **deliberately excluded** — `ResolveTargetTable` already refuses them at
   save time regardless of `search_path`, so they need no deploy gate
   (`scripts/audit_dml_vacuous_questions.sql` sections 2a/2b report those).
 
+  **The claim an empty report makes is bounded, and the script's header states
+  the bound**: for the execution schemas it enumerates and the object classes
+  it enumerates, an empty report means no name of those classes in `public`
+  was reachable through the fallback there. It is *not* a claim that no
+  question can break for any other reason. Covered object classes:
+  **relations** (`pg_class` relkinds `r p v m f S`), **routines**
+  (`pg_proc` — functions, procedures, aggregates, window functions; compared
+  by NAME, not by argument signature) and **types** (`pg_type` — standalone
+  composites, domains, enums, ranges, multiranges). Explicitly **not** covered:
+  operators, operator classes/families, collations, conversions, text-search
+  objects and statistics objects, which `search_path` also resolves but which
+  nothing in this codebase creates; and the QUERY paths, which do not use the
+  five DML `search_path` sites.
+
   It audits the schemas DML *actually executes in*, which differ between
-  capture and grading: practice capture and grading both use
+  capture, grading and preview: practice capture and grading both use
   `practice_categories.schema_name`; exam **capture** uses
   `exam_categories.schema_name` (categorised) or
   `COALESCE(NULLIF(curriculum_schema,''),'public')` (uncategorised); exam
   **grading** uses the sandbox — `sandbox_exam_cat_<category_id>` when the
   category owns its schema, otherwise `sandbox_exam_<exam_id>` — and *never*
-  `curriculum_schema`. The sandbox matters on its own because it is a partial
-  clone: `GetTablesInSchema` reads `pg_catalog.pg_tables`, so only ordinary and
-  partitioned tables are cloned — **views, materialised views, foreign tables
-  and sequences are never copied into a sandbox**, and were reachable only
-  through the fallback. Sequences are covered too (relkinds `r p v m f S`), and
-  there is no `<> 'public'` exclusion on the exam side, so legacy exams still
-  on the default `curriculum_schema='public'` are audited rather than skipped.
-  Sections: 1 practice, 2 exam capture, 3 exam grading, 4 execution schemas
-  that do not exist yet (typically a sandbox for an exam never activated —
-  reachability there is *unknown*, not zero), 5 verdict
+  `curriculum_schema`; **DML preview** of a `dual_schema` question runs in a
+  *decoy* schema that is none of those — `practice_categories.preview_schema_name`,
+  `sandbox_exam_cat_<category_id>_preview`, or `sandbox_exam_<exam_id>_preview`
+  (`postgres_evaluation.go:596-604`, `quiz_controller.go:370,382`,
+  `practice_controller.go:291-294`). The sandboxes matter on their own because
+  they are partial clones: `GetTablesInSchema` reads `pg_catalog.pg_tables`, so
+  only ordinary and partitioned tables are cloned — **views, materialised
+  views, foreign tables, sequences, functions and types are never copied into
+  a sandbox**, and were reachable only through the fallback. The *preview*
+  decoy sandboxes are built by the same tables-only path
+  (`InitializeExamPreviewSandbox`), so they are missing exactly the same
+  classes; a `dual_schema` exam DML question reading a `public` view can break
+  every student's **preview** while grading still works, which is why preview
+  is its own section rather than being assumed identical to grading. There is
+  no `<> 'public'` exclusion on the exam side, so legacy exams still on the
+  default `curriculum_schema='public'` are audited rather than skipped.
+  Sections: 1 practice, 2 exam capture, 3 exam grading, 4 DML preview decoys,
+  5 `public` routines absent from any execution schema, 6 `public` types
+  absent from any execution schema, 7 execution schemas that do not exist yet
+  (typically a sandbox for an exam never activated, or a decoy nobody has
+  previewed into — reachability there is *unknown*, not zero), 8 verdict
   (`practice_dml_total`, `exam_dml_total`, `practice_categories_affected`,
   `exam_capture_targets_affected`, `exam_grading_targets_affected`,
-  `exec_schemas_missing`), every count derived from the same CTE the sections
-  list so the two cannot drift. Run it with
+  `preview_targets_affected`, `routine_targets_affected`,
+  `type_targets_affected`, `exec_schemas_missing`), each count derived from the
+  same CTE and the same section predicate as the section it summarises, so the
+  two cannot drift. Run it with
   `psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql`.
 
 ### Tests
@@ -79,23 +105,45 @@
 ### Before deploying
 **Run the audit script against your own database first**, not just trust this note:
 `psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql`.
-The report covers **both capture and grading**, which execute in different
-schemas — in particular exam grading runs in `sandbox_exam_cat_<cat>` /
-`sandbox_exam_<exam>`, never in `curriculum_schema`, and a sandbox is only a
-partial clone (no views, matviews, foreign tables or sequences). Read each
-count as follows:
+The report covers **capture, grading and preview**, which execute in three
+different schemas — in particular exam grading runs in `sandbox_exam_cat_<cat>` /
+`sandbox_exam_<exam>`, never in `curriculum_schema`, DML preview of a
+`dual_schema` question runs in a decoy schema that is neither, and every
+sandbox is only a partial clone (no views, matviews, foreign tables,
+sequences, functions or types). Read each count as follows:
 
-- Non-zero `practice_categories_affected` / `exam_capture_targets_affected` —
-  a lecturer re-saving a question in that schema may now see capture fail.
-- Non-zero `exam_grading_targets_affected` — **the higher-severity one**:
-  those questions already captured green and can break at *grade time* for
-  every student. This is the count that catches a legacy exam whose DML read a
-  `public` view or sequence that activation never cloned into the sandbox.
+- Non-zero `practice_categories_affected` — **a grade-time count, not only a
+  save-time one.** Practice capture *and* practice grading run in the same
+  schema, so a name reachable there breaks both: the lecturer's re-save, and
+  every student's submission at grade time, including the `seed_sql` /
+  auto-seed replay that runs under the same `search_path` before the student's
+  statement.
+- Non-zero `exam_capture_targets_affected` — save-time only: a lecturer
+  re-saving a question in that schema may now see capture fail. Existing
+  captures are unaffected, because exam grading does not run in the capture
+  schema.
+- Non-zero `exam_grading_targets_affected` — **grade time for exams**: those
+  questions already captured green and can break for every student. This is
+  the count that catches a legacy exam whose DML read a `public` view or
+  sequence that activation never cloned into the sandbox.
+- Non-zero `preview_targets_affected` — student **preview** of `dual_schema`
+  DML questions breaks in the decoy schema. Grading is unaffected in this case
+  (it runs elsewhere), so it is lower severity than the two grade-time counts —
+  but it is a per-student, every-attempt failure, not a lecturer-only one.
+- Non-zero `routine_targets_affected` / `type_targets_affected` — a function,
+  procedure, aggregate or type in `public` was reachable from an execution
+  schema that does not define it. `ensureTablesInSchema` clones tables only, so
+  a lecturer-imported `CREATE FUNCTION` in `public` never reaches a sandbox and
+  resolved solely through the fallback. Read the row's own `section` column to
+  know whether that target is a capture, grading or preview schema — i.e.
+  whether the failure lands at save time, grade time or preview time.
+  Extension-provided routines in `public` (uuid-ossp, pgcrypto, …) are listed
+  too, and are genuinely at risk for the same reason.
 - Non-zero `exec_schemas_missing` — the audit could **not** answer for those
   targets, because the schema (usually a sandbox for an exam that has never
-  been activated) does not exist yet. Treat them as potentially affected and
-  re-run the audit after activating, rather than reading a zero elsewhere as
-  all-clear.
+  been activated, or a decoy nobody has previewed into) does not exist yet.
+  Treat them as potentially affected and re-run the audit after
+  activating/previewing, rather than reading a zero elsewhere as all-clear.
 
 A reported name is a name that *could* be reached, not a broken question:
 confirm by hand whether the listed DML questions actually reference it.

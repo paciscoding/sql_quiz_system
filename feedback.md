@@ -141,21 +141,40 @@ not equally settled:
 
   **Audit before trusting this on a database with real lecturer content.**
   `scripts/audit_public_fallback_questions.sql` (read-only) lists, per
-  *execution schema*, every relation **name** in `public` that is absent from
-  that schema — the names the fallback could still have resolved. It is an
+  *execution schema*, every **name** in `public` that is absent from that
+  schema — the names the fallback could still have resolved. It is an
   over-approximation of NAMES, **not a per-question verdict**: a reported name
   may be referenced by no question, and the report never names a broken
   question. `target_table` cases are deliberately excluded, because
   `ResolveTargetTable` already refuses them at save time regardless of
   `search_path` (`audit_dml_vacuous_questions.sql` sections 2a/2b covers
-  those). It audits capture and grading separately, because they run in
-  different schemas: exam grading runs in `sandbox_exam_cat_<cat>` /
-  `sandbox_exam_<exam>`, never in `curriculum_schema`, and the sandbox is only
-  a partial clone (`pg_tables` lists tables only, so views, matviews, foreign
-  tables and sequences are never cloned into it). Legacy exams on the default
-  `curriculum_schema='public'` are audited, not excluded, and a sandbox that
+  those). It audits capture, grading and preview separately, because they run
+  in three different schemas: exam grading runs in `sandbox_exam_cat_<cat>` /
+  `sandbox_exam_<exam>`, never in `curriculum_schema`; DML preview of a
+  `dual_schema` question runs in a *decoy* schema that is neither
+  (`practice_categories.preview_schema_name`,
+  `sandbox_exam_cat_<cat>_preview`, `sandbox_exam_<exam>_preview`), built by
+  the same tables-only clone path, so a `public` view can break every
+  student's preview while grading still works. Legacy exams on the default
+  `curriculum_schema='public'` are audited, not excluded, and a schema that
   does not exist yet is reported in its own "unknown, not zero" section rather
-  than silently counted either way. The pre-ship run reported all
+  than silently counted either way.
+
+  **The empty-report claim is bounded and the script header states the
+  bound.** Covered object classes: relations (`pg_class` relkinds `r p v m f
+  S`), routines (`pg_proc`, compared by name not signature — `search_path`
+  resolves function names exactly as it resolves relation names, and
+  `ImportSchemaIntoCategory` has no DDL allowlist, so a lecturer curriculum
+  really can leave a `CREATE FUNCTION` in `public` that no sandbox ever
+  clones) and types (`pg_type`: standalone composites, domains, enums, ranges,
+  multiranges). NOT covered, and named as such in the header: operators,
+  operator classes/families, collations, conversions, text-search objects and
+  statistics objects — also `search_path`-resolved, but nothing in this
+  codebase creates them; and the QUERY paths, which do not use the five DML
+  `search_path` sites. An empty report therefore proves "no name of those
+  classes in those schemas", not "nothing can break".
+
+  The pre-ship run reported all
   counts zero, but against the local docker-compose stack, which has no
   practice categories and no exams — that proved the feature unused there,
   not the change safe. Re-run it wherever real lecturer content lives. **No

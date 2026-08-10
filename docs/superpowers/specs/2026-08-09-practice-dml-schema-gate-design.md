@@ -467,23 +467,40 @@ package.
 
   **Audit before trusting this on a database with real lecturer content.**
   `scripts/audit_public_fallback_questions.sql` (read-only) lists, per
-  *execution schema*, every relation **name** in `public` that is absent from
-  that schema — the names the fallback could still have resolved. It is an
+  *execution schema*, every **name** in `public` that is absent from that
+  schema — the names the fallback could still have resolved. It is an
   over-approximation of NAMES, **not a per-question verdict**: a reported name
   may be referenced by no question, and the report never identifies a broken
   question. `target_table` cases are deliberately excluded, because
   `ResolveTargetTable` already refuses them at save time regardless of
   `search_path` (`audit_dml_vacuous_questions.sql` sections 2a/2b covers
-  those). Capture and grading are audited separately because they execute in
-  different schemas: exam grading runs in `sandbox_exam_cat_<cat>` /
-  `sandbox_exam_<exam>`, never in `curriculum_schema`, and that sandbox is
-  only a partial clone — `GetTablesInSchema` reads `pg_catalog.pg_tables`, so
-  views, matviews, foreign tables and sequences are never cloned into it and
-  were reachable through the fallback alone. Legacy exams on the default
-  `curriculum_schema='public'` are audited rather than excluded, and an
-  execution schema that does not exist yet (a sandbox for an exam never
-  activated) is reported in its own "unknown, not zero" section instead of
-  being silently included or excluded. The pre-ship run reported all
+  those). Capture, grading and preview are audited separately because they
+  execute in three different schemas: exam grading runs in
+  `sandbox_exam_cat_<cat>` / `sandbox_exam_<exam>`, never in
+  `curriculum_schema`, and that sandbox is only a partial clone —
+  `GetTablesInSchema` reads `pg_catalog.pg_tables`, so views, matviews,
+  foreign tables, sequences, functions and types are never cloned into it and
+  were reachable through the fallback alone. DML **preview** of a
+  `dual_schema` question executes in a decoy schema that is neither the
+  capture nor the grading schema (`practice_categories.preview_schema_name`,
+  `sandbox_exam_cat_<cat>_preview`, `sandbox_exam_<exam>_preview`;
+  `postgres_evaluation.go:596-604`), cloned by that same tables-only path — so
+  a `public` view can break every student's preview while grading still
+  works, and preview is therefore its own audited population. Legacy exams on
+  the default `curriculum_schema='public'` are audited rather than excluded,
+  and an execution schema that does not exist yet (a sandbox for an exam never
+  activated, or a decoy nobody has previewed into) is reported in its own
+  "unknown, not zero" section instead of being silently included or excluded.
+
+  The empty-report claim is **bounded**, and the script's header states the
+  bound rather than asserting a name can never be omitted. Object classes
+  covered: relations (`pg_class` relkinds `r p v m f S`), routines (`pg_proc`,
+  compared by name not by signature — `search_path` resolves routine names
+  exactly as it resolves relation names, and `ImportSchemaIntoCategory` has no
+  DDL allowlist) and types (`pg_type`: standalone composites, domains, enums,
+  ranges, multiranges). Not covered, and named as such in the header:
+  operators, operator classes/families, collations, conversions, text-search
+  objects, statistics objects, and the QUERY paths. The pre-ship run reported all
   counts zero, but that was against the local docker-compose stack, which has
   no practice categories and no exams — it proved the feature unused there,
   not the change safe. Re-run it wherever real lecturer content lives before
