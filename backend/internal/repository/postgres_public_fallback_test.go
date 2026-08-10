@@ -385,6 +385,102 @@ func TestPracticeGrading_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable(t *t
 	}
 }
 
+// TestPracticePreview_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable pins
+// the PREVIEW site (postgres_evaluation.go:604, evaluateDMLPreview).
+//
+// It was the one production `search_path` site with nothing pinning it:
+// restoring `, public` at :604 alone left the entire suite green, so a partial
+// revert there would silently reopen the cross-category read/write while CI
+// stayed happy. The branch's headline constraint is that all five sites move
+// together; this test is what makes that checkable for the fifth.
+//
+// Structure mirrors TestPracticeGrading_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable
+// exactly — same fixture shape, same GRANT (see the long comment there: without
+// it the reverted-buggy path fails with "permission denied" instead of
+// "does not exist" and the test passes for the wrong reason), and the same
+// assertion on the FEEDBACK TEXT rather than on the status alone.
+//
+// The feedback assertion is the discriminating one and must not be weakened to
+// a status check: evaluateDMLPreview returns Result.Status == "error" for ANY
+// failing student statement (postgres_evaluation.go:649-658), so a status-only
+// assertion passes whether or not the name resolved.
+//
+// previewSchema is passed as "" on purpose: that is the single, exact rule for
+// useDecoy (postgres_evaluation.go:451), so the preview runs under the real
+// exam_student role against the category's own schema — the same schema and
+// role grading uses — which is the only configuration in which the `, public`
+// element is observable at this site.
+func TestPracticePreview_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable(t *testing.T) {
+	repo := openTestRepo(t)
+	ctx := context.Background()
+
+	catID, uid := mkPracticeCategory(t, repo, ctx, "pubprev")
+	defer func() { _ = repo.DeletePracticeCategory(ctx, catID, true) }()
+
+	emp := uniqueUsername("pubprev_emp")
+	if err := repo.ImportSchemaIntoCategory(ctx, catID, fmt.Sprintf(
+		`CREATE TABLE %s (id INT PRIMARY KEY, name TEXT, label TEXT);
+		 INSERT INTO %s (id, name) VALUES (1, 'Alice');`, emp, emp), uid, false); err != nil {
+		t.Fatalf("ImportSchemaIntoCategory: %v", err)
+	}
+	shared := mkPublicOnlyTable(t, repo, ctx, "pubprev_shared")
+	// Same reason as in the grading test above: isolate the assertion to name
+	// resolution, so a fallback that DID resolve fails with "does not exist"
+	// only when the name is genuinely unresolvable — never with
+	// "permission denied", which would pass in both the fixed and reverted
+	// states. Do NOT delete this as setup noise.
+	if _, err := repo.pool.Exec(ctx,
+		fmt.Sprintf("GRANT SELECT, UPDATE ON public.%s TO exam_student", shared)); err != nil {
+		t.Fatalf("grant on public.%s: %v", shared, err)
+	}
+
+	schema, err := repo.GetPracticeCategorySchema(ctx, catID)
+	if err != nil {
+		t.Fatalf("GetPracticeCategorySchema: %v", err)
+	}
+
+	studentSQL := fmt.Sprintf(
+		"UPDATE %s SET label = s.label FROM %s s WHERE s.id = %s.id", emp, shared, emp)
+
+	q := models.Question{
+		ID:          1,
+		Type:        "DML",
+		DMLKind:     "UPDATE",
+		TargetTable: emp,
+		CorrectSQL:  studentSQL,
+		CreatedBy:   models.UserID(uid),
+		Points:      1,
+	}
+
+	pr, evalErr := repo.EvaluatePreview(ctx, 4100, q, studentSQL, schema, "")
+	if evalErr != nil {
+		t.Fatalf("EvaluatePreview returned an unexpected Go error: %v", evalErr)
+	}
+	if pr.Result.Status != "error" {
+		t.Fatalf("expected preview to FAIL because %q resolves only in public; got status %q, feedback %q. "+
+			"The public fallback is still present in the preview search_path.",
+			shared, pr.Result.Status, pr.Result.Feedback)
+	}
+	if !strings.Contains(strings.ToLower(pr.Result.Feedback), "does not exist") {
+		t.Fatalf("expected feedback to name the unresolvable relation (\"does not exist\"), got: %q. "+
+			"evaluateDMLPreview reports status \"error\" for ANY failing student statement, so this "+
+			"text assertion — not the status — is what discriminates a restored `, public`. A different "+
+			"error (e.g. permission denied) means the GRANT block above was removed.", pr.Result.Feedback)
+	}
+
+	// Belt-and-braces: the preview transaction is always rolled back regardless
+	// of this fix, so the shared table must be untouched either way. Not the
+	// discriminating assertion — the feedback check above is.
+	var n int
+	if err := repo.pool.QueryRow(ctx,
+		fmt.Sprintf("SELECT count(*) FROM public.%s", shared)).Scan(&n); err != nil {
+		t.Fatalf("count public.%s: %v", shared, err)
+	}
+	if n != 1 {
+		t.Fatalf("preview reached public.%s: row count %d, want 1", shared, n)
+	}
+}
+
 // TestExamCapture_NonPublicCurriculumSchema_RejectsUnqualifiedPublicOnlyTable
 // pins the EXAM-CAPTURE site (postgres_questions.go:129, CreateQuestion) with
 // a NON-public curriculum schema.

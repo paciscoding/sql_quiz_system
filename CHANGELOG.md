@@ -30,28 +30,85 @@
 
 ### Added
 - `scripts/audit_public_fallback_questions.sql` — a **read-only** catalog
-  report (`BEGIN; SET TRANSACTION READ ONLY`) that resolves, per practice
-  category and per exam, every DML question whose `target_table` is absent
-  from its own execution schema but present in `public`, plus totals
+  report (`BEGIN; SET TRANSACTION READ ONLY`) that lists, per *execution
+  schema*, every relation **name** in `public` that is absent from that
+  schema — i.e. the names the dropped fallback could still have resolved
+  there. It is a deliberate **over-approximation of names, not a per-question
+  verdict**: a reported name may be referenced by no question at all, and the
+  report never says which question is broken. An empty report is a proof that
+  this change is a no-op for that database; a non-empty one is a worklist to
+  check by hand. Questions whose `target_table` itself lives only in `public`
+  are **deliberately excluded** — `ResolveTargetTable` already refuses them at
+  save time regardless of `search_path`, so they need no deploy gate
+  (`scripts/audit_dml_vacuous_questions.sql` sections 2a/2b report those).
+
+  It audits the schemas DML *actually executes in*, which differ between
+  capture and grading: practice capture and grading both use
+  `practice_categories.schema_name`; exam **capture** uses
+  `exam_categories.schema_name` (categorised) or
+  `COALESCE(NULLIF(curriculum_schema,''),'public')` (uncategorised); exam
+  **grading** uses the sandbox — `sandbox_exam_cat_<category_id>` when the
+  category owns its schema, otherwise `sandbox_exam_<exam_id>` — and *never*
+  `curriculum_schema`. The sandbox matters on its own because it is a partial
+  clone: `GetTablesInSchema` reads `pg_catalog.pg_tables`, so only ordinary and
+  partitioned tables are cloned — **views, materialised views, foreign tables
+  and sequences are never copied into a sandbox**, and were reachable only
+  through the fallback. Sequences are covered too (relkinds `r p v m f S`), and
+  there is no `<> 'public'` exclusion on the exam side, so legacy exams still
+  on the default `curriculum_schema='public'` are audited rather than skipped.
+  Sections: 1 practice, 2 exam capture, 3 exam grading, 4 execution schemas
+  that do not exist yet (typically a sandbox for an exam never activated —
+  reachability there is *unknown*, not zero), 5 verdict
   (`practice_dml_total`, `exam_dml_total`, `practice_categories_affected`,
-  `exams_affected`). Run it with
+  `exam_capture_targets_affected`, `exam_grading_targets_affected`,
+  `exec_schemas_missing`), every count derived from the same CTE the sections
+  list so the two cannot drift. Run it with
   `psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql`.
+
+### Tests
+- `TestPracticePreview_NoPublicFallback_RejectsUnqualifiedPublicOnlyTable`
+  (`backend/internal/repository/postgres_public_fallback_test.go`) pins the
+  preview site (`postgres_evaluation.go:604`), which was the one production
+  `search_path` site with nothing holding it: restoring `, public` there alone
+  previously left the whole suite green, so a partial revert could reopen the
+  hazard silently. Like its grading counterpart it asserts on the feedback
+  text containing `does not exist`, not merely on an error status —
+  `evaluateDMLPreview` returns an error status for *any* failing student
+  statement, so a status-only assertion would pass for the wrong reason.
 
 ### Before deploying
 **Run the audit script against your own database first**, not just trust this note:
 `psql "$DATABASE_URL" -f scripts/audit_public_fallback_questions.sql`.
-Non-zero `practice_categories_affected` / `exams_affected` means some DML
-questions may reference a table they only ever reached through `public`;
-those questions will fail at grade time after this deploys, until a
-lecturer re-saves them (re-saving re-runs capture under the corrected
-resolution, which either succeeds against the question's own schema or
-surfaces the problem to the lecturer instead of the student). **There is
-no automatic re-capture** — that is a deliberate decision, not an
-oversight: auto re-capture would run arbitrary lecturer SQL unattended at
-deploy time. The audit output is a worklist a human must work through, not
-something the deploy can resolve on its own.
+The report covers **both capture and grading**, which execute in different
+schemas — in particular exam grading runs in `sandbox_exam_cat_<cat>` /
+`sandbox_exam_<exam>`, never in `curriculum_schema`, and a sandbox is only a
+partial clone (no views, matviews, foreign tables or sequences). Read each
+count as follows:
 
-**The audit run during development reported all four counts zero — this
+- Non-zero `practice_categories_affected` / `exam_capture_targets_affected` —
+  a lecturer re-saving a question in that schema may now see capture fail.
+- Non-zero `exam_grading_targets_affected` — **the higher-severity one**:
+  those questions already captured green and can break at *grade time* for
+  every student. This is the count that catches a legacy exam whose DML read a
+  `public` view or sequence that activation never cloned into the sandbox.
+- Non-zero `exec_schemas_missing` — the audit could **not** answer for those
+  targets, because the schema (usually a sandbox for an exam that has never
+  been activated) does not exist yet. Treat them as potentially affected and
+  re-run the audit after activating, rather than reading a zero elsewhere as
+  all-clear.
+
+A reported name is a name that *could* be reached, not a broken question:
+confirm by hand whether the listed DML questions actually reference it.
+Affected questions fail at grade time after this deploys until a lecturer
+re-saves them (re-saving re-runs capture under the corrected resolution,
+which either succeeds against the question's own schema or surfaces the
+problem to the lecturer instead of the student). **There is no automatic
+re-capture** — that is a deliberate decision, not an oversight: auto
+re-capture would run arbitrary lecturer SQL unattended at deploy time. The
+audit output is a worklist a human must work through, not something the
+deploy can resolve on its own.
+
+**The audit run during development reported all counts zero — this
 is NOT evidence the change is safe.** It was run against the local
 `docker-compose` stack, which holds only the `app` and `public` schemas:
 no practice categories and no exams exist there at all. The gate proved

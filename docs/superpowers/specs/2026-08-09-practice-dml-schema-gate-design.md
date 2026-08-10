@@ -466,9 +466,24 @@ package.
   about.
 
   **Audit before trusting this on a database with real lecturer content.**
-  `scripts/audit_public_fallback_questions.sql` (read-only) resolves, per
-  category/exam, every DML question whose `target_table` is absent from its
-  own schema but present in `public`. The pre-ship run reported all four
+  `scripts/audit_public_fallback_questions.sql` (read-only) lists, per
+  *execution schema*, every relation **name** in `public` that is absent from
+  that schema — the names the fallback could still have resolved. It is an
+  over-approximation of NAMES, **not a per-question verdict**: a reported name
+  may be referenced by no question, and the report never identifies a broken
+  question. `target_table` cases are deliberately excluded, because
+  `ResolveTargetTable` already refuses them at save time regardless of
+  `search_path` (`audit_dml_vacuous_questions.sql` sections 2a/2b covers
+  those). Capture and grading are audited separately because they execute in
+  different schemas: exam grading runs in `sandbox_exam_cat_<cat>` /
+  `sandbox_exam_<exam>`, never in `curriculum_schema`, and that sandbox is
+  only a partial clone — `GetTablesInSchema` reads `pg_catalog.pg_tables`, so
+  views, matviews, foreign tables and sequences are never cloned into it and
+  were reachable through the fallback alone. Legacy exams on the default
+  `curriculum_schema='public'` are audited rather than excluded, and an
+  execution schema that does not exist yet (a sandbox for an exam never
+  activated) is reported in its own "unknown, not zero" section instead of
+  being silently included or excluded. The pre-ship run reported all
   counts zero, but that was against the local docker-compose stack, which has
   no practice categories and no exams — it proved the feature unused there,
   not the change safe. Re-run it wherever real lecturer content lives before
