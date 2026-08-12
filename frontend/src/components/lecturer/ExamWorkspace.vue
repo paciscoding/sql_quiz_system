@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { Examination } from './types'
-import ExamSchemaPanel from './ExamSchemaPanel.vue'
 import ExamQuestionsPanel from './ExamQuestionsPanel.vue'
 import ExamRosterPanel from './ExamRosterPanel.vue'
 import Icon from '../Icon.vue'
@@ -13,7 +12,11 @@ const emit = defineEmits<{
   changed: []
 }>()
 
-const activeTab = ref<'schema' | 'questions' | 'roster'>('questions')
+// The Schema tab was removed from the tab bar: the exam-category management
+// panel (inside Questions) already handles per-category schema import, so a
+// separate exam-level Schema navigation was redundant. ExamSchemaPanel.vue is
+// left on disk, unreferenced, in case the standalone panel is wanted again.
+const activeTab = ref<'questions' | 'roster'>('questions')
 </script>
 
 <template>
@@ -24,12 +27,10 @@ const activeTab = ref<'schema' | 'questions' | 'roster'>('questions')
     </div>
 
     <div class="tab-bar">
-      <button :class="{ 'tab-active': activeTab === 'schema' }" @click="activeTab = 'schema'">Schema</button>
       <button :class="{ 'tab-active': activeTab === 'questions' }" @click="activeTab = 'questions'">Questions</button>
       <button :class="{ 'tab-active': activeTab === 'roster' }" @click="activeTab = 'roster'">Roster</button>
     </div>
 
-    <ExamSchemaPanel v-if="activeTab === 'schema'" :exam="exam" @changed="emit('changed')" />
     <ExamQuestionsPanel v-if="activeTab === 'questions'" :exam="exam" @changed="emit('changed')" />
     <ExamRosterPanel v-if="activeTab === 'roster'" :exam="exam" @changed="emit('changed')" />
   </div>

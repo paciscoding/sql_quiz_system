@@ -238,7 +238,10 @@ describe('ExamQuestionsPanel — Exam Categories lower panel (ARCH-034 (3) / ARC
     const wrapper = mount(ExamQuestionsPanel, { props: { exam: makeExam() } })
     await flushPromises()
 
-    const cards = wrapper.findAll('.collapsible-card')
+    // Scoped to the exam-category-* test ids: the panel also holds two
+    // exam-level CollapsibleCards (decoy curriculum, exam description) that
+    // are not per-category cards.
+    const cards = wrapper.findAll('[data-testid^="exam-category-"]')
     expect(cards).toHaveLength(2)
     expect(wrapper.find('[data-testid="exam-category-cat-1"]').text()).toContain('Part A')
     expect(wrapper.find('[data-testid="exam-category-cat-2"]').text()).toContain('Part B')

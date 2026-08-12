@@ -47,16 +47,19 @@ const {
   toggleCollapsed: toggleCategoriesPanel,
 } = useAuthoringLayout('exam')
 
-// Independent client-side check (dual-schema spec §6.1): dual_schema on an
-// exam with no decoy curriculum is allowed (grading falls back to schema B)
-// but must be flagged to the lecturer with zero network round-trips. Purely
-// derived from props.exam, so it reacts automatically to switching exams,
-// toggling question.value.dual_schema, and loading a question into the form
-// (editQuestion / onQuestionDropdownChange) — no extra watcher needed.
+// Dual schema is no longer a lecturer-facing choice: every exam question is
+// authored with dual_schema = true (see blankQuestion / editQuestion). The
+// per-question toggle and its "no decoy curriculum yet" badge are gone; an
+// exam with no decoy curriculum still grades correctly (previews just fall
+// back to the grading schema), and the decoy-import block below reports
+// whether a decoy exists.
 const examHasDecoy = computed(() => props.exam.has_preview_schema ?? false)
 
 const blankQuestion = () => ({
   id: null as number | null,
+  // Backend-computed per-exam position (see sortKey below). Display only, and
+  // never sent back on save — 0 until the question is loaded from the server.
+  display_no: 0,
   exam_id: null as string | null,
   category_id: null as string | null,
   target_table: '',
@@ -66,7 +69,9 @@ const blankQuestion = () => ({
   dml_kind: '',
   seed_sql: '',
   points: 10,
-  dual_schema: false,
+  // Always true — dual schema is enabled for every question and hidden from
+  // the lecturer.
+  dual_schema: true,
   strict_mode: {
     ordering: false,
     attributes: false,
@@ -148,7 +153,11 @@ const seedApplies = computed(
 )
 
 const examQuestions = ref<any[]>([])
-const sortKey = ref<'id'|'type'|'points'|null>(null)
+// Sorting/labelling is on display_no (the backend's per-exam 1-based position,
+// gap-free and restarting at 1 per exam) rather than the raw global id, which
+// keeps climbing after questions or whole exams are deleted. q.id is still the
+// key for edit/delete/lookup — only what the lecturer READS changed.
+const sortKey = ref<'display_no'|'type'|'points'|null>(null)
 const sortDir = ref<'asc'|'desc'>('asc')
 const filterText = ref('')
 
@@ -162,15 +171,16 @@ const displayedQuestions = computed(() => {
     const k = sortKey.value
     const dir = sortDir.value === 'asc' ? 1 : -1
     list.sort((a, b) => {
-      const av = k === 'type' ? (a.question_type || '') : (a[k] ?? 0)
-      const bv = k === 'type' ? (b.question_type || '') : (b[k] ?? 0)
+      // Same `type` vs `question_type` wire-name caveat as editQuestion below.
+      const av = k === 'type' ? (a.type || a.question_type || '') : (a[k] ?? 0)
+      const bv = k === 'type' ? (b.type || b.question_type || '') : (b[k] ?? 0)
       return av < bv ? -dir : av > bv ? dir : 0
     })
   }
   return list
 })
 
-function toggleSort(key: 'id'|'type'|'points') {
+function toggleSort(key: 'display_no'|'type'|'points') {
   if (sortKey.value === key) {
     sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
   } else {
@@ -469,16 +479,24 @@ const editQuestion = async (q: any) => {
   isEditMode.value = true
   question.value = {
     id: q.id,
+    display_no: q.display_no ?? 0,
     exam_id: q.exam_id,
     category_id: q.category_id ?? null,
     target_table: q.target_table || '',
     correct_sql: q.correct_sql || '',
     requirement: q.requirement || '',
-    type: q.question_type || 'QUERY',
+    // The exam-question wire format serializes the kind as `type`
+    // (models.Question, submission.go) — NOT `question_type`, which is the
+    // practice-question field name. Reading only `question_type` here silently
+    // fell back to 'QUERY', so editing a DML question showed (and re-saved) it
+    // as a QUERY. Both names are accepted so either shape loads correctly.
+    type: q.type || q.question_type || 'QUERY',
     dml_kind: q.dml_kind || '',
     seed_sql: q.seed_sql || '',
     points: q.points || 0,
-    dual_schema: q.dual_schema || false,
+    // Forced on regardless of what is stored, so re-saving an older
+    // single-schema question upgrades it.
+    dual_schema: true,
     strict_mode: {
       ordering: q.strict_mode?.ordering || false,
       attributes: q.strict_mode?.attributes || false,
@@ -506,6 +524,7 @@ async function onQuestionDropdownChange(event: Event) {
     isEditMode.value = false
     question.value = {
       id: 0,
+      display_no: 0,
       exam_id: props.exam.id,
       category_id: null,
       target_table: '',
@@ -515,7 +534,7 @@ async function onQuestionDropdownChange(event: Event) {
       dml_kind: '',
       seed_sql: '',
       points: 10,
-      dual_schema: false,
+      dual_schema: true,
       strict_mode: { ordering: false, attributes: false, column_order: false }
     }
     loadedQuestionSnapshot.value = JSON.stringify(question.value)
@@ -789,10 +808,11 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
   if (!questionValidation.validateAll()) return
 
   // Warn before overwriting an existing question when in create-new mode
-  if (!isEditMode.value && examQuestions.value.some((q: any) => q.id === question.value.id)) {
+  const clash = isEditMode.value ? undefined : examQuestions.value.find((q: any) => q.id === question.value.id)
+  if (clash) {
     const ok = await confirm({
       title: 'Overwrite existing question?',
-      body: `Question #${question.value.id} already exists and will be overwritten.`,
+      body: `Question Q${clash.display_no} already exists and will be overwritten.`,
       confirmLabel: 'Overwrite',
       danger: true
     })
@@ -808,7 +828,8 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
       },
-      body: JSON.stringify({ ...question.value, exam_id: props.exam.id }),
+      // display_no is a read-only, per-read projection — never echo it back.
+      body: JSON.stringify({ ...question.value, display_no: undefined, exam_id: props.exam.id }),
     })
 
     const data = await response.json().catch(() => ({} as any))
@@ -876,10 +897,10 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           <select id="exam-question-select" @change="onQuestionDropdownChange" :value="isEditMode ? question.id : ''">
             <option value="">Create new question</option>
             <option v-for="q in examQuestions" :key="q.id" :value="q.id">
-              Q{{ q.id }} — {{ (q.requirement || '').slice(0, 50) }}
+              Q{{ q.display_no }} — {{ (q.requirement || '').slice(0, 50) }}
             </option>
           </select>
-          <span v-if="isEditMode" class="badge badge-info" style="margin-top: var(--space-1); font-size: 0.75rem;">Editing #{{ question.id }}</span>
+          <span v-if="isEditMode" class="badge badge-info" style="margin-top: var(--space-1); font-size: 0.75rem;">Editing Q{{ question.display_no }}</span>
           <span v-else class="muted" style="font-size: 0.75rem; margin-top: var(--space-1);">New question - ID assigned on save</span>
         </div>
 
@@ -923,16 +944,9 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           <FieldError id="points-error" :message="questionValidation.touched.points ? questionValidation.errors.points : ''" />
         </div>
 
-        <!-- Dual schema applies to both QUERY and DML, so it is not gated by
-             question.type like the Target Table field above. -->
-        <div class="input-group">
-          <label><input type="checkbox" v-model="question.dual_schema" /> Dual schema (hidden grading)</label>
-          <!-- Independent, client-only validation (spec §6.1): no network round-trip,
-               purely reactive to question.value.dual_schema + examHasDecoy. -->
-          <span v-if="question.dual_schema && !examHasDecoy" class="badge badge-warning" style="display: inline-block; width: fit-content; font-weight: 600; margin-top: var(--space-1);">
-            Dual schema is enabled but this exam has no decoy curriculum yet — previews will use the grading schema until you upload one.
-          </span>
-        </div>
+        <!-- No dual-schema toggle: it is always on and hidden from the
+             lecturer. question.dual_schema is set to true by blankQuestion and
+             by editQuestion, so every save carries it. -->
       </div>
 
       <div v-if="showDraftBanner" class="draft-banner">
@@ -1071,64 +1085,11 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
       </div>
     </div><!-- /questionFormRef -->
 
-    <!-- Decoy curriculum (preview only) — same tables/columns as the exam's
-         real curriculum, different data; used by dual-schema questions so
-         the student's preview never leaks the grading data. Mirrors the
-         SqlEditor + single-flight + 409-then-confirm-replace pattern used by
-         the real-curriculum import in ExamSchemaPanel.vue, replicated
-         locally since that file is out of this TODO's scope. -->
-    <div style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">
-      <h3 style="margin: 0 0 var(--space-2) 0;">Decoy curriculum (preview only)</h3>
-      <p class="muted" style="margin: 0 0 var(--space-2) 0; font-size: 0.85rem;">
-        Paste a SQL script with the same tables and columns as this exam's real curriculum, but different data. Students previewing a dual-schema question see this data instead of the real grading data.
-      </p>
-      <SqlEditor v-model="importPreviewSql" height="200px" style="margin-bottom: var(--space-2);" />
-      <button
-        class="secondary-btn"
-        :disabled="importPreviewLoading || !importPreviewSql.trim()"
-        @click="doImportPreview"
-        style="margin-bottom: 0;"
-      >
-        <Spinner v-if="importPreviewLoading" size="sm" inline :invert="true" />{{ importPreviewLoading ? 'Importing...' : 'Import Decoy Curriculum' }}
-      </button>
-      <p v-if="examHasDecoy" class="muted" style="margin-top: var(--space-2); font-size: 0.85rem;">Decoy curriculum loaded — used for dual-schema question previews.</p>
-    </div>
-
-    <!-- Exam Description editor -->
-    <div style="margin-top: var(--space-5); border-top: 2px solid var(--color-border); padding-top: var(--space-5);">
-      <h3 style="margin: 0 0 var(--space-2) 0;">Exam Description</h3>
-      <p class="muted" style="margin: 0 0 var(--space-2) 0; font-size: 0.85rem;">This text is shown to enrolled students on the intro page before they begin the exam.</p>
-      <textarea
-        v-model="examIntroductionText"
-        class="input"
-        rows="4"
-        style="width: 100%; resize: vertical;"
-        placeholder="Describe the exam's database structure or any context students should know..."
-      ></textarea>
-      <div style="margin-top: var(--space-2); display: flex; gap: var(--space-2); align-items: center;">
-        <button class="btn-sm" :disabled="examIntroSaving" @click="saveExamIntroduction">
-          {{ examIntroSaving ? 'Saving...' : 'Save Description' }}
-        </button>
-        <button class="btn-sm" @click="toggleIntroPreview">
-          {{ showIntroPreview ? 'Hide preview' : 'Preview' }}
-        </button>
-      </div>
-      <div v-if="showIntroPreview" class="intro-preview-panel">
-        <div class="intro-preview-header">Student preview</div>
-        <p v-if="examIntroductionText" class="intro-preview-text">{{ examIntroductionText }}</p>
-        <p v-else class="intro-preview-placeholder">No description yet.</p>
-        <div v-if="previewImages.length > 0" class="intro-preview-images">
-          <img
-            v-for="(img, idx) in previewImages"
-            :key="img.id"
-            :src="previewThumbUrls[img.id]"
-            :alt="'Intro image ' + (idx + 1)"
-            class="intro-preview-img"
-          />
-        </div>
-      </div>
-      <IntroImagesEditor scope="exam" :owner-id="props.exam.id" />
-    </div>
+    <!-- The exam-level decoy-curriculum import and the exam description /
+         intro-images editors used to sit inline here. They now live in the
+         docked Exam Categories panel below, next to the per-category schema
+         and description editors they mirror, so the authoring column holds
+         only the question form and the questions list. -->
 
     <EmptyState v-if="examQuestions.length === 0" :compact="true" title="No questions in this exam yet" body="Use the form above to add the first question." />
     <div v-if="examQuestions.length > 0" class="questions-list-section" style="margin-top: 2rem; border-top: 2px solid var(--color-border); padding-top: 1rem;">
@@ -1138,7 +1099,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         <table class="preview-table">
           <thead>
             <tr>
-              <th @click="toggleSort('id')" style="cursor: pointer;">ID <Icon v-if="sortKey === 'id'" :name="sortDir === 'asc' ? 'chevron-up' : 'chevron-down'" /></th>
+              <th @click="toggleSort('display_no')" style="cursor: pointer;">Q# <Icon v-if="sortKey === 'display_no'" :name="sortDir === 'asc' ? 'chevron-up' : 'chevron-down'" /></th>
               <th @click="toggleSort('type')" style="cursor: pointer;">Type <Icon v-if="sortKey === 'type'" :name="sortDir === 'asc' ? 'chevron-up' : 'chevron-down'" /></th>
               <th @click="toggleSort('points')" style="cursor: pointer;">Points <Icon v-if="sortKey === 'points'" :name="sortDir === 'asc' ? 'chevron-up' : 'chevron-down'" /></th>
               <th>Requirement</th>
@@ -1148,8 +1109,8 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           </thead>
           <tbody>
             <tr v-for="q in displayedQuestions" :key="q.id">
-              <td>{{ q.id }}</td>
-              <td>{{ q.question_type }}</td>
+              <td>{{ q.display_no }}</td>
+              <td>{{ q.dml_kind || q.type || q.question_type }}</td>
               <td>{{ q.points }}</td>
               <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                 {{ q.requirement }}
@@ -1220,6 +1181,63 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
           </span>
         </div>
         <p class="muted" style="margin: 0 0 var(--space-3) 0; font-size: 0.85rem;">Each category can own its own database, kept separate from the exam-level schema above. Questions with no category grade against the exam-level schema.</p>
+
+        <!-- Exam-level settings, moved here from the authoring column so all
+             schema/description management lives in this one docked panel.
+             Collapsed by default (CollapsibleCard defaultOpen=false) — the
+             per-category cards below stay the primary content. -->
+        <CollapsibleCard title="Decoy curriculum (preview only)" test-id="exam-decoy-curriculum-card">
+          <template #header-meta>
+            <span v-if="examHasDecoy" class="badge badge-info">decoy</span>
+          </template>
+          <p class="muted" style="margin: 0 0 var(--space-2) 0; font-size: 0.85rem;">
+            Paste a SQL script with the same tables and columns as this exam's real curriculum, but different data. Students previewing a question see this data instead of the real grading data.
+          </p>
+          <SqlEditor v-model="importPreviewSql" height="200px" style="margin-bottom: var(--space-2);" />
+          <button
+            class="secondary-btn"
+            :disabled="importPreviewLoading || !importPreviewSql.trim()"
+            @click="doImportPreview"
+            style="margin-bottom: 0;"
+          >
+            <Spinner v-if="importPreviewLoading" size="sm" inline :invert="true" />{{ importPreviewLoading ? 'Importing...' : 'Import Decoy Curriculum' }}
+          </button>
+          <p v-if="examHasDecoy" class="muted" style="margin-top: var(--space-2); font-size: 0.85rem;">Decoy curriculum loaded — used for student question previews.</p>
+        </CollapsibleCard>
+
+        <CollapsibleCard title="Exam description &amp; intro images" test-id="exam-description-card">
+          <p class="muted" style="margin: 0 0 var(--space-2) 0; font-size: 0.85rem;">This text is shown to enrolled students on the intro page before they begin the exam.</p>
+          <textarea
+            v-model="examIntroductionText"
+            class="input"
+            rows="4"
+            style="width: 100%; resize: vertical;"
+            placeholder="Describe the exam's database structure or any context students should know..."
+          ></textarea>
+          <div style="margin-top: var(--space-2); display: flex; gap: var(--space-2); align-items: center;">
+            <button class="btn-sm" :disabled="examIntroSaving" @click="saveExamIntroduction">
+              {{ examIntroSaving ? 'Saving...' : 'Save Description' }}
+            </button>
+            <button class="btn-sm" @click="toggleIntroPreview">
+              {{ showIntroPreview ? 'Hide preview' : 'Preview' }}
+            </button>
+          </div>
+          <div v-if="showIntroPreview" class="intro-preview-panel">
+            <div class="intro-preview-header">Student preview</div>
+            <p v-if="examIntroductionText" class="intro-preview-text">{{ examIntroductionText }}</p>
+            <p v-else class="intro-preview-placeholder">No description yet.</p>
+            <div v-if="previewImages.length > 0" class="intro-preview-images">
+              <img
+                v-for="(img, idx) in previewImages"
+                :key="img.id"
+                :src="previewThumbUrls[img.id]"
+                :alt="'Intro image ' + (idx + 1)"
+                class="intro-preview-img"
+              />
+            </div>
+          </div>
+          <IntroImagesEditor scope="exam" :owner-id="props.exam.id" />
+        </CollapsibleCard>
 
         <!-- New category -->
         <div style="display: flex; gap: var(--space-2); margin-bottom: var(--space-4);">

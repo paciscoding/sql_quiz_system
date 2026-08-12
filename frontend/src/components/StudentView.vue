@@ -15,6 +15,7 @@ import { formatSql } from '../utils/format_sql'
 import { UI_COPY } from '../constants/ui_copy'
 import { getExamIntroduction, type ExamIntroduction } from '../services/exam'
 import SchemaImageWindow from './SchemaImageWindow.vue'
+import SchemaIntroWindow from './SchemaIntroWindow.vue'
 import { listExamIntroImages, type IntroImageMetadata } from '../services/schemaImages'
 
 const { notify } = useNotifications()
@@ -94,6 +95,13 @@ const activeView = ref<ActiveView>('intro')
 const examIntro = ref<ExamIntroduction | null>(null)
 const examIntroLoading = ref(false)
 const examIntroImages = ref<IntroImageMetadata[]>([])
+
+// The schema stays reachable while answering: the questions sub-view mounts the
+// same intro data as a floating, draggable SchemaIntroWindow (the pattern
+// PracticeView.vue already uses for category schemas) instead of forcing a
+// switch back to the intro sub-view. Closing the window only hides it until the
+// student reopens it from the header.
+const schemaWindowOpen = ref(true)
 
 async function fetchExamIntro(examId: string) {
   examIntroLoading.value = true
@@ -467,6 +475,15 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           @click="activeView = 'questions'"
           title="Go to questions"
         >Questions</button>
+        <!-- Reopen control for the floating schema window; only meaningful in
+             the questions sub-view, where that window lives. -->
+        <button
+          v-if="activeView === 'questions' && !schemaWindowOpen"
+          class="btn btn-secondary"
+          data-testid="student-schema-window-reopen"
+          title="Show the schema panel again"
+          @click="schemaWindowOpen = true"
+        >Show schema panel</button>
         <div v-if="activeView === 'questions'" class="field" style="margin: 0; flex: 1;">
           <label>Question</label>
           <select class="input" v-model="selectedQuestionId">
@@ -515,6 +532,27 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
       </template>
 
       <template v-else>
+
+      <!-- Schema stays on screen while answering: floating windows
+           (position: fixed), draggable/collapsible/minimizable, mounted for the
+           whole questions sub-view rather than only on the intro page. -->
+      <template v-if="schemaWindowOpen && selectedExam">
+        <SchemaImageWindow
+          v-if="examIntroImages.length > 0"
+          scope="exam"
+          :owner-id="selectedExam.id"
+          :images="examIntroImages"
+        />
+        <SchemaIntroWindow
+          scope="exam"
+          :owner-id="selectedExam.id"
+          :introduction="examIntro?.introduction ?? ''"
+          :tables="examIntro?.tables ?? []"
+          :imported="(examIntro?.tables?.length ?? 0) > 0"
+          mode="student"
+          @close="schemaWindowOpen = false"
+        />
+      </template>
 
       <div class="quiz-progress" v-if="questions.length > 0">
         <div class="qp-line">

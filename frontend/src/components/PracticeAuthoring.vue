@@ -227,7 +227,9 @@ const editQuestion = async (q: PracticeQuestion) => {
   // dml_kind/seed_sql default to '' so a question saved before those columns
   // existed carries a clean slate rather than undefined, and so an edit
   // round-trip never inherits the previously-loaded question's seed.
-  form.value = { dml_kind: '', seed_sql: '', ...editable }
+  // dual_schema is forced true: it is always on and hidden from the lecturer,
+  // so re-saving an older single-schema question upgrades it.
+  form.value = { dml_kind: '', seed_sql: '', ...editable, dual_schema: true }
   loadedAutoSeed.value = auto_seed ?? null
   loadedFormSnapshot.value = JSON.stringify(form.value)
 }
@@ -244,7 +246,7 @@ const resetForm = () => {
     strict_ordering: false,
     strict_attrs: false,
     strict_column_order: false,
-    dual_schema: false
+    dual_schema: true
   }
   loadedAutoSeed.value = null
   previewRows.value = []
@@ -265,7 +267,7 @@ const resetSubmissionForm = () => {
     strict_ordering: false,
     strict_attrs: false,
     strict_column_order: false,
-    dual_schema: false
+    dual_schema: true
   }
   loadedAutoSeed.value = null
   previewRows.value = []

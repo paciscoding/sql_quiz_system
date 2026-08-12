@@ -38,7 +38,16 @@ type Submission struct {
 }
 
 type Question struct {
-	ID          int        `json:"id"`
+	ID int `json:"id"`
+	// DisplayNo is the question's 1-based position WITHIN its exam, in the
+	// same order GetQuestionsByExamID returns (category grouping, then id).
+	// It is computed per read (ROW_NUMBER()) and never stored, so it stays
+	// gap-free and restarts at 1 for every exam — unlike ID, which comes from
+	// a global sequence and keeps climbing after questions or whole exams are
+	// deleted. Presentation only: every lookup, edit, and delete still keys on
+	// ID. Zero (and so omitted) on reads that cannot know the position, e.g.
+	// GetQuestionByID.
+	DisplayNo   int        `json:"display_no,omitempty"`
 	ExamID      *ExamID    `json:"exam_id,omitempty"`
 	TargetTable string     `json:"target_table"`
 	CorrectSQL  string     `json:"correct_sql"`

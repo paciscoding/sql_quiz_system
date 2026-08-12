@@ -217,7 +217,9 @@ const drillQuestionStats = computed(() => {
     const avgScore = distinctStudents > 0
       ? Array.from(bestByStudent.values()).reduce((acc, v) => acc + v, 0) / distinctStudents
       : 0
-    return { id: q.id, requirement: q.requirement, attempts, correctStudents, avgScore }
+    // display_no is the backend's per-exam 1-based position (gap-free, restarts
+    // at 1 per exam); id stays the row key and the submission join key.
+    return { id: q.id, displayNo: q.display_no ?? 0, requirement: q.requirement, attempts, correctStudents, avgScore }
   })
 })
 
@@ -353,7 +355,7 @@ onMounted(() => {
               </thead>
               <tbody>
                 <tr v-for="qs in drillQuestionStats" :key="qs.id">
-                  <td>{{ qs.id }}</td>
+                  <td>{{ qs.displayNo }}</td>
                   <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ qs.requirement }}</td>
                   <td>{{ qs.attempts }}</td>
                   <td>{{ qs.correctStudents }}</td>

@@ -577,8 +577,17 @@ func (r *PostgresRepository) GetQuestionsByExamID(ctx context.Context, examID in
 	// resolution (category_schema/category_preview_schema, both json:"-").
 	// ORDER BY groups categorised questions contiguously (name ASC), with
 	// uncategorised questions sorted last (ARCH-028 (2)(b) / ARCH-030).
+	//
+	// ROW_NUMBER() over that same ordering yields display_no: the question's
+	// 1-based position within THIS exam. It is computed per read and never
+	// stored, so deleting a question (or a whole exam) never leaves a gap and
+	// a new exam's first question is always 1 — the global app.questions_id_seq
+	// keeps climbing, but the lecturer no longer sees it (models.Question
+	// DisplayNo).
 	query := `
-		SELECT q.id, q.exam_id, q.target_table, q.correct_sql, q.question_type, q.points, q.requirement,
+		SELECT q.id,
+		       ROW_NUMBER() OVER (ORDER BY (q.category_id IS NULL) ASC, ec.name ASC, q.id ASC) AS display_no,
+		       q.exam_id, q.target_table, q.correct_sql, q.question_type, q.points, q.requirement,
 		       q.strict_ordering, q.strict_attributes, q.strict_column_order,
 		       q.expected_result, q.expected_columns, q.expected_result_status,
 		       q.expected_result_captured_at, q.capture_error, q.expected_rows_affected,
@@ -600,7 +609,7 @@ func (r *PostgresRepository) GetQuestionsByExamID(ctx context.Context, examID in
 	for rows.Next() {
 		var q models.Question
 		err := rows.Scan(
-			&q.ID, &q.ExamID, &q.TargetTable, &q.CorrectSQL, &q.Type, &q.Points, &q.Requirement,
+			&q.ID, &q.DisplayNo, &q.ExamID, &q.TargetTable, &q.CorrectSQL, &q.Type, &q.Points, &q.Requirement,
 			&q.StrictMode.Ordering, &q.StrictMode.Attributes, &q.StrictMode.ColumnOrder,
 			&q.ExpectedResult, &q.ExpectedColumns, &q.ExpectedResultStatus,
 			&q.ExpectedResultCapturedAt, &q.CaptureError, &q.ExpectedRowsAffected,
