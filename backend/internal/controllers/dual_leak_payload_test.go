@@ -68,7 +68,11 @@ func dualLeakExamQuestionsHandler(questions []models.Question) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		for i := range questions {
 			questions[i].CorrectSQL = ""
-			if questions[i].Type != "QUERY" || questions[i].DualSchema {
+			// Mirrors quiz_controller.go: dual QUERY questions now KEEP
+			// expected_result/expected_columns (the exam view shows the
+			// Expected Result table like practice does); only non-QUERY
+			// questions are stripped.
+			if questions[i].Type != "QUERY" {
 				questions[i].ExpectedResult = nil
 				questions[i].ExpectedColumns = nil
 			}

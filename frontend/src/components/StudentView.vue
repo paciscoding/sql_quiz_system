@@ -139,11 +139,6 @@ const selectedQuestion = computed<Question | null>(
 )
 const currentQuestion = computed(() => selectedQuestion.value)
 
-const briefTwoCol = computed(() => {
-  const n = currentQuestion.value?.expected_columns?.length ?? 0
-  return n > 0 && n <= 4
-})
-
 const currentIndex = computed(() =>
   questions.value.findIndex(q => q.id === selectedQuestionId.value))
 
@@ -305,6 +300,14 @@ const { inFlight: submitLoading, run: submitAnswer } = useSingleFlight(async () 
 
   error.value = ''
   result.value = null
+
+  // Show the student what their SQL actually returned, not just the verdict —
+  // the same thing PracticeView.doSubmit does before submitting. The preview
+  // runs in the read-only sandbox (ValidatePreview -> EvaluatePreview) and
+  // persists nothing, so it cannot influence the grade that follows. DML
+  // previews still redact row contents server-side; only the row count shows.
+  await testRun()
+
   const token = localStorage.getItem('sql_quiz_token')
 
   try {
@@ -562,7 +565,11 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
         <div class="qp-bar"><div class="qp-fill" :style="{ transform: 'scaleX(' + (progressPct / 100) + ')' }" /></div>
       </div>
 
-      <div class="pane-grid" :class="{ 'pane-grid--cols2': briefTwoCol }">
+      <!-- Single column, two rows: Question Brief on top, the answering panel
+           directly below it. Previously this switched to two side-by-side
+           columns when the expected-result table was narrow (briefTwoCol),
+           which pushed the SQL editor off to the right. -->
+      <div class="pane-grid">
         <div class="card">
           <h3 style="margin-top: 0;">Question Brief</h3>
           <div v-if="currentQuestion">
@@ -654,9 +661,6 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
   grid-template-columns: 1fr;
   gap: var(--space-5);
 }
-.pane-grid--cols2 {
-  grid-template-columns: 1fr 1fr;
-}
 
 .card {
   border: 1px solid var(--color-border);
@@ -723,7 +727,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
 .result-panel p { font-weight: 600; margin: 0; }
 
 @media (max-width: 768px) {
-  .pane-grid, .pane-grid--cols2 { grid-template-columns: 1fr; }
+  .pane-grid { grid-template-columns: 1fr; }
   .header-bar  { flex-direction: column; align-items: stretch; }
 }
 

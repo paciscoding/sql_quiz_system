@@ -142,15 +142,24 @@ func (ctrl *QuizController) GetExamQuestions(c *gin.Context) {
 	// Students see the expected result for QUERY questions (it's the target
 	// rows they're supposed to reproduce) but NOT for DML — revealing the
 	// post-image of a mutation question would leak the answer outright.
-	// Dual-schema questions strip both fields regardless of type: expected_result
-	// is captured on grading schema B, and a dual QUERY question's preview runs
-	// on decoy schema A, so shipping B's captured rows would hand the student
-	// the answer outright. This is driven by DualSchema alone, so it still
-	// applies while the question is in dual-without-decoy fallback (spec 6.1).
-	// Correct SQL is also stripped regardless of type.
+	//
+	// This used to also strip dual-schema QUERY questions, which in practice
+	// meant EVERY exam question (the lecturer UI authors exam questions with
+	// dual_schema = true), so the exam view never showed the "Expected Result"
+	// table that PracticeView shows. Product decision: show it, so exam and
+	// practice behave the same.
+	//
+	// KNOWN TRADE-OFF: expected_result is captured on grading schema B and
+	// grading compares the student's rows against it, so a student who can see
+	// those rows can reproduce them literally (SELECT ... FROM (VALUES ...))
+	// and score without writing the intended query. It is also B's data while
+	// the student's preview runs on decoy schema A, so the shown rows will not
+	// match their own test-run output on a dual question.
+	//
+	// Correct SQL is still stripped regardless of type.
 	for i := range questions {
 		questions[i].CorrectSQL = ""
-		if questions[i].Type != "QUERY" || questions[i].DualSchema {
+		if questions[i].Type != "QUERY" {
 			questions[i].ExpectedResult = nil
 			questions[i].ExpectedColumns = nil
 		}
