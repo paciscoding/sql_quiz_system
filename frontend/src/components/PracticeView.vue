@@ -475,6 +475,13 @@ function RefillData(text: string) {
   grid-template-columns: 1fr;
   gap: var(--space-5);
   align-items: start;
+  /* .pane-grid is itself a flex item of .practice-shell; flex items default
+     to min-width: auto, which refuses to shrink below the intrinsic width
+     of whatever's inside (here, the ResultTable's Expected Result table).
+     Without this, a wide query result pushes .pane-grid — and the whole
+     page — wider than the viewport instead of letting the table's own
+     wrapper scroll internally. */
+  min-width: 0;
 }
 
 .pane-grid.list-collapsed {
@@ -483,6 +490,15 @@ function RefillData(text: string) {
 
 .question-list-card.collapsed {
   padding: var(--space-2);
+}
+
+.editor-card {
+  /* .editor-card is a grid item of .pane-grid; grid items default to
+     min-width: auto, which sizes to the widest thing inside (the Expected
+     Result / Query Result tables). min-width: 0 lets it shrink to the
+     track's actual width so the ResultTable wrapper — not this card — owns
+     the horizontal scroll. */
+  min-width: 0;
 }
 
 .card-header {

@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import type { Examination } from './types'
 import ExamQuestionsPanel from './ExamQuestionsPanel.vue'
 import ExamRosterPanel from './ExamRosterPanel.vue'
+import ExamAnnouncementsPanel from './ExamAnnouncementsPanel.vue'
 import Icon from '../Icon.vue'
 
 defineProps<{ exam: Examination }>()
@@ -16,7 +17,7 @@ const emit = defineEmits<{
 // panel (inside Questions) already handles per-category schema import, so a
 // separate exam-level Schema navigation was redundant. ExamSchemaPanel.vue is
 // left on disk, unreferenced, in case the standalone panel is wanted again.
-const activeTab = ref<'questions' | 'roster'>('questions')
+const activeTab = ref<'questions' | 'roster' | 'announcements'>('questions')
 </script>
 
 <template>
@@ -29,10 +30,12 @@ const activeTab = ref<'questions' | 'roster'>('questions')
     <div class="tab-bar">
       <button :class="{ 'tab-active': activeTab === 'questions' }" @click="activeTab = 'questions'">Questions</button>
       <button :class="{ 'tab-active': activeTab === 'roster' }" @click="activeTab = 'roster'">Roster</button>
+      <button :class="{ 'tab-active': activeTab === 'announcements' }" @click="activeTab = 'announcements'">Announcements</button>
     </div>
 
     <ExamQuestionsPanel v-if="activeTab === 'questions'" :exam="exam" @changed="emit('changed')" />
     <ExamRosterPanel v-if="activeTab === 'roster'" :exam="exam" @changed="emit('changed')" />
+    <ExamAnnouncementsPanel v-if="activeTab === 'announcements'" :exam="exam" @changed="emit('changed')" />
   </div>
 </template>
 

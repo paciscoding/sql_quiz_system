@@ -464,6 +464,20 @@ const { inFlight: deleteQuestionLoading, run: deleteQuestion } = useSingleFlight
 
 const isEditMode = ref(false)
 
+// The normal Upsert path (POST /api/v1/lecturer/question) still hard-refuses to
+// touch a question of an active exam (postgres_questions.go CreateQuestion).
+// This computed tells the template/save flow when we're editing an EXISTING
+// question of a currently-active exam, in which case saveQuestion below routes
+// to the wording-only live-edit endpoint instead
+// (controllers/live_question_edit_controller.go). That endpoint can change
+// nothing but app.questions.requirement and never touches app.submissions, so
+// no grade can move. New-question creation on an active exam is untouched — it
+// still hits the normal path and is still refused server-side.
+const isLiveEditCandidate = computed(() => isEditMode.value && !!props.exam.is_active)
+
+// dual_schema as it was stored when the question was loaded for editing.
+const loadedDualSchema = ref(true)
+
 const previewResult = ref<PreviewResult>({ status: '', rows: [], columns: [], error: '' })
 const previewLoading = ref(false)
 const questionFormRef = ref<HTMLElement | null>(null)
@@ -503,6 +517,12 @@ const editQuestion = async (q: any) => {
       column_order: q.strict_mode?.column_order || false
     }
   }
+  // What was actually STORED for dual_schema, before the forced upgrade above.
+  // A wording-only live edit must echo the stored value back, otherwise the
+  // server sees dual_schema flip false->true, counts it as an answer-key change
+  // and refuses to fix a typo on a legacy single-schema question. The upgrade
+  // still happens on the normal (inactive-exam) save path.
+  loadedDualSchema.value = !!q.dual_schema
   loadedQuestionSnapshot.value = JSON.stringify(question.value)
   autoSeedPlan.value = q.auto_seed ?? null
   lastCapture.value = {
@@ -807,34 +827,87 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
   questionValidation.markTouched('correct_sql')
   if (!questionValidation.validateAll()) return
 
-  // Warn before overwriting an existing question when in create-new mode
-  const clash = isEditMode.value ? undefined : examQuestions.value.find((q: any) => q.id === question.value.id)
-  if (clash) {
+  const liveEdit = isLiveEditCandidate.value
+
+  if (liveEdit) {
     const ok = await confirm({
-      title: 'Overwrite existing question?',
-      body: `Question Q${clash.display_no} already exists and will be overwritten.`,
-      confirmLabel: 'Overwrite',
-      danger: true
+      title: 'Save wording to a running exam?',
+      body: 'This exam is running, so only the question wording will be saved. No answer is re-captured and no submission is re-graded — every score already recorded stays as it is. Students see the new wording the next time their exam view loads the questions. If you changed anything else, the save will be refused and nothing at all is written.',
+      confirmLabel: 'Save wording',
     })
     if (!ok) return
+  } else {
+    // Warn before overwriting an existing question when in create-new mode
+    const clash = isEditMode.value ? undefined : examQuestions.value.find((q: any) => q.id === question.value.id)
+    if (clash) {
+      const ok = await confirm({
+        title: 'Overwrite existing question?',
+        body: `Question Q${clash.display_no} already exists and will be overwritten.`,
+        confirmLabel: 'Overwrite',
+        danger: true
+      })
+      if (!ok) return
+    }
   }
 
   const token = localStorage.getItem('sql_quiz_token')
 
   try {
-    const response = await fetch('/api/v1/lecturer/question', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
-      // display_no is a read-only, per-read projection — never echo it back.
-      body: JSON.stringify({ ...question.value, display_no: undefined, exam_id: props.exam.id }),
-    })
+    const response = liveEdit
+      ? await fetch(`/api/v1/lecturer/exams/${props.exam.id}/questions/${question.value.id}/live-edit`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          // Same payload shape the normal path sends, plus confirm: true. The
+          // server compares every field against what is stored and refuses the
+          // whole request unless only the wording moved, so dual_schema has to
+          // carry the STORED value rather than the forced-on upgrade.
+          body: JSON.stringify({
+            ...question.value,
+            display_no: undefined,
+            exam_id: props.exam.id,
+            dual_schema: loadedDualSchema.value,
+            confirm: true,
+          }),
+        })
+      : await fetch('/api/v1/lecturer/question', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          // display_no is a read-only, per-read projection — never echo it back.
+          body: JSON.stringify({ ...question.value, display_no: undefined, exam_id: props.exam.id }),
+        })
 
     const data = await response.json().catch(() => ({} as any))
     if (!response.ok) {
+      // 400 on the live-edit route means the server refused because something
+      // other than the wording changed; data.error names the exact fields.
+      if (liveEdit && response.status === 400) {
+        throw new Error(data.error || 'Only the question wording can be changed while the exam is running. Nothing was saved.')
+      }
       throw new Error(data.error || 'Failed to save question')
+    }
+
+    if (liveEdit) {
+      lastCapture.value = { status: data.capture_status || '', error: '', capturedAt: null }
+
+      // regraded_count is always 0 on this route by construction — the endpoint
+      // cannot touch app.submissions at all. Saying so out loud is the point:
+      // it is what tells the lecturer their students' scores did not move.
+      notify('Wording updated. No submission was re-graded and no score changed.', 'success')
+
+      fetchExamQuestions()
+      loadCategories()
+      localStorage.removeItem(requirementDraftKey.value)
+      emit('changed')
+      // Stay on the same question in edit mode (unlike the create flow below) —
+      // there is nothing to reset since id/exam_id/category_id are unchanged.
+      loadedQuestionSnapshot.value = JSON.stringify(question.value)
+      return
     }
 
     // Adopt the server-assigned real id (create sent id=0; the backend
@@ -875,7 +948,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
     previewResult.value = { status: '', rows: [], columns: [], error: '' }
     previewAsStudentResult.value = { status: '', rows: [], columns: [], error: '' }
   } catch (err) {
-    handleApiError(err, { fallback: 'Failed to save question' })
+    handleApiError(err, { fallback: liveEdit ? 'Failed to save live edit' : 'Failed to save question' })
   }
 })
 </script>
@@ -947,6 +1020,13 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
         <!-- No dual-schema toggle: it is always on and hidden from the
              lecturer. question.dual_schema is set to true by blankQuestion and
              by editQuestion, so every save carries it. -->
+      </div>
+
+      <div v-if="isLiveEditCandidate" class="live-edit-banner" data-testid="live-edit-banner">
+        <strong>This exam is running.</strong> Only the question wording can be saved right now, and saving it
+        changes nothing else — no answer is re-captured and no submission is re-graded, so every score already
+        recorded stays exactly as it is. Changing the correct SQL, target table, question type, seed rows,
+        strict mode, category or points is refused until you deactivate the exam.
       </div>
 
       <div v-if="showDraftBanner" class="draft-banner">
@@ -1073,7 +1153,7 @@ const { inFlight: saveQuestionLoading, run: saveQuestion } = useSingleFlight(asy
       </div>
 
       <button @click="saveQuestion" :disabled="saveQuestionLoading" class="primary-btn">
-        <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : 'Save Question' }}
+        <Spinner v-if="saveQuestionLoading" size="sm" inline :invert="true" />{{ saveQuestionLoading ? 'Saving' : (isLiveEditCandidate ? 'Save & Re-capture (Live Exam)' : 'Save Question') }}
       </button>
 
       <div v-if="lastCapture.status" class="capture-status" :class="lastCapture.status">
@@ -1407,6 +1487,16 @@ textarea {
   flex-wrap: wrap;
   margin-bottom: var(--space-2);
   font-size: 0.85rem;
+}
+
+.live-edit-banner {
+  border: 2px solid var(--color-warning, var(--color-border));
+  background: var(--color-warning-bg, var(--color-surface-muted));
+  color: var(--color-warning, var(--color-text));
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+  font-size: 0.85rem;
+  line-height: 1.5;
 }
 
 .strict-mode-section {

@@ -1,4 +1,4 @@
-export type WindowMode = 'normal' | 'collapsed' | 'minimized'
+export type WindowMode = 'normal' | 'collapsed' | 'minimized' | 'fullscreen'
 
 export interface WindowState {
   mode: WindowMode

@@ -57,7 +57,7 @@ onBeforeUnmount(() => {
       </thead>
       <tbody>
         <tr v-for="(row, i) in rows" :key="i">
-          <td v-for="c in columns" :key="c">{{ row[c] ?? '' }}</td>
+          <td v-for="c in columns" :key="c" :title="row[c] ?? ''">{{ row[c] ?? '' }}</td>
         </tr>
       </tbody>
     </table>
@@ -68,8 +68,29 @@ onBeforeUnmount(() => {
 <style scoped>
 .responsive-table-wrap {
   position: relative;
+  /* Let the wrapper actually shrink to whatever width its flex/grid parent
+     gives it (instead of being pushed wide by the table's intrinsic width),
+     so overflow-x:auto (from the global .responsive-table-wrap rule) is the
+     thing that scrolls — not the surrounding card or the page body. The
+     wrapper's own border/background (also global) always match its own box,
+     which now tracks the visible/scrollable area rather than the content. */
+  min-width: 0;
+  max-width: 100%;
 }
-th {
+/* .data-table itself renders inside this component, so this scoped rule
+   overrides the global `width: 100%` without touching style.css: the table
+   fills the wrapper when content is narrow (min-width: 100%) but is free to
+   grow past it when content is wide (width: auto), which is what makes the
+   wrapper's horizontal scrollbar engage instead of the table clipping. */
+.data-table {
+  width: auto;
+  min-width: 100%;
+}
+th,
+td {
   white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 </style>

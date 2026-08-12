@@ -279,6 +279,7 @@ onMounted(() => {
     <div class="results-header">
       <h2>Consolidated Student Performance</h2>
       <div class="export-actions">
+        <router-link to="/lecturer/submission-log" class="secondary-btn" style="margin: 0; text-decoration: none; display: inline-flex; align-items: center;">View every attempt</router-link>
         <button @click="exportExamCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Exam Scores (CSV)</button>
         <button @click="exportPracticeCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Practice Scores (CSV)</button>
         <button @click="exportPracticeBreakdownCSV" class="secondary-btn" style="margin: 0;" :disabled="practiceResults.length === 0">Export Practice Breakdown (CSV)</button>

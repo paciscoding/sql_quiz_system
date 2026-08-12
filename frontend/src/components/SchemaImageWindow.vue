@@ -183,6 +183,116 @@ function restore() {
   state.pos.y = Math.max(TOP_INSET, Math.min(state.pos.y, maxY))
 }
 
+// ─── Fullscreen (zoom/pan) ────────────────────────────────────────────────────
+// Zoom/pan state is deliberately NOT part of `state` — it does not need to
+// persist across sessions, and always resets when fullscreen is (re-)entered.
+
+const zoomLevel = ref(1)
+const panX = ref(0)
+const panY = ref(0)
+const fsImgWrapRef = ref<HTMLElement | null>(null)
+
+// Mode to return to on exit — captured when entering fullscreen (not persisted).
+let previousFsMode: WindowState['mode'] = 'normal'
+
+function resetView() {
+  zoomLevel.value = 1
+  panX.value = 0
+  panY.value = 0
+}
+
+function enterFullscreen() {
+  if (state.mode === 'fullscreen') return
+  previousFsMode = state.mode
+  state.mode = 'fullscreen'
+  resetView()
+}
+
+function exitFullscreen() {
+  state.mode = previousFsMode
+}
+
+const ZOOM_MIN = 0.25
+const ZOOM_MAX = 8
+
+function onFsWheel(e: WheelEvent) {
+  e.preventDefault()
+  const wrap = fsImgWrapRef.value
+  if (!wrap) return
+  const rect = wrap.getBoundingClientRect()
+  // Coordinates relative to the wrap's centre — matches the image's default
+  // transform-origin (50% 50%), which is also where zoom=1/pan=0 centres it.
+  const cx = e.clientX - rect.left - rect.width / 2
+  const cy = e.clientY - rect.top - rect.height / 2
+  const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1
+  const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel.value * factor))
+  // Keep the point under the cursor fixed while zooming
+  panX.value = cx - ((cx - panX.value) / zoomLevel.value) * newZoom
+  panY.value = cy - ((cy - panY.value) / zoomLevel.value) * newZoom
+  zoomLevel.value = newZoom
+}
+
+let panning = false
+let panStartX = 0
+let panStartY = 0
+let panOriginX = 0
+let panOriginY = 0
+
+function onFsMousedown(e: MouseEvent) {
+  // Middle button always pans; left button pans too (cheap to allow).
+  if (e.button !== 0 && e.button !== 1) return
+  e.preventDefault()
+  panning = true
+  panStartX = e.clientX
+  panStartY = e.clientY
+  panOriginX = panX.value
+  panOriginY = panY.value
+  document.addEventListener('mousemove', onFsPanMove)
+  document.addEventListener('mouseup', onFsPanUp)
+}
+
+function onFsPanMove(e: MouseEvent) {
+  if (!panning) return
+  panX.value = panOriginX + (e.clientX - panStartX)
+  panY.value = panOriginY + (e.clientY - panStartY)
+}
+
+function onFsPanUp() {
+  panning = false
+  document.removeEventListener('mousemove', onFsPanMove)
+  document.removeEventListener('mouseup', onFsPanUp)
+}
+
+function onFsAuxclick(e: MouseEvent) {
+  // Suppress the browser's middle-click autoscroll icon / paste-on-click.
+  if (e.button === 1) e.preventDefault()
+}
+
+function onFsDblclick() {
+  resetView()
+}
+
+function onFsKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    exitFullscreen()
+  }
+}
+
+// Document-level Escape listener is only live while in fullscreen, since the
+// fullscreen overlay isn't guaranteed to hold DOM focus (unlike onKeydown
+// below, which relies on the normal-mode window's own tabindex focus).
+watch(
+  () => state.mode,
+  (mode, prevMode) => {
+    if (mode === 'fullscreen') {
+      document.addEventListener('keydown', onFsKeydown)
+    } else if (prevMode === 'fullscreen') {
+      document.removeEventListener('keydown', onFsKeydown)
+    }
+  }
+)
+
 // ─── Keyboard ────────────────────────────────────────────────────────────────
 
 function onKeydown(e: KeyboardEvent) {
@@ -219,6 +329,9 @@ onUnmounted(() => {
   document.removeEventListener('mouseup', onDocMouseup)
   document.removeEventListener('mousemove', onResizeMousemove)
   document.removeEventListener('mouseup', onResizeMouseup)
+  document.removeEventListener('mousemove', onFsPanMove)
+  document.removeEventListener('mouseup', onFsPanUp)
+  document.removeEventListener('keydown', onFsKeydown)
 })
 </script>
 
@@ -237,7 +350,72 @@ onUnmounted(() => {
     Schema Diagram
   </div>
 
-  <!-- Main floating window (hidden when minimized) -->
+  <!-- Fullscreen viewing mode — fills the viewport above everything else -->
+  <div
+    v-else-if="state.mode === 'fullscreen'"
+    class="siw-fullscreen"
+    role="dialog"
+    aria-roledescription="dialog"
+    :aria-label="`Schema Diagram fullscreen (${state.currentIndex + 1} of ${images.length})`"
+    tabindex="0"
+  >
+    <div class="siw-fs-topbar">
+      <span class="siw-title">
+        Schema Diagram
+        <span class="siw-counter" v-if="images.length > 1">
+          ({{ state.currentIndex + 1 }}/{{ images.length }})
+        </span>
+      </span>
+      <div class="siw-controls">
+        <button
+          class="siw-ctrl-btn"
+          title="Reset zoom (or double-click the image)"
+          @click="resetView"
+        >Reset</button>
+        <button
+          class="siw-ctrl-btn"
+          title="Exit fullscreen (Esc)"
+          @click="exitFullscreen"
+        >✕ Close</button>
+      </div>
+    </div>
+
+    <div
+      ref="fsImgWrapRef"
+      class="siw-fs-img-wrap"
+      @wheel="onFsWheel"
+      @mousedown="onFsMousedown"
+      @auxclick="onFsAuxclick"
+      @dblclick="onFsDblclick"
+    >
+      <img
+        v-if="objectUrl"
+        :src="objectUrl"
+        alt="Schema diagram"
+        class="siw-fs-img"
+        draggable="false"
+        :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoomLevel})` }"
+      />
+      <div v-else class="siw-img-placeholder">Loading image…</div>
+    </div>
+
+    <!-- Navigation row (only shown when multiple images) -->
+    <div v-if="images.length > 1" class="siw-nav siw-fs-nav">
+      <button
+        class="btn btn-secondary siw-nav-btn"
+        :disabled="state.currentIndex === 0"
+        @click="prev"
+      >&#8249; Prev</button>
+      <span class="siw-nav-counter">{{ state.currentIndex + 1 }} / {{ images.length }}</span>
+      <button
+        class="btn btn-secondary siw-nav-btn"
+        :disabled="state.currentIndex === images.length - 1"
+        @click="next"
+      >Next &#8250;</button>
+    </div>
+  </div>
+
+  <!-- Main floating window (hidden when minimized/fullscreen) -->
   <div
     v-else
     ref="windowRef"
@@ -275,6 +453,12 @@ onUnmounted(() => {
           @click.stop="toggleCollapse"
           @mousedown.stop
         >{{ state.mode === 'collapsed' ? '▾' : '▴' }}</button>
+        <button
+          class="siw-ctrl-btn"
+          title="Fullscreen"
+          @click.stop="enterFullscreen"
+          @mousedown.stop
+        >⛶</button>
         <button
           class="siw-ctrl-btn"
           title="Minimize"
@@ -499,6 +683,57 @@ onUnmounted(() => {
   z-index: 1;
 }
 .siw-resize-grip:hover { opacity: 1; }
+
+/* ── Fullscreen mode ──────────────────────────────────────────────────────── */
+.siw-fullscreen {
+  position: fixed;
+  inset: 0;
+  /* Above the sticky header (z-index 200) and above the normal window/chip. */
+  z-index: 900;
+  background: var(--color-surface);
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+
+.siw-fs-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--color-surface-sunk);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+  min-height: 40px;
+}
+
+.siw-fs-img-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-surface-muted);
+  cursor: grab;
+  touch-action: none;
+}
+.siw-fs-img-wrap:active { cursor: grabbing; }
+
+.siw-fs-img {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  display: block;
+  user-select: none;
+  will-change: transform;
+}
+
+.siw-fs-nav {
+  flex-shrink: 0;
+}
 
 /* ── Mobile fallback — render inline, hide drag/resize affordances ────────── */
 @media (max-width: 767px) {

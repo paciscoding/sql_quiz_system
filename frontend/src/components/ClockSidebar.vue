@@ -20,14 +20,7 @@ const timeStr = computed(() =>
 </script>
 
 <template>
-  <div class="sidebar-clock" role="region" aria-label="Server time">
-    <div class="clock-row">
-      <span class="clock-label">Date</span>
-      <span class="clock-value">{{ dateStr }}</span>
-    </div>
-    <div class="clock-row">
-      <span class="clock-label">Server Time</span>
-      <span class="clock-value">{{ timeStr }}</span>
-    </div>
+  <div class="clock-compact" role="region" aria-label="Server time">
+    <span class="clock-compact-value">{{ dateStr }} &middot; {{ timeStr }}</span>
   </div>
 </template>

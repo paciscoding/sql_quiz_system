@@ -535,7 +535,6 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   z-index: 50;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--space-4);
   padding: 0 var(--space-5);
   height: var(--layout-header-h);
@@ -570,6 +569,8 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
 .cms-header-right {
   display: flex; align-items: center; gap: var(--space-3);
   font-size: 0.86rem;
+  margin-left: auto;
+  flex-shrink: 0;
 }
 .cms-header-right .header-greeting { color: var(--color-text-muted); }
 .cms-header-right .header-greeting strong { color: var(--color-text); font-weight: 700; }
@@ -591,22 +592,10 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
 .cms-header-right .logout-btn:hover { background: #9c5d0d; color: #fff; }
 
 .cms-body {
-  display: grid;
-  grid-template-columns: var(--layout-sidebar-w) minmax(0, 1fr);
-  gap: var(--space-5);
   width: 100%;
   max-width: var(--layout-max-w);
   margin: 0 auto;
   padding: var(--space-5);
-}
-
-.cms-sidebar {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  align-self: start;
-  position: sticky;
-  top: calc(var(--layout-header-h) + var(--space-5));
 }
 
 .cms-main {
@@ -618,76 +607,54 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   box-shadow: var(--shadow-1);
 }
 
-/* When a view wants to render full-bleed (e.g. login), opt out of .cms-main.
-   The sidebar <aside> is absent on these routes, so the single grid child would
-   otherwise land in the fixed sidebar column (--layout-sidebar-w). Span the full
-   grid width so the content can use the whole viewport. */
+/* When a view wants to render full-bleed (e.g. login), opt out of .cms-main
+   chrome so the content can use the whole viewport. */
 .cms-main.is-bare {
-  grid-column: 1 / -1;
   background: transparent;
   border: none;
   box-shadow: none;
   padding: 0;
 }
 
-/* ---------- Sidebar widgets ---------------------------------------------- */
-.sidebar-clock {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-  padding: 12px 14px;
+/* ---------- Header clock (compact, no layout shift on tick) ------------- */
+.clock-compact {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  box-shadow: var(--shadow-1);
-}
-.sidebar-clock .clock-row {
-  display: flex; justify-content: space-between; align-items: baseline;
-  gap: 8px;
-}
-.sidebar-clock .clock-row + .clock-row {
-  margin-top: 6px;
-  padding-top: 6px;
-  border-top: 1px dashed var(--color-border-soft);
-}
-.sidebar-clock .clock-label {
-  font-family: var(--font-sans);
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--color-text-muted);
+  font-size: 0.82rem;
   font-weight: 600;
+  color: var(--color-text-muted);
+  white-space: nowrap;
 }
-.sidebar-clock .clock-value {
-  font-size: 1.02rem;
-  font-weight: 700;
-  color: var(--color-text);
-}
-.sidebar-clock .clock-value.is-urgent { color: #a83232; }
-.sidebar-clock .clock-value.is-warn   { color: #c97a14; }
+.clock-compact-value { letter-spacing: 0.01em; }
 
-.sidebar-nav {
-  background: var(--color-surface-muted);
-  border: 1px solid var(--color-border-soft);
-  border-radius: var(--radius);
-  padding: 6px;
+/* ---------- Primary nav (lives in the header) ---------------------------- */
+.cms-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex: 1 1 auto;
+  min-width: 0;
 }
-.sidebar-nav .nav-section {
-  padding: 6px 10px 4px;
+.cms-nav .nav-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.cms-nav .nav-group:not(:last-child) {
+  padding-right: var(--space-4);
+  border-right: 1px dashed var(--color-border-soft);
+}
+.cms-nav .nav-group-label {
+  display: none;
   font-size: 0.7rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--color-text-subtle);
   font-weight: 700;
 }
-.sidebar-nav .nav-section:not(:first-child) {
-  margin-top: 4px;
-  border-top: 1px dashed var(--color-border-soft);
-  padding-top: 10px;
-}
-.sidebar-nav a, .sidebar-nav button.nav-item {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  width: 100%;
-  padding: 7px 10px;
+.cms-nav a, .cms-nav button.nav-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px;
   font-size: 0.88rem;
   font-weight: 500;
   color: var(--color-text);
@@ -697,41 +664,24 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
   cursor: pointer;
   text-align: left;
   text-decoration: none;
-  border-bottom: 1px solid transparent;
+  white-space: nowrap;
 }
-.sidebar-nav a:hover, .sidebar-nav button.nav-item:hover {
-  background: var(--color-surface);
+.cms-nav a:hover, .cms-nav button.nav-item:hover {
+  background: var(--color-surface-muted);
   border-color: var(--color-border-soft);
   color: var(--color-link);
 }
-.sidebar-nav a.router-link-active,
-.sidebar-nav a.is-active,
-.sidebar-nav button.nav-item.is-active {
-  background: var(--color-surface);
+.cms-nav a.router-link-active,
+.cms-nav a.is-active,
+.cms-nav button.nav-item.is-active {
+  background: var(--color-surface-muted);
   border-color: var(--color-border);
   color: var(--color-primary);
   font-weight: 700;
-  box-shadow: inset 3px 0 0 var(--color-primary);
+  box-shadow: inset 0 -2px 0 var(--color-primary);
 }
-.sidebar-nav .nav-task-group {
-  padding: 4px;
-}
-.sidebar-nav .nav-task-title {
-  display: block;
-  padding: 6px 10px 2px;
-  font-size: 0.82rem;
-  font-weight: 700;
-  color: var(--color-text);
-  letter-spacing: -0.005em;
-}
-.sidebar-nav .nav-sublink {
-  padding-left: 22px;
-  font-size: 0.83rem;
-  color: var(--color-text-muted);
-}
-.sidebar-nav .nav-sublink.is-active { color: var(--color-primary); }
 
-/* ---------- Mobile nav drawer (keeps existing hamburger behavior) -------- */
+/* ---------- Mobile nav dropdown (anchored under the header) ------------- */
 .nav-hamburger {
   display: none;
   flex-direction: column;
@@ -745,14 +695,48 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
 .hbar { display: block; width: 18px; height: 2px; background: var(--color-text); border-radius: 1px; }
 
 @media (max-width: 1023.98px) {
-  .cms-body {
-    grid-template-columns: minmax(0, 1fr);
+  .cms-body { padding: var(--space-4); }
+
+  .cms-nav { display: none; }
+  .cms-nav.is-open {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 40;
+    background: var(--color-bg);
+    border-bottom: 1px solid var(--color-border);
+    box-shadow: var(--shadow-1);
     padding: var(--space-4);
+    max-height: calc(100dvh - var(--layout-header-h));
+    overflow-y: auto;
   }
-  .cms-sidebar {
-    position: static;
-    order: 2;
+  .cms-nav.is-open .nav-group {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
   }
+  .cms-nav.is-open .nav-group:not(:last-child) {
+    padding-right: 0;
+    padding-bottom: var(--space-2);
+    margin-bottom: var(--space-2);
+    border-right: none;
+    border-bottom: 1px dashed var(--color-border-soft);
+  }
+  .cms-nav.is-open .nav-group-label {
+    display: block;
+    padding: 6px 10px 4px;
+  }
+  .cms-nav.is-open a, .cms-nav.is-open button.nav-item {
+    width: 100%;
+  }
+}
+@media (max-width: 899.98px) {
+  .cms-header-right .clock-compact { display: none; }
 }
 @media (max-width: 767.98px) {
   .cms-header { padding: 0 var(--space-3); }
@@ -1027,7 +1011,7 @@ input[type='file'] { padding: 5px; background: var(--color-surface); }
 @media (pointer: coarse) {
   .btn,
   .primary-btn, .secondary-btn, .success-btn, .fail-btn, .toggle-btn,
-  .sidebar-nav a, .sidebar-nav button.nav-item,
+  .cms-nav a, .cms-nav button.nav-item,
   .cms-header-right .locale-select,
   input:not([type='checkbox']):not([type='radio']), select, textarea {
     min-height: 44px;

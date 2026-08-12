@@ -79,6 +79,12 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true, allowedRoles: ['ADMIN', 'LECTURER'] }
   },
   {
+    path: '/lecturer/submission-log',
+    name: 'lecturer-submission-log',
+    component: () => import('./components/lecturer/SubmissionLog.vue'),
+    meta: { requiresAuth: true, allowedRoles: ['ADMIN', 'LECTURER'] }
+  },
+  {
     path: '/admin/bulk-reset',
     name: 'admin-bulk-reset',
     component: () => import('./components/BulkPasswordReset.vue'),

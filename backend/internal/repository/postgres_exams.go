@@ -197,11 +197,12 @@ func (r *PostgresRepository) ArchiveExamination(ctx context.Context, id int) err
 }
 
 func (r *PostgresRepository) AddStudentsToExam(ctx context.Context, examID int, studentIDs []int) error {
-	exam, err := r.GetExamByID(ctx, examID)
-	if err == nil && ExaminationEffectiveState(exam).ActiveNow {
-		return fmt.Errorf("%w: cannot assign students to an active examination", ErrExamActive)
-	}
-
+	// Adding students while the exam is effectively active is allowed: this
+	// covers late-joining students being enrolled mid-exam. The exam sandbox
+	// (app.exam_sandboxes) is keyed by exam_id, not per student, so no
+	// per-student provisioning is needed for a late joiner. The reverse
+	// operation (RemoveStudentFromExam) stays blocked while active, since
+	// removing a student mid-exam would orphan their submissions.
 	return r.WithTransaction(ctx, func(tx pgx.Tx) error {
 		for _, studentID := range studentIDs {
 			_, err := tx.Exec(ctx,

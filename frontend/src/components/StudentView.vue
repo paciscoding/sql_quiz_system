@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import SqlEditor from './SqlEditor.vue'
 import EmptyState from './EmptyState.vue'
 import Icon from './Icon.vue'
 import ResultTable from './ResultTable.vue'
 import SchemaIntroduction from './SchemaIntroduction.vue'
+import CollapsibleCard from './CollapsibleCard.vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
 import { useExamStream } from '../composables/useExamStream'
 import { useNotifications } from '../services/notification_service'
@@ -17,6 +18,7 @@ import { getExamIntroduction, type ExamIntroduction } from '../services/exam'
 import SchemaImageWindow from './SchemaImageWindow.vue'
 import SchemaIntroWindow from './SchemaIntroWindow.vue'
 import { listExamIntroImages, type IntroImageMetadata } from '../services/schemaImages'
+import { listExamAnnouncements, type ExamAnnouncement } from '../services/announcements'
 
 const { notify } = useNotifications()
 
@@ -51,6 +53,7 @@ interface Examination {
   effective_state: string
   scheduled_start_at: string | null
   scheduled_end_at: string | null
+  activated_at?: string | null
 }
 
 interface Question {
@@ -121,6 +124,110 @@ async function fetchExamIntro(examId: string) {
   }
 }
 
+// ─── Announcements ────────────────────────────────────────────────────────────
+// Polled every 30s while an exam is selected and effectively active (phase
+// === 'active'). Cached in localStorage per exam + activation stamp so a
+// re-activation (new activated_at) discards the previous run's announcements
+// client-side, matching the server's sent_at >= activated_at gating.
+const announcements = ref<ExamAnnouncement[]>([])
+const seenAnnouncementIds = ref<Set<number>>(new Set())
+const unseenAnnouncementQueue = ref<ExamAnnouncement[]>([])
+let announcementsTimer: ReturnType<typeof setInterval> | null = null
+
+function announcementsCacheKey(examId: string) { return `exam_announcements:${examId}` }
+function announcementsSeenKey(examId: string) { return `exam_announcements_seen:${examId}` }
+
+function loadCachedAnnouncements(examId: string, activatedAt: string | null): ExamAnnouncement[] {
+  try {
+    const raw = localStorage.getItem(announcementsCacheKey(examId))
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (parsed.activated_at !== activatedAt) return []
+    return Array.isArray(parsed.items) ? parsed.items : []
+  } catch (_) { return [] }
+}
+
+function saveCachedAnnouncements(examId: string, activatedAt: string | null, items: ExamAnnouncement[]) {
+  try {
+    localStorage.setItem(announcementsCacheKey(examId), JSON.stringify({ activated_at: activatedAt, items }))
+  } catch (_) { /* storage full/unavailable — non-fatal */ }
+}
+
+function loadSeenAnnouncementIds(examId: string, activatedAt: string | null): Set<number> {
+  try {
+    const raw = localStorage.getItem(announcementsSeenKey(examId))
+    if (!raw) return new Set()
+    const parsed = JSON.parse(raw)
+    if (parsed.activated_at !== activatedAt) return new Set()
+    return new Set(Array.isArray(parsed.ids) ? parsed.ids : [])
+  } catch (_) { return new Set() }
+}
+
+function saveSeenAnnouncementIds(examId: string, activatedAt: string | null, ids: Set<number>) {
+  try {
+    localStorage.setItem(announcementsSeenKey(examId), JSON.stringify({ activated_at: activatedAt, ids: Array.from(ids) }))
+  } catch (_) { /* storage full/unavailable — non-fatal */ }
+}
+
+async function fetchAnnouncements() {
+  const exam = selectedExam.value
+  if (!exam) return
+  const activatedAt = exam.activated_at ?? null
+  try {
+    const data = await listExamAnnouncements(exam.id)
+    announcements.value = data
+    saveCachedAnnouncements(exam.id, activatedAt, data)
+    const alreadyQueued = new Set(unseenAnnouncementQueue.value.map(a => a.id))
+    for (const a of data) {
+      if (!seenAnnouncementIds.value.has(a.id) && !alreadyQueued.has(a.id)) {
+        unseenAnnouncementQueue.value.push(a)
+      }
+    }
+  } catch (_) {
+    // Fail silently: 403/404 just means the exam isn't currently active for
+    // announcement purposes (or enrollment changed) — no toast spam, no
+    // announcements shown.
+  }
+}
+
+function stopAnnouncementsPoll() {
+  if (announcementsTimer !== null) {
+    clearInterval(announcementsTimer)
+    announcementsTimer = null
+  }
+}
+
+function startAnnouncementsPoll() {
+  stopAnnouncementsPoll()
+  announcementsTimer = setInterval(fetchAnnouncements, 30000)
+}
+
+function initAnnouncementsForExam(exam: Examination) {
+  const activatedAt = exam.activated_at ?? null
+  announcements.value = loadCachedAnnouncements(exam.id, activatedAt)
+  seenAnnouncementIds.value = loadSeenAnnouncementIds(exam.id, activatedAt)
+  unseenAnnouncementQueue.value = []
+  fetchAnnouncements()
+  startAnnouncementsPoll()
+}
+
+function resetAnnouncements() {
+  stopAnnouncementsPoll()
+  announcements.value = []
+  seenAnnouncementIds.value = new Set()
+  unseenAnnouncementQueue.value = []
+}
+
+function dismissAnnouncement(id: number) {
+  seenAnnouncementIds.value.add(id)
+  if (selectedExam.value) {
+    saveSeenAnnouncementIds(selectedExam.value.id, selectedExam.value.activated_at ?? null, seenAnnouncementIds.value)
+  }
+  unseenAnnouncementQueue.value = unseenAnnouncementQueue.value.filter(a => a.id !== id)
+}
+
+onBeforeUnmount(stopAnnouncementsPoll)
+
 // ─── ACTIVE phase state ──────────────────────────────────────────────────────
 const questions = ref<Question[]>([])
 const selectedQuestionId = ref<number | null>(null)
@@ -131,7 +238,7 @@ const previewLoading = ref(false)
 const previewResult = ref<PreviewResult | null>(null)
 const previewStale = ref(false)
 const answerStatus = ref<Record<number, boolean>>({})
-const progressMap = ref<Record<number, { answered: boolean; correct: boolean }>>({})
+const progressMap = ref<Record<number, { answered: boolean; correct: boolean; score?: number }>>({})
 const editorWrapRef = ref<HTMLElement | null>(null)
 
 const selectedQuestion = computed<Question | null>(
@@ -179,6 +286,46 @@ const questionGroups = computed<QuestionGroup[]>(() => {
   return groups
 })
 
+// mergedQuestionStatus combines answerStatus (optimistic, just-submitted) with
+// progressMap (server-fetched via GET .../results) the same way
+// answeredCount/correctCount above do, but also carries the score so the
+// question dropdown and the selected-question status row can show it.
+const mergedQuestionStatus = computed<Record<number, { answered: boolean; correct: boolean; score?: number }>>(() => {
+  const merged: Record<number, { answered: boolean; correct: boolean; score?: number }> = { ...progressMap.value }
+  for (const [k, v] of Object.entries(answerStatus.value)) {
+    const qid = Number(k)
+    const existing = merged[qid]
+    merged[qid] = { answered: true, correct: v, score: existing?.score }
+  }
+  return merged
+})
+
+// optionStatusMarker renders the plain-text status marker used inside a
+// native <option> label (SVG icons cannot appear there): a checkmark with the
+// score for a correct answer, an X with the score for an incorrect one, or a
+// middle dot for a question the student hasn't submitted yet.
+function optionStatusMarker(q: Question): string {
+  const status = mergedQuestionStatus.value[q.id]
+  if (!status || !status.answered) return '· unanswered'
+  const scoreText = status.score != null ? `${status.score}/${q.points}` : ''
+  return (status.correct ? `✔ ${scoreText}` : `✖ ${scoreText}`).trim()
+}
+
+// selectedQuestionStatus drives the icon + colour-coded row shown next to the
+// question dropdown for whichever question is currently selected.
+const selectedQuestionStatus = computed(() => {
+  const q = selectedQuestion.value
+  if (!q) return null
+  const status = mergedQuestionStatus.value[q.id]
+  if (!status || !status.answered) {
+    return { icon: 'circle-help', colorVar: 'var(--color-text-muted)', text: 'Not answered yet' }
+  }
+  const scoreText = status.score != null ? ` — ${status.score}/${q.points} pts` : ''
+  return status.correct
+    ? { icon: 'circle-check', colorVar: 'var(--color-success)', text: `Correct${scoreText}` }
+    : { icon: 'circle-x', colorVar: 'var(--color-danger)', text: `Incorrect${scoreText}` }
+})
+
 // ─── Watchers ────────────────────────────────────────────────────────────────
 watch(selectedQuestionId, () => {
   result.value = null
@@ -189,32 +336,48 @@ watch(selectedQuestionId, () => {
 
 watch(sqlText, () => { if (previewResult.value !== null) previewStale.value = true })
 
+// Stop polling for announcements as soon as the exam is no longer effectively
+// active (e.g. a lecturer ends it mid-session) — the backend would 403/404
+// the poll anyway, but this avoids the pointless requests.
+watch(effectiveState, (state) => {
+  if (phase.value === 'active' && state !== 'active') stopAnnouncementsPoll()
+})
+
+// fetchResults hits GET /api/v1/quiz/exams/:id/results — the per-question
+// score/correctness history for the selected exam — and rebuilds
+// progressMap from it. Reused on exam selection and again after every
+// successful submit so the dropdown/status row reflect the server's record,
+// not just the just-submitted question.
+const fetchResults = async () => {
+  const id = selectedExamId.value
+  if (id === null) return
+  try {
+    const token = localStorage.getItem('sql_quiz_token')
+    const res = await fetch(`/api/v1/quiz/exams/${id}/results`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (res.ok) {
+      const data = await res.json()
+      const map: Record<number, { answered: boolean; correct: boolean; score?: number }> = {}
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          if (item.question_id != null) {
+            map[item.question_id] = { answered: true, correct: !!item.is_correct, score: item.score }
+          }
+        }
+      }
+      progressMap.value = map
+    }
+  } catch (_) { /* silently ignore */ }
+}
+
 // When the selected exam changes, reset progress state
 watch(selectedExamId, async (id) => {
   answerStatus.value = {}
   progressMap.value = {}
   questions.value = []
   selectedQuestionId.value = null
-  if (id !== null) {
-    try {
-      const token = localStorage.getItem('sql_quiz_token')
-      const res = await fetch(`/api/v1/quiz/results/${id}`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      })
-      if (res.ok) {
-        const data = await res.json()
-        const map: Record<number, { answered: boolean; correct: boolean }> = {}
-        if (Array.isArray(data)) {
-          for (const item of data) {
-            if (item.question_id != null) {
-              map[item.question_id] = { answered: true, correct: !!item.is_correct }
-            }
-          }
-        }
-        progressMap.value = map
-      }
-    } catch (_) { /* silently ignore */ }
-  }
+  if (id !== null) await fetchResults()
 })
 
 // ─── Badge helpers ───────────────────────────────────────────────────────────
@@ -247,6 +410,7 @@ function selectExam(exam: Examination) {
     activeView.value = 'intro'
     fetchQuestions()
     fetchExamIntro(exam.id)
+    initAnnouncementsForExam(exam)
   } else {
     phase.value = 'waiting'
   }
@@ -254,6 +418,7 @@ function selectExam(exam: Examination) {
 
 function goBackToSelect() {
   closeStream()
+  resetAnnouncements()
   selectedExam.value = null
   questions.value = []
   selectedQuestionId.value = null
@@ -272,6 +437,7 @@ function startExam() {
   activeView.value = 'intro'
   fetchQuestions()
   if (selectedExamId.value !== null) fetchExamIntro(selectedExamId.value)
+  if (selectedExam.value) initAnnouncementsForExam(selectedExam.value)
 }
 
 // ─── ACTIVE phase actions ────────────────────────────────────────────────────
@@ -348,6 +514,9 @@ const { inFlight: submitLoading, run: submitAnswer } = useSingleFlight(async () 
     } else {
       notify('Incorrect answer.', 'error')
     }
+    // Refresh from the server so the score/status shown in the dropdown and
+    // status row match the persisted record, not just the optimistic merge.
+    await fetchResults()
   } catch (err) {
     handleApiError(err, { fallback: 'Failed to submit answer' })
   }
@@ -494,18 +663,41 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
             <template v-if="hasCategorizedQuestions">
               <optgroup v-for="(group, gi) in questionGroups" :key="gi" :label="group.label">
                 <option v-for="item in group.items" :key="item.question.id" :value="item.question.id">
-                  Q{{ item.index + 1 }} ({{ item.question.type }} - {{ item.question.points }} pts)
+                  Q{{ item.index + 1 }} ({{ item.question.type }} - {{ item.question.points }} pts) — {{ optionStatusMarker(item.question) }}
                 </option>
               </optgroup>
             </template>
             <template v-else>
               <option v-for="(q, i) in questions" :key="q.id" :value="q.id">
-                Q{{ i + 1 }} ({{ q.type }} - {{ q.points }} pts)
+                Q{{ i + 1 }} ({{ q.type }} - {{ q.points }} pts) — {{ optionStatusMarker(q) }}
               </option>
             </template>
           </select>
+          <div v-if="selectedQuestionStatus" class="question-status-row" :style="{ color: selectedQuestionStatus.colorVar }">
+            <Icon :name="selectedQuestionStatus.icon" />
+            <span>{{ selectedQuestionStatus.text }}</span>
+          </div>
         </div>
       </div>
+
+      <CollapsibleCard
+        v-if="phase === 'active'"
+        title="Announcements"
+        :subtitle="announcements.length ? `${announcements.length} message${announcements.length === 1 ? '' : 's'}` : undefined"
+        :default-open="announcements.length > 0"
+        test-id="student-announcements"
+      >
+        <p v-if="announcements.length === 0" class="muted" style="margin: 0;">No announcements yet.</p>
+        <ul v-else class="announcement-list">
+          <li v-for="a in announcements" :key="a.id" class="announcement-item">
+            <div class="announcement-item-meta">
+              <strong>{{ a.lecturer_name }}</strong>
+              <span class="muted announcement-item-time">{{ new Date(a.sent_at).toLocaleString() }}</span>
+            </div>
+            <p class="announcement-item-message">{{ a.message }}</p>
+          </li>
+        </ul>
+      </CollapsibleCard>
 
       <!-- Intro sub-view: shown when activeView === 'intro' -->
       <template v-if="activeView === 'intro'">
@@ -636,6 +828,39 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
       </template><!-- end v-else (questions sub-view) -->
     </template><!-- end ACTIVE phase -->
 
+    <!-- Unseen-announcement dialog: reuses the app's modal/dialog markup
+         convention (see ConfirmDialogHost.vue). Multiple unseen announcements
+         queue up here — dismissing the front one reveals the next. -->
+    <Teleport to="body">
+      <div
+        v-if="unseenAnnouncementQueue.length > 0"
+        class="announcement-backdrop"
+        role="presentation"
+        @click.self="dismissAnnouncement(unseenAnnouncementQueue[0].id)"
+      >
+        <div
+          class="announcement-dialog"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="announcement-dialog-title"
+        >
+          <h3 id="announcement-dialog-title" class="announcement-dialog-title">
+            Announcement from {{ unseenAnnouncementQueue[0].lecturer_name }}
+          </h3>
+          <p class="muted announcement-dialog-time">{{ new Date(unseenAnnouncementQueue[0].sent_at).toLocaleString() }}</p>
+          <p class="announcement-dialog-message">{{ unseenAnnouncementQueue[0].message }}</p>
+          <div class="announcement-dialog-actions">
+            <span v-if="unseenAnnouncementQueue.length > 1" class="muted" style="margin-right: auto; font-size: 0.8rem;">
+              {{ unseenAnnouncementQueue.length - 1 }} more
+            </span>
+            <button type="button" class="btn btn-primary" @click="dismissAnnouncement(unseenAnnouncementQueue[0].id)">
+              Got it
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
   </div>
 </template>
 
@@ -660,6 +885,15 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
   display: grid;
   grid-template-columns: 1fr;
   gap: var(--space-5);
+}
+/* Grid items default to min-width: auto, which lets a wide table's
+   min-content size push the track (and the surrounding page) wider instead
+   of scrolling inside its own card. min-width: 0 lets the card shrink to the
+   track width so the table wrapper (ResultTable's .responsive-table-wrap,
+   global in style.css) owns the horizontal overflow and the card's own
+   background always covers the full visible width. */
+.pane-grid > * {
+  min-width: 0;
 }
 
 .card {
@@ -720,6 +954,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
   border-radius: var(--radius);
   margin-top: var(--space-3);
   padding: 10px 14px;
+  min-width: 0;
 }
 .result-panel.correct       { background: var(--color-success-bg); color: var(--color-success); border-color: #c4dfba; }
 .result-panel.incorrect     { background: var(--color-warning-bg); color: var(--color-warning); border-color: #ecd998; }
@@ -760,5 +995,85 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
 }
 @media (prefers-reduced-motion: reduce) {
   .qp-fill { transition: none; }
+}
+
+/* ── Question status row (Task A) ─────────────────────────────────────── */
+.question-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/* ── Announcements (Task B) ───────────────────────────────────────────── */
+.announcement-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.announcement-item {
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--color-surface-sunk);
+}
+.announcement-item-meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-bottom: 4px;
+}
+.announcement-item-time {
+  font-size: 0.78rem;
+}
+.announcement-item-message {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.announcement-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  padding: var(--space-4);
+}
+.announcement-dialog {
+  background: var(--color-surface);
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  max-width: 480px;
+  width: 100%;
+  box-shadow: var(--shadow-2);
+}
+.announcement-dialog-title {
+  margin: 0 0 var(--space-2) 0;
+  font-weight: 800;
+  font-size: 1.05rem;
+}
+.announcement-dialog-time {
+  margin: 0 0 var(--space-3) 0;
+  font-size: 0.8rem;
+}
+.announcement-dialog-message {
+  margin: 0 0 var(--space-4) 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.announcement-dialog-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  justify-content: flex-end;
 }
 </style>

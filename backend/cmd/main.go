@@ -152,6 +152,9 @@ func main() {
 	userCtrl := controllers.NewUserController(authService, studentImportService)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
 	examCategoryCtrl := controllers.NewExamCategoryController(repo)
+	announcementCtrl := controllers.NewAnnouncementController(repo)
+	liveQuestionEditCtrl := controllers.NewLiveQuestionEditController(repo)
+	submissionLogCtrl := controllers.NewSubmissionLogController(repo)
 	// Practice is live during exams by default; this gate only blocks practice
 	// when an active exam has its block_practice_during_exam toggle on (OQ-1).
 	practiceFreezeMW := middleware.PracticeFreezeMiddleware(repo)
@@ -248,6 +251,7 @@ func main() {
 			// the enrollment check inside the handler.
 			quiz.GET("/exams/:id/categories", controllers.RoleMiddleware(models.RoleStudent, models.RoleAdmin, models.RoleLecturer), examCategoryCtrl.GetExamCategories)
 			quiz.GET("/results", controllers.RoleMiddleware(models.RoleStudent), quizCtrl.GetMyResultsSummary)
+			quiz.GET("/exams/:id/announcements", controllers.RoleMiddleware(models.RoleStudent), announcementCtrl.ListActiveAnnouncements)
 		}
 
 		// Protected Lecturer/Admin Routes
@@ -270,6 +274,11 @@ func main() {
 			staff.PUT("/lecturer/exams/:id/deactivate", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeactivateExamination)
 			staff.PUT("/lecturer/exams/:id/practice-freeze", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.SetPracticeFreeze)
 			staff.PUT("/lecturer/exams/:id/introduction", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.SetExamIntroduction)
+			// Wording-only edit of a question belonging to a RUNNING exam. The
+			// normal authoring path above still refuses every question mutation
+			// while the exam is active; this narrower door can only rewrite
+			// app.questions.requirement and never touches app.submissions.
+			staff.PUT("/lecturer/exams/:id/questions/:questionId/live-edit", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), liveQuestionEditCtrl.LiveEditQuestion)
 			// Exam intro images: staff mutations (upload, delete, reorder).
 			staff.POST("/lecturer/exams/:id/intro-images", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.UploadExamIntroImage)
 			staff.DELETE("/lecturer/exams/:id/intro-images/:imageId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.DeleteExamIntroImage)
@@ -293,6 +302,16 @@ func main() {
 			staff.DELETE("/lecturer/exams/:id/students/:studentId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.RemoveStudentFromExam)
 			staff.POST("/lecturer/exams/:id/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.AssignStudents)
 			staff.GET("/lecturer/scores", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), lecturerCtrl.GetConsolidatedScores)
+			// Per-attempt submission log. Read-only: app.submissions is
+			// insert-only, and these handlers only ever SELECT from it. The
+			// ".csv" sibling is a distinct static segment, so it does not
+			// collide with the "/:submissionId" route below it.
+			staff.GET("/lecturer/submission-log", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), submissionLogCtrl.ListSubmissionLog)
+			staff.GET("/lecturer/submission-log.csv", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), submissionLogCtrl.ExportSubmissionLogCSV)
+			staff.GET("/lecturer/submission-log/:submissionId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), submissionLogCtrl.GetSubmissionLogEntry)
+			staff.POST("/lecturer/exams/:id/announcements", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), announcementCtrl.CreateAnnouncement)
+			staff.GET("/lecturer/exams/:id/announcements", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), announcementCtrl.ListAnnouncements)
+			staff.DELETE("/lecturer/exams/:id/announcements/:announcementId", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), announcementCtrl.DeleteAnnouncement)
 			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin), userCtrl.CreateAccount)
 			// Single-student create/upsert — shares the importer's parity path.
 			staff.POST("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateStudent)

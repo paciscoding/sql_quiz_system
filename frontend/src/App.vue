@@ -105,30 +105,16 @@ const locales = [
         <span class="hbar" /><span class="hbar" /><span class="hbar" />
       </button>
 
-      <div v-if="isLoggedIn" class="cms-header-right">
-        <select v-model="locale" class="locale-select" aria-label="Language" disabled title="Additional languages coming soon">
-          <option v-for="l in locales" :key="l.code" :value="l.code">{{ l.label }}</option>
-        </select>
-        <span class="header-greeting">
-          Logged in as <strong>{{ user.username }}</strong>
-        </span>
-        <button class="btn btn-sm logout-btn" @click="logout">{{ UI_COPY.LOGOUT }}</button>
-      </div>
-    </header>
-
-    <!-- Two-column body -->
-    <div class="cms-body">
-      <aside
+      <nav
         v-if="showSidebar"
         ref="navRef"
         id="main-nav-links"
-        class="cms-sidebar"
+        class="cms-nav"
         :class="{ 'is-open': navOpen }"
+        aria-label="Primary"
       >
-        <ClockSidebar />
-
-        <nav class="sidebar-nav" aria-label="Primary">
-          <div class="nav-section">General</div>
+        <div class="nav-group">
+          <div class="nav-group-label">General</div>
 
           <router-link to="/student" v-if="user.role === 'STUDENT'" custom v-slot="{ navigate, isActive }">
             <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
@@ -145,37 +131,55 @@ const locales = [
               <span>Submissions</span>
             </button>
           </router-link>
+        </div>
 
-          <template v-if="['ADMIN','LECTURER'].includes(user.role)">
-            <div class="nav-section">Authoring</div>
-            <router-link to="/lecturer" custom v-slot="{ navigate, isActive }">
-              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
-                <span>Examinations</span>
-              </button>
-            </router-link>
-            <router-link to="/lecturer/practice" custom v-slot="{ navigate, isActive }">
-              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
-                <span>Practice Authoring</span>
-              </button>
-            </router-link>
-            <router-link to="/lecturer/results" custom v-slot="{ navigate, isActive }">
-              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
-                <span>Results</span>
-              </button>
-            </router-link>
-          </template>
+        <div class="nav-group" v-if="['ADMIN','LECTURER'].includes(user.role)">
+          <div class="nav-group-label">Authoring</div>
+          <router-link to="/lecturer" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Examinations</span>
+            </button>
+          </router-link>
+          <router-link to="/lecturer/practice" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Practice Authoring</span>
+            </button>
+          </router-link>
+          <router-link to="/lecturer/results" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Results</span>
+            </button>
+          </router-link>
+          <router-link to="/lecturer/submission-log" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Submission Log</span>
+            </button>
+          </router-link>
+        </div>
 
-          <template v-if="user.role === 'ADMIN'">
-            <div class="nav-section">Administration</div>
-            <router-link to="/admin" custom v-slot="{ navigate, isActive }">
-              <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
-                <span>Accounts</span>
-              </button>
-            </router-link>
-          </template>
-        </nav>
-      </aside>
+        <div class="nav-group" v-if="user.role === 'ADMIN'">
+          <div class="nav-group-label">Administration</div>
+          <router-link to="/admin" custom v-slot="{ navigate, isActive }">
+            <button class="nav-item" :class="{ 'is-active': isActive }" @click="navigate">
+              <span>Accounts</span>
+            </button>
+          </router-link>
+        </div>
+      </nav>
 
+      <div v-if="isLoggedIn" class="cms-header-right">
+        <ClockSidebar class="header-clock" />
+        <select v-model="locale" class="locale-select" aria-label="Language" disabled title="Additional languages coming soon">
+          <option v-for="l in locales" :key="l.code" :value="l.code">{{ l.label }}</option>
+        </select>
+        <span class="header-greeting">
+          Logged in as <strong>{{ user.username }}</strong>
+        </span>
+        <button class="btn btn-sm logout-btn" @click="logout">{{ UI_COPY.LOGOUT }}</button>
+      </div>
+    </header>
+
+    <div class="cms-body">
       <main id="content" class="cms-main" :class="{ 'is-bare': isLoginRoute }" role="main">
         <router-view />
       </main>
@@ -198,23 +202,9 @@ const locales = [
 }
 .skip-link:focus { top: 8px; }
 
-/* Mobile drawer behavior for the sidebar */
+/* Mobile dropdown behavior for the nav (anchored under the header, not a
+   full-screen drawer — see .cms-nav rules in style.css for the panel itself) */
 @media (max-width: 1023.98px) {
-  .cms-sidebar {
-    display: none;
-  }
-  .cms-sidebar.is-open {
-    display: flex;
-    position: fixed;
-    top: var(--layout-header-h);
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 40;
-    background: var(--color-bg);
-    padding: var(--space-4);
-    overflow-y: auto;
-  }
   .nav-hamburger { display: inline-flex; }
 }
 @media (min-width: 1024px) {

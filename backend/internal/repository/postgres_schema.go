@@ -902,6 +902,18 @@ func (r *PostgresRepository) InitializeSystemTables(ctx context.Context) error {
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			dropped_at TIMESTAMP WITH TIME ZONE
 		);`,
+		// exam_announcements: lecturer-authored messages broadcast to every
+		// student enrolled in an exam. Rows are never deleted on re-activation —
+		// the student read path filters to sent_at >= examinations.activated_at
+		// instead, so re-activating an exam clears the feed without mutating history.
+		`CREATE TABLE IF NOT EXISTS app.exam_announcements (
+			id SERIAL PRIMARY KEY,
+			exam_id INTEGER NOT NULL REFERENCES app.examinations(id) ON DELETE CASCADE,
+			lecturer_id INTEGER NOT NULL,
+			message TEXT NOT NULL,
+			sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_exam_announcements_exam_sent ON app.exam_announcements(exam_id, sent_at DESC);`,
 		// Indexes for performance
 		`CREATE INDEX IF NOT EXISTS idx_exam_students_student_id ON app.exam_students(student_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_questions_exam_id ON app.questions(exam_id);`,

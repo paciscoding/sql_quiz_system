@@ -24,6 +24,10 @@ const ICONS: Record<string, string> = {
   'x':            '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
   'circle':       '<circle cx="12" cy="12" r="10"/>',
   'circle-dot':   '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="1" fill="currentColor"/>',
+  'circle-check': '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+  'circle-x':     '<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>',
+  'circle-help':  '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
+  'clock':        '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
 }
 
 const inner = computed(() => ICONS[props.name] ?? '')
