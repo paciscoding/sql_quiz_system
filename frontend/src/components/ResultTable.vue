@@ -86,11 +86,21 @@ onBeforeUnmount(() => {
   width: auto;
   min-width: 100%;
 }
-th,
+/* Cell VALUES may be arbitrarily long free text, so they stay capped and
+   ellipsised — the :title attribute on each td gives the full value on hover. */
 td {
   white-space: nowrap;
   max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Column NAMES are never truncated. They used to share the rule above, which
+   ellipsised any attribute name past 320px — and unlike td, th carried no
+   :title, so a student comparing their output against the expected result had
+   no way to read the full name at all. The table is free to grow (width: auto)
+   inside a wrapper that scrolls horizontally, so a wide header widens the
+   scrollable area instead of clipping. */
+th {
+  white-space: nowrap;
 }
 </style>
