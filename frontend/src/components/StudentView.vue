@@ -246,6 +246,13 @@ const selectedQuestion = computed<Question | null>(
 )
 const currentQuestion = computed(() => selectedQuestion.value)
 
+// Test Run exists only for exam QUERY questions. For INSERT/UPDATE/DELETE the
+// student gets the verdict and nothing else — no expected result (the backend
+// already strips expected_result/expected_columns for non-QUERY), and no preview
+// of the table state. /api/v1/quiz/preview refuses non-QUERY questions outright,
+// so this only hides a button that would 400.
+const previewAllowed = computed(() => currentQuestion.value?.type === 'QUERY')
+
 const currentIndex = computed(() =>
   questions.value.findIndex(q => q.id === selectedQuestionId.value))
 
@@ -470,9 +477,12 @@ const { inFlight: submitLoading, run: submitAnswer } = useSingleFlight(async () 
   // Show the student what their SQL actually returned, not just the verdict —
   // the same thing PracticeView.doSubmit does before submitting. The preview
   // runs in the read-only sandbox (ValidatePreview -> EvaluatePreview) and
-  // persists nothing, so it cannot influence the grade that follows. DML
-  // previews still redact row contents server-side; only the row count shows.
-  await testRun()
+  // persists nothing, so it cannot influence the grade that follows.
+  //
+  // QUERY only: an INSERT/UPDATE/DELETE question shows no preview at all, and
+  // the endpoint 400s for it, so calling it here would only surface a spurious
+  // error toast on every DML submit.
+  if (previewAllowed.value) await testRun()
 
   const token = localStorage.getItem('sql_quiz_token')
 
@@ -789,7 +799,7 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
           <SqlEditor v-model="sqlText" />
           <div style="display: flex; gap: var(--space-2); margin-top: var(--space-3);">
             <button class="btn btn-secondary" :disabled="!sqlText" @click="sqlText = formatSql(sqlText)">Format SQL</button>
-            <button class="btn btn-secondary" :disabled="previewLoading || !selectedQuestionId" @click="testRun">
+            <button v-if="previewAllowed" class="btn btn-secondary" :disabled="previewLoading || !selectedQuestionId" @click="testRun">
               {{ previewLoading ? UI_COPY.TEST_RUN_LOADING : UI_COPY.TEST_RUN }}
             </button>
             <button class="btn btn-primary" :disabled="submitLoading || !selectedQuestionId" @click="submitAnswer">
@@ -799,21 +809,19 @@ const statusLabel = (s: string) => s === 'correct' ? 'Passed' : s === 'syntax_er
         </div>
       </div>
 
-      <div v-if="previewResult" class="card result-panel" :class="previewResult.status" :style="{ opacity: previewStale ? 0.55 : 1 }">
+      <div v-if="previewResult && previewAllowed" class="card result-panel" :class="previewResult.status" :style="{ opacity: previewStale ? 0.55 : 1 }">
         <div style="display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2);">
           <span class="muted" style="font-size: 0.8rem;">Test Run</span>
           <span v-if="previewStale" class="muted" style="font-size: 0.75rem; margin-left: auto;">Stale - run again to refresh</span>
         </div>
         <p v-if="previewResult.status === 'syntax_error'" style="margin: 0 0 var(--space-3) 0; font-weight: 600; color: var(--color-danger);">{{ previewResult.feedback }}</p>
-        <template v-if="currentQuestion && currentQuestion.type !== 'QUERY' && previewResult.status !== 'syntax_error'">
-          <p class="muted" style="margin: 0;">{{ previewResult.row_count }} row(s) in the table after your statement. Row contents are not shown for INSERT/UPDATE/DELETE test runs.</p>
-        </template>
-        <template v-else>
-          <ResultTable :rows="previewResult.rows" :columns="previewResult.columns" max-height="320px" />
-          <p v-if="previewResult.truncated" class="muted" style="font-size: 0.8rem; margin-top: var(--space-2);">
-            Showing 200 of {{ previewResult.row_count }} rows.
-          </p>
-        </template>
+        <!-- QUERY only by construction: previewAllowed gates this whole panel,
+             so the old INSERT/UPDATE/DELETE row-count branch is gone with the
+             DML test run itself. -->
+        <ResultTable :rows="previewResult.rows" :columns="previewResult.columns" max-height="320px" />
+        <p v-if="previewResult.truncated" class="muted" style="font-size: 0.8rem; margin-top: var(--space-2);">
+          Showing 200 of {{ previewResult.row_count }} rows.
+        </p>
       </div>
 
       <div v-if="result" class="card result-panel" :class="result.status">

@@ -351,6 +351,23 @@ func (ctrl *QuizController) PreviewAnswer(c *gin.Context) {
 		return
 	}
 
+	// Exam INSERT/UPDATE/DELETE gets no test run at all. The response was already
+	// redacted to a bare row_count, but that count is itself a free oracle over
+	// the sandbox: a student can binary-search the table with repeated DELETE ...
+	// WHERE previews and read out data they were never shown, and can tell a
+	// working statement from a no-op without spending a submission. The button is
+	// hidden in StudentView, and this is the enforcement — the endpoint is
+	// reachable directly with any student's token.
+	//
+	// QUERY previews are untouched: they are read-only and their rows come from
+	// decoy schema A, which the student is allowed to see.
+	if question.Type != "QUERY" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "test run is not available for INSERT/UPDATE/DELETE questions in an examination",
+		})
+		return
+	}
+
 	// Type-aware preview resolution to decoy schema A (spec 6.1): exam QUERY
 	// reads the curriculum, so A = preview curriculum; exam DML mutates the
 	// shared sandbox, so A = a preview sandbox cloned from the preview

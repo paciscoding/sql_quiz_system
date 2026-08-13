@@ -19,6 +19,14 @@ import (
 // server-side so lecturers/ops can diagnose A/B structure drift.
 const dualExecErrorFeedback = "Your SQL could not be executed against the grading dataset. Use Test Run to check your statement."
 
+// isExamDML reports whether q is an INSERT/UPDATE/DELETE question that belongs to
+// an examination (as opposed to a practice question). Exam DML is held to a
+// stricter disclosure rule than practice DML: the student is told only whether
+// they were right or wrong, never what the expected post-image looks like.
+func isExamDML(q models.Question) bool {
+	return q.ExamID != nil && q.Type != "QUERY"
+}
+
 type DBExecutor interface {
 	Query(ctx context.Context, schema, sql string) ([]map[string]interface{}, error)
 	Exec(ctx context.Context, schema, sql string) error
@@ -71,6 +79,25 @@ func (s *ValidationService) Validate(ctx context.Context, studentID int, questio
 				// would blame the student's submission for what is actually a
 				// question-configuration failure, contradicting ARCH-041.
 				log.Printf("dual-schema auto-seed failure surfaced to student %d for question %d", studentID, question.ID)
+			} else if isExamDML(question) {
+				// DELIBERATE EXCEPTION to ARCH-018, decided by the system owner
+				// on 2026-08-13: exam INSERT/UPDATE/DELETE passes the executor's
+				// raw error text through to the student unscrubbed.
+				//
+				// This IS a disclosure. The text is pgconn's PgError rendering
+				// from the hidden grading schema B, and its Message embeds
+				// values and object names from B — "Key (ssn)=(123456789)
+				// already exists", "column \"salalry\" does not exist", the
+				// constraint's name. A student who can provoke errors can read
+				// B's structure and some of its data out of them. It is allowed
+				// here because exam DML now has no Test Run at all (see
+				// QuizController.PreviewAnswer), so this is the student's only
+				// channel for finding out why a statement failed, and the owner
+				// judged a debuggable exam worth the leak.
+				//
+				// Scope is exactly exam DML: dual-schema QUERY questions and all
+				// practice questions still get dualExecErrorFeedback below.
+				log.Printf("dual-schema syntax error DISCLOSED to student %d for exam DML question %d: %s", studentID, question.ID, result.Feedback)
 			} else {
 				log.Printf("dual-schema syntax error suppressed from student %d for question %d: %s", studentID, question.ID, result.Feedback)
 				result.Feedback = dualExecErrorFeedback
@@ -216,11 +243,17 @@ func (s *ValidationService) decideDMLStatus(execResult models.ValidationResult, 
 	execResult.IsCorrect = false
 	execResult.Score = 0
 
-	if q.DualSchema {
+	if q.DualSchema || isExamDML(q) {
 		// Leak-proofing (ARCH-007): the teacher's post-image snapshot lives on the
 		// hidden grading schema B. A dual question's student never sees B's data,
 		// so the row-level diff (which would dump B's expected rows via
 		// formatDMLDiff) must never reach Feedback here.
+		//
+		// isExamDML extends the same rule to NON-dual exam DML. Under exam
+		// conditions the student is told only whether the answer was right or
+		// wrong; formatDMLDiff would print the expected row counts and up to
+		// dmlDiffMaxSampleRows of the expected post-image, which is the answer.
+		// Practice DML keeps the detailed diff — that is where it teaches.
 		execResult.Feedback = "Your result does not match the expected outcome."
 		return execResult
 	}
