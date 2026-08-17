@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -799,9 +800,37 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 		return
 	}
 
+	// Tell the truth about delivery: ImportRotating marks a row "queued"
+	// purely based on whether it has an email address, with no way to know
+	// whether a real sender is even wired in. When it is not (the no-op stub
+	// is active), every "queued" row would otherwise report success though
+	// nothing was ever sent — 200 students signed out holding passwords
+	// nobody told them about. Downgrade those rows here, before anything
+	// below reads EmailStatus, so the job-registration/worker logic and the
+	// response body agree.
+	emailConfigured := ctrl.authService != nil && ctrl.authService.EmailConfigured()
+	if !emailConfigured {
+		for i := range report.Accounts {
+			if report.Accounts[i].EmailStatus == services.EmailStatusQueued {
+				report.Accounts[i].EmailStatus = services.EmailStatusNotConfigured
+			}
+		}
+	}
+
 	// Post-commit audit trail: one password_events row per rotated account, and
 	// deliberately NO email from this path (see LogBulkCredentials).
+	//
+	// context.WithoutCancel: this transaction already committed, and a
+	// 500-row roster runs ~40s of per-row bcrypt hashing (past a typical 60s
+	// proxy timeout for larger rosters). If the admin's browser disconnects
+	// after commit, c.Request.Context() is cancelled and every
+	// InsertPasswordEvent below would fail with "context canceled" -- taking
+	// down the ONLY server-side audit trail (and thus the resend-credential
+	// recovery path) for passwords that are already irrecoverably rotated.
+	// The audit write must survive a client disconnect even though the
+	// response body cannot be resent.
 	if ctrl.authService != nil {
+		auditCtx := context.WithoutCancel(c.Request.Context())
 		events := make([]services.BulkCredentialEvent, 0, len(report.Accounts))
 		for _, a := range report.Accounts {
 			source := models.PasswordEventAdminReset
@@ -812,7 +841,9 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 				UserID: a.UserID, Source: source, Plaintext: a.Password,
 			})
 		}
-		ctrl.authService.LogBulkCredentials(c.Request.Context(), admin, events)
+		if written := ctrl.authService.LogBulkCredentials(auditCtx, admin, events); written < len(events) {
+			log.Printf("import-credentials: audit trail incomplete: wrote %d/%d password_events rows (see preceding log lines for the per-row cause)", written, len(events))
+		}
 	}
 
 	// Hand delivery to a single background goroutine per import. Serial within
@@ -821,6 +852,10 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 	// (two overlapping imports still run two concurrent send loops). SendCredentialEmail
 	// takes no context, so the request's own (already-cancelled-by-the-time-this-runs)
 	// context cannot leak into the send.
+	//
+	// Rows are only ever queued here when emailConfigured is true (see the
+	// EmailStatus downgrade above), so no job is registered and no worker
+	// starts when delivery is not configured.
 	toSend := make([]services.RotatedAccount, 0, len(report.Accounts))
 	for _, a := range report.Accounts {
 		if a.EmailStatus == services.EmailStatusQueued {
@@ -842,23 +877,36 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 		}
 		go func(jobID string, accounts []services.RotatedAccount) {
 			defer ctrl.emailJobs.Finish(jobID)
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("import-credentials: email worker panic: %v", r)
-				}
-			}()
 			for _, a := range accounts {
-				if err := ctrl.authService.SendCredentialEmail(a.Email, a.StudentIDExt, a.Password); err != nil {
-					log.Printf("import-credentials: SendCredential failed for %q: %v", a.StudentIDExt, err)
-					ctrl.emailJobs.MarkFailed(jobID, a.StudentIDExt)
-					continue
-				}
-				ctrl.emailJobs.MarkSent(jobID)
+				sendOne(ctrl, jobID, a)
 			}
 		}(job.ID, toSend)
 	}
 
 	c.JSON(http.StatusOK, report)
+}
+
+// sendOne sends a single rotated credential and records the outcome in the
+// job registry. It carries its OWN per-iteration recover(): the worker loop
+// used to wrap a single recover() around the WHOLE send loop, so a panic on
+// (say) row 3 of 200 abandoned rows 4-200 with no MarkFailed call for any of
+// them -- Finish still ran, so the admin saw a job reporting "done" with a
+// misleadingly small failure count while 197 rows silently got nothing.
+// Recovering per-iteration means one bad row is recorded as failed and the
+// loop moves on, exactly like a returned error from SendCredentialEmail.
+func sendOne(ctrl *LecturerController, jobID string, a services.RotatedAccount) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("import-credentials: email worker panic for %q: %v", a.StudentIDExt, r)
+			ctrl.emailJobs.MarkFailed(jobID, a.StudentIDExt)
+		}
+	}()
+	if err := ctrl.authService.SendCredentialEmail(a.Email, a.StudentIDExt, a.Password); err != nil {
+		log.Printf("import-credentials: SendCredential failed for %q: %v", a.StudentIDExt, err)
+		ctrl.emailJobs.MarkFailed(jobID, a.StudentIDExt)
+		return
+	}
+	ctrl.emailJobs.MarkSent(jobID)
 }
 
 // ImportCredentialsJobStatus handles

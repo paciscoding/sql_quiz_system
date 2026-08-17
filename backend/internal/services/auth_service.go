@@ -49,6 +49,17 @@ func (s *AuthService) SetEmailSender(sender EmailSender) { s.email = sender }
 // KeyConfigured reports whether the password-event encryption key is available.
 func (s *AuthService) KeyConfigured() bool { return s.cipher != nil }
 
+// EmailConfigured reports whether a REAL email sender is wired in (SetEmailSender
+// was called with something other than the default NoopEmailSender). Callers
+// that are about to claim delivery happened — e.g. the rotating credential
+// importer marking a row "queued" — must check this first: NoopEmailSender's
+// SendCredential logs a TODO and returns nil, which is indistinguishable from
+// a real send at the call site unless this is checked explicitly.
+func (s *AuthService) EmailConfigured() bool {
+	_, isNoop := s.email.(NoopEmailSender)
+	return !isNoop
+}
+
 func (s *AuthService) Login(ctx context.Context, username, password string) (models.LoginResponse, error) {
 	// Rate Limiting: 5 attempts per 10 minutes
 	now := time.Now()
@@ -218,12 +229,18 @@ type BulkCredentialEvent struct {
 // Best-effort throughout: a failure to encrypt or insert is logged and skipped,
 // never returned, because the passwords are already committed and shown to the
 // admin.
-func (s *AuthService) LogBulkCredentials(ctx context.Context, actor models.User, events []BulkCredentialEvent) {
+//
+// Returns the number of events actually written, so the caller can detect and
+// surface an incomplete audit trail (e.g. when s.cipher is nil, or individual
+// rows fail to encrypt/insert) rather than assuming every event landed just
+// because this call did not return an error.
+func (s *AuthService) LogBulkCredentials(ctx context.Context, actor models.User, events []BulkCredentialEvent) int {
 	if s.cipher == nil {
 		log.Printf("auth: password-event logging disabled (no key); %d bulk credential events not recorded", len(events))
-		return
+		return 0
 	}
 	actorID := int(actor.ID)
+	written := 0
 	for _, ev := range events {
 		ct, nonce, err := s.cipher.Encrypt(ev.Plaintext)
 		if err != nil {
@@ -238,8 +255,11 @@ func (s *AuthService) LogBulkCredentials(ctx context.Context, actor models.User,
 			Nonce:          nonce,
 		}); err != nil {
 			log.Printf("auth: insert bulk credential event failed (user_id=%d): %v", ev.UserID, err)
+			continue
 		}
+		written++
 	}
+	return written
 }
 
 // SendCredentialEmail exposes the credential email to callers that own their

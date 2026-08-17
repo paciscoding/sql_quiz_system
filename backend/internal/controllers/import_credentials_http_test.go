@@ -233,6 +233,99 @@ func buildImportCredentialsEnvWithSender(t *testing.T, sender services.EmailSend
 	}
 }
 
+// newImportCredentialsEnvUnconfiguredEmail mirrors newImportCredentialsTestEnv
+// but deliberately never calls auth.SetEmailSender: AuthService's default is
+// the real NoopEmailSender{} stub (not a test spy), exactly like a deployment
+// that never set EMAIL_SENDER_ADDRESS. This is the fixture CRITICAL 2's tests
+// need -- every other builder in this file substitutes some other EmailSender,
+// which would trivially make EmailConfigured() report true and hide the bug.
+func newImportCredentialsEnvUnconfiguredEmail(t *testing.T) *importCredentialsTestEnv {
+	t.Helper()
+	repo := openCtrlTestRepo(t)
+	t.Setenv(services.PasswordCryptoEnvKey, ctrlTestKey)
+	t.Setenv("ADMIN_NOTIFY_EMAIL", "admin-notify@example.com")
+
+	auth := services.NewAuthService(repo, "test-jwt-secret-least-32-characters-long")
+	// No auth.SetEmailSender call: s.email stays services.NoopEmailSender{}.
+
+	userCtrl := NewUserController(auth, services.NewStudentImportService(repo))
+	lecturerCtrl := NewLecturerController(repo, nil)
+	lecturerCtrl.SetStudentImportService(services.NewStudentImportService(repo))
+	lecturerCtrl.SetAuthService(auth)
+	registry := services.NewEmailJobRegistry()
+	lecturerCtrl.SetEmailJobRegistry(registry)
+
+	engine := buildImportCredentialsRouter(auth, userCtrl, lecturerCtrl)
+
+	admin := mkCtrlUser(t, repo, models.RoleAdmin, "adminpw")
+	otherAdmin := mkCtrlUser(t, repo, models.RoleAdmin, "adminpw2")
+	lecturer := mkCtrlUser(t, repo, models.RoleLecturer, "lecpw")
+
+	return &importCredentialsTestEnv{
+		engine:          engine,
+		registry:        registry,
+		repo:            repo,
+		adminID:         int(admin.ID),
+		adminToken:      login(t, engine, admin.Username, "adminpw"),
+		otherAdminToken: login(t, engine, otherAdmin.Username, "adminpw2"),
+		lecturerToken:   login(t, engine, lecturer.Username, "lecpw"),
+	}
+}
+
+// CRITICAL 2: with no real email sender wired in (EMAIL_SENDER_ADDRESS unset
+// in a real deployment, reproduced here by never calling SetEmailSender), the
+// importer used to mark every row with an address "queued" -- read by the
+// admin as "Passwords emailed N/N" -- even though NoopEmailSender.SendCredential
+// only logs a TODO and returns nil. This proves the fix: rows are marked
+// "not_configured" instead, no job is registered (job_id stays ""), and no
+// send is attempted.
+func TestImportCredentials_EmailNotConfigured_MarksRowsNotConfigured(t *testing.T) {
+	env := newImportCredentialsEnvUnconfiguredEmail(t)
+	body, contentType := multipartRoster(t, testRosterCSV, "ROTATE")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/students/import-credentials", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+env.adminToken)
+	rec := httptest.NewRecorder()
+	env.engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var report struct {
+		Total    int    `json:"total"`
+		JobID    string `json:"job_id"`
+		Accounts []struct {
+			StudentIDExt string `json:"student_id_ext"`
+			EmailStatus  string `json:"email_status"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode report: %v", err)
+	}
+	if report.Total != 2 || len(report.Accounts) != 2 {
+		t.Fatalf("report total=%d accounts=%d, want 2/2", report.Total, len(report.Accounts))
+	}
+	if report.JobID != "" {
+		t.Fatalf("job_id = %q, want \"\": no send may be attempted when email is not configured", report.JobID)
+	}
+	// testRosterCSV: row 1 (cred-s1) has an address and would normally be
+	// "queued"; row 2 (cred-s2) has none and is "no_email" regardless.
+	if report.Accounts[0].EmailStatus != services.EmailStatusNotConfigured {
+		t.Errorf("row 0 email_status = %q, want %q (has an address, but delivery is unconfigured)",
+			report.Accounts[0].EmailStatus, services.EmailStatusNotConfigured)
+	}
+	if report.Accounts[1].EmailStatus != services.EmailStatusNoEmail {
+		t.Errorf("row 1 email_status = %q, want %q (never had an address)",
+			report.Accounts[1].EmailStatus, services.EmailStatusNoEmail)
+	}
+	for _, a := range report.Accounts {
+		if a.EmailStatus == services.EmailStatusQueued {
+			t.Errorf("%s: email_status = %q, must never be \"queued\" when no sender is configured", a.StudentIDExt, a.EmailStatus)
+		}
+	}
+}
+
 // waitForJobDone polls the registry directly (not over HTTP) every 10ms up to
 // 5s until the job reports Done, so the test never depends on how long the
 // (fake, in-memory) email send takes. Every job created by these tests is

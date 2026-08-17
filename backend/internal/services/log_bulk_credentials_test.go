@@ -9,6 +9,71 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
 
+// IMPORTANT 1: ImportStudentsWithCredentials (lecturer_controller.go) hands
+// LogBulkCredentials a context.WithoutCancel wrapping the request context,
+// specifically so the audit write survives the admin's browser disconnecting
+// mid-request -- a real risk here, since the import is one transaction with
+// one bcrypt hash per row (~50-100ms each), so a 500-row roster runs ~40s,
+// past a typical 60s proxy timeout for anything bigger. Without
+// WithoutCancel, every InsertPasswordEvent below would fail with "context
+// canceled" the instant the client goes away, silently destroying the last
+// server-side recovery path (ResendCredential reads from password_events).
+//
+// This proves the underlying mechanism LogBulkCredentials relies on:
+// a bare cancelled context yields zero events written, while
+// context.WithoutCancel(cancelledCtx) still writes normally — exactly the
+// difference between the pre-fix and post-fix call at lecturer_controller.go.
+func TestLogBulkCredentials_SurvivesCancelledRequestContext(t *testing.T) {
+	repo := integrationRepo(t)
+	t.Setenv("ADMIN_NOTIFY_EMAIL", "admin-notify@example.com")
+	auth := newIntegrationAuth(t, repo)
+	spy := &noticeSpy{}
+	auth.SetEmailSender(spy)
+
+	admin := mkUser(t, repo, models.RoleAdmin, "adminpw-cancel")
+
+	t.Run("a bare cancelled context writes nothing", func(t *testing.T) {
+		s := mkUser(t, repo, models.RoleStudent, fmt.Sprintf("bulkcred-cancelled_%d", time.Now().UnixNano()))
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		written := auth.LogBulkCredentials(cancelledCtx, admin, []BulkCredentialEvent{
+			{UserID: int(s.ID), Source: models.PasswordEventCreate, Plaintext: "pw-cancelled"},
+		})
+		if written != 0 {
+			t.Errorf("written = %d, want 0: a cancelled context must fail the insert (this is the failure mode the fix avoids)", written)
+		}
+		events, err := repo.GetPasswordEvents(context.Background(), int(s.ID))
+		if err != nil {
+			t.Fatalf("GetPasswordEvents: %v", err)
+		}
+		if len(events) != 0 {
+			t.Errorf("events = %+v, want none: nothing should have been persisted", events)
+		}
+	})
+
+	t.Run("context.WithoutCancel survives the same cancellation and writes normally", func(t *testing.T) {
+		s := mkUser(t, repo, models.RoleStudent, fmt.Sprintf("bulkcred-survived_%d", time.Now().UnixNano()))
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel() // simulates the admin's browser disconnecting right after the transaction commits
+
+		auditCtx := context.WithoutCancel(cancelledCtx)
+		written := auth.LogBulkCredentials(auditCtx, admin, []BulkCredentialEvent{
+			{UserID: int(s.ID), Source: models.PasswordEventCreate, Plaintext: "pw-survived"},
+		})
+		if written != 1 {
+			t.Fatalf("written = %d, want 1: context.WithoutCancel must insulate the audit write from the cancelled request context", written)
+		}
+		events, err := repo.GetPasswordEvents(context.Background(), int(s.ID))
+		if err != nil {
+			t.Fatalf("GetPasswordEvents: %v", err)
+		}
+		if len(events) != 1 || events[0].Source != models.PasswordEventCreate {
+			t.Errorf("events = %+v, want exactly one %q event", events, models.PasswordEventCreate)
+		}
+	})
+}
+
 // noticeSpy records every SendChangeNotice (and SendCredential) call so the
 // test can prove the bulk path never fans out an admin email, nor emails the
 // student directly — neither spyEmailSender (password_flows_integration_test.go)

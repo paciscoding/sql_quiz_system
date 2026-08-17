@@ -2,10 +2,13 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/paciscoding/sql-quiz-system/internal/models"
 )
 
@@ -37,6 +40,32 @@ func (f *fakeRotatingRepo) UpsertStudentRotating(ctx context.Context, tx pgx.Tx,
 
 func (f *fakeRotatingRepo) WithTransaction(ctx context.Context, fn func(pgx.Tx) error) error {
 	return fn(&fakeTx{})
+}
+
+// execRecordingTx wraps fakeTx to record every SQL statement passed to Exec,
+// so a test can prove which of ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT
+// actually ran for a row, not just what the resulting report claims.
+type execRecordingTx struct {
+	fakeTx
+	execCalls []string
+}
+
+func (t *execRecordingTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	t.execCalls = append(t.execCalls, sql)
+	return pgconn.CommandTag{}, nil
+}
+
+// execRecordingRotatingRepo behaves exactly like fakeRotatingRepo but hands
+// ImportRotating an execRecordingTx instead of a plain fakeTx, and keeps a
+// reference to it so the test can inspect execCalls after the run.
+type execRecordingRotatingRepo struct {
+	fakeRotatingRepo
+	tx *execRecordingTx
+}
+
+func (f *execRecordingRotatingRepo) WithTransaction(ctx context.Context, fn func(pgx.Tx) error) error {
+	f.tx = &execRecordingTx{}
+	return fn(f.tx)
 }
 
 func TestImportRotating(t *testing.T) {
@@ -140,6 +169,111 @@ func TestImportRotating(t *testing.T) {
 		}
 		if len(report.Errors) != 1 || report.Errors[0].Row != 1 {
 			t.Fatalf("Errors = %+v, want one entry for row 1", report.Errors)
+		}
+	})
+
+	// IMPORTANT 2: UpsertStudentRotating already applies the rotation (new
+	// hash + bumped token_version) and RELEASEs its savepoint before this
+	// switch used to run, so an outcome string outside "created"/"updated"
+	// used to be counted Skipped with the rotation already durably committed
+	// and no ImportRowError naming the row -- a student locked out with
+	// nothing pointing at them. This is unreachable via the real repository
+	// today (it always returns "created"/"updated"), but guards the exact
+	// failure mode that appears the moment those literals ever drift.
+	t.Run("unexpected outcome rolls back the savepoint instead of releasing it, and names the row", func(t *testing.T) {
+		repo := &execRecordingRotatingRepo{fakeRotatingRepo: fakeRotatingRepo{outcomes: []string{"bogus"}}}
+		service := NewStudentImportService(repo)
+
+		report, err := service.ImportRotating(ctx, 7, []ParsedStudentRow{
+			{RowNumber: 1, StudentNumber: "N1", StudentIDExt: "s1", Email: "s1@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("ImportRotating: %v", err)
+		}
+		if report.Skipped != 1 {
+			t.Fatalf("Skipped = %d, want 1", report.Skipped)
+		}
+		if len(report.Accounts) != 0 {
+			t.Fatalf("Accounts = %+v, want none: an unexpected outcome must not be reported as a rotated account", report.Accounts)
+		}
+		if len(report.Errors) != 1 || report.Errors[0].Row != 1 {
+			t.Fatalf("Errors = %+v, want one entry naming row 1", report.Errors)
+		}
+
+		rolledBack, released := false, false
+		for _, sql := range repo.tx.execCalls {
+			if strings.HasPrefix(sql, "ROLLBACK TO SAVEPOINT") {
+				rolledBack = true
+			}
+			if strings.HasPrefix(sql, "RELEASE SAVEPOINT") {
+				released = true
+			}
+		}
+		if !rolledBack {
+			t.Errorf("no ROLLBACK TO SAVEPOINT was executed; exec calls: %v", repo.tx.execCalls)
+		}
+		if released {
+			t.Errorf("RELEASE SAVEPOINT was executed, which commits the already-applied rotation; exec calls: %v", repo.tx.execCalls)
+		}
+	})
+
+	// CRITICAL 1 (rotating path): same nil-vs-empty-slice bug as ImportReport,
+	// asserted on the marshalled bytes so a struct-equality check (which would
+	// pass for both nil and []) can't paper over it.
+	t.Run("a completely clean rotating import marshals errors as [] not null", func(t *testing.T) {
+		repo := &fakeRotatingRepo{outcomes: []string{"created", "updated"}}
+		service := NewStudentImportService(repo)
+
+		report, err := service.ImportRotating(ctx, 7, []ParsedStudentRow{
+			{RowNumber: 1, StudentNumber: "N1", StudentIDExt: "s1", Email: "s1@example.com"},
+			{RowNumber: 2, StudentNumber: "N2", StudentIDExt: "s2", Email: "s2@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("ImportRotating: %v", err)
+		}
+		if len(report.Errors) != 0 {
+			t.Fatalf("expected zero errors, got %+v", report.Errors)
+		}
+		raw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		body := string(raw)
+		if strings.Contains(body, `"errors":null`) {
+			t.Errorf(`marshalled report has "errors":null, want "errors":[] — body: %s`, body)
+		}
+		if !strings.Contains(body, `"errors":[]`) {
+			t.Errorf(`marshalled report is missing "errors":[] — body: %s`, body)
+		}
+	})
+
+	// CRITICAL 1 (rotating path), symmetric case: when every row is skipped,
+	// Accounts must marshal as [] not null. Before the fix this null would
+	// throw inside BulkImportStudentsCredentials.vue's hasHeldResults
+	// computed, and therefore inside submitImport and the beforeunload watch.
+	t.Run("an all-skipped rotating import marshals accounts as [] not null", func(t *testing.T) {
+		repo := &fakeRotatingRepo{}
+		service := NewStudentImportService(repo)
+
+		report, err := service.ImportRotating(ctx, 7, []ParsedStudentRow{
+			{RowNumber: 1, StudentNumber: "", StudentIDExt: "s1"},
+		})
+		if err != nil {
+			t.Fatalf("ImportRotating: %v", err)
+		}
+		if len(report.Accounts) != 0 {
+			t.Fatalf("expected zero accounts, got %+v", report.Accounts)
+		}
+		raw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		body := string(raw)
+		if strings.Contains(body, `"accounts":null`) {
+			t.Errorf(`marshalled report has "accounts":null, want "accounts":[] — body: %s`, body)
+		}
+		if !strings.Contains(body, `"accounts":[]`) {
+			t.Errorf(`marshalled report is missing "accounts":[] — body: %s`, body)
 		}
 	})
 }

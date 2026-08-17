@@ -128,8 +128,15 @@ func (s *StudentImportService) CreateSingle(ctx context.Context, creatorID int, 
 // Import processes a roster of students, performing an upsert for each row.
 // It uses a single outer transaction with savepoints to allow partial successes.
 func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows []ParsedStudentRow) (ImportReport, error) {
+	// Errors/CreatedAccounts start as non-nil empty slices, not nil: Go
+	// marshals a nil slice as JSON `null`, and a clean import (every row
+	// succeeds) would otherwise leave both null. BulkImportStudents.vue reads
+	// result.errors.length unguarded, so `null` throws a TypeError during
+	// render and the admin sees a success toast with no results table.
 	report := ImportReport{
-		Total: len(rows),
+		Total:           len(rows),
+		Errors:          []ImportRowError{},
+		CreatedAccounts: []CreatedStudent{},
 	}
 
 	err := s.repo.WithTransaction(ctx, func(tx pgx.Tx) error {
@@ -224,6 +231,13 @@ const (
 	OutcomeUpdated     = "updated"
 	EmailStatusQueued  = "queued"
 	EmailStatusNoEmail = "no_email"
+	// EmailStatusNotConfigured marks a row that WOULD have been queued (it has
+	// an email address) but was not, because no real email sender is wired in
+	// (the no-op stub is active). Set by the controller after ImportRotating
+	// returns, once it knows whether AuthService.EmailConfigured(). Without
+	// this distinct status, every row would read "queued" even though nothing
+	// was ever sent.
+	EmailStatusNotConfigured = "not_configured"
 )
 
 // RotatedAccount is one account touched by the rotating importer. Unlike
@@ -258,7 +272,15 @@ type RotatingImportReport struct {
 // transaction/savepoint structure is deliberately identical to Import's, so a
 // single bad row is isolated instead of failing the file.
 func (s *StudentImportService) ImportRotating(ctx context.Context, creatorID int, rows []ParsedStudentRow) (RotatingImportReport, error) {
-	report := RotatingImportReport{Total: len(rows)}
+	// Same nil-vs-empty-slice reasoning as Import above: a clean roster (no
+	// errors) or an all-skipped roster (no accounts) must marshal `[]`, not
+	// `null` — BulkImportStudentsCredentials.vue's hasHeldResults computed and
+	// its render both dereference these arrays.
+	report := RotatingImportReport{
+		Total:    len(rows),
+		Errors:   []ImportRowError{},
+		Accounts: []RotatedAccount{},
+	}
 
 	err := s.repo.WithTransaction(ctx, func(tx pgx.Tx) error {
 		for _, row := range rows {
@@ -319,18 +341,32 @@ func (s *StudentImportService) ImportRotating(ctx context.Context, creatorID int
 				continue
 			}
 
+			// Validate the outcome BEFORE releasing the savepoint: UpsertStudentRotating
+			// has already applied the rotation (new hash + bumped token_version) at
+			// this point, but RELEASE SAVEPOINT has not run yet, so a savepoint
+			// ROLLBACK here still fully undoes it. Checking after RELEASE (as this
+			// code used to) would be too late — the rotation would already be
+			// committed with no audit row, no email, and no CSV line naming the
+			// affected student (see IMPORTANT 2 in the final review).
+			if outcome != OutcomeCreated && outcome != OutcomeUpdated {
+				tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepointName)
+				report.Skipped++
+				report.Errors = append(report.Errors, ImportRowError{
+					Row:           row.RowNumber,
+					StudentNumber: row.StudentNumber,
+					Message:       fmt.Sprintf("unexpected outcome %q from credential rotation; row rolled back", outcome),
+				})
+				continue
+			}
+
 			if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT "+savepointName); err != nil {
 				return fmt.Errorf("failed to release savepoint: %w", err)
 			}
 
-			switch outcome {
-			case OutcomeCreated:
+			if outcome == OutcomeCreated {
 				report.Created++
-			case OutcomeUpdated:
+			} else {
 				report.Updated++
-			default:
-				report.Skipped++
-				continue
 			}
 
 			// Decided synchronously, before any send is attempted, so the value is
