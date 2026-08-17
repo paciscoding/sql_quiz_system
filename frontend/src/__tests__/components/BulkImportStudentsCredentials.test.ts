@@ -181,6 +181,35 @@ describe('BulkImportStudentsCredentials', () => {
     expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(1)
   })
 
+  // The spinner/"Importing" label must reflect only the actual network round
+  // trip, not the time spent waiting on the discard-confirmation dialog. The
+  // guard used to wrap await confirm(...) too, so the button showed
+  // "Importing" with a spinner the entire time the dialog sat open — before
+  // any request had even been sent.
+  it('does not show the spinner while the discard-confirmation dialog is awaiting a decision', async () => {
+    const fetchMock = vi.fn(() => jsonResponse(report))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper) // results held -> the next submit must prompt to discard
+
+    let resolveConfirm!: (v: boolean) => void
+    mockConfirm.mockImplementationOnce(() => new Promise<boolean>((resolve) => { resolveConfirm = resolve }))
+
+    await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+    wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+    await flushPromises() // submitImport runs up to (and blocks on) awaiting confirm()
+
+    const button = wrapper.find('[data-testid="rotate-import-submit"]')
+    expect(button.text()).not.toContain('Importing')
+    expect(fetchMock).toHaveBeenCalledTimes(1) // only the earlier setup import so far
+
+    resolveConfirm(true)
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2) // the guarded import only starts once confirm resolves
+  })
+
   it('prompts for confirmation before changing the selected file wipes displayed results; declining keeps them', async () => {
     vi.stubGlobal('fetch', vi.fn(() => jsonResponse(report)))
 
@@ -233,6 +262,71 @@ describe('BulkImportStudentsCredentials', () => {
 
     const emailingClaims = mockNotify.mock.calls.filter(([msg]) => String(msg).includes('being emailed'))
     expect(emailingClaims).toHaveLength(0)
+  })
+
+  // -------------------------------------------------------------------------
+  // CRITICAL 1: a nil/absent errors or accounts array must never throw during
+  // render. Go marshals a nil slice as JSON `null`, and a completely clean
+  // import (or an all-skipped one) used to leave one of these two fields
+  // null. Before the fix, `result.errors.length`/`result.accounts.length`
+  // were read unguarded in the template, so null threw a TypeError mid-patch:
+  // the whole results subtree failed to mount and the admin saw a success
+  // toast with NO table, even though every student in the file had already
+  // been rotated and signed out.
+  // -------------------------------------------------------------------------
+
+  it('renders the accounts table when the server sends errors: null (an all-clean import)', async () => {
+    const cleanReport = { ...report, errors: null }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(cleanReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    // Must not throw during the whole submit -> render cycle.
+    await expect(importSuccessfully(wrapper)).resolves.not.toThrow()
+
+    expect(wrapper.find('[data-testid="rotated-accounts-table"]').exists()).toBe(true)
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+    // The row-errors section must render as "no errors", not crash.
+    expect(wrapper.text()).toContain('No row errors.')
+  })
+
+  it('does not throw when the server sends accounts: null (an all-skipped import)', async () => {
+    const allSkippedReport = {
+      ...report,
+      job_id: '',
+      accounts: null,
+      errors: [{ row: 1, student_number: 'N1', message: 'Student number is required' }],
+    }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(allSkippedReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await expect(importSuccessfully(wrapper)).resolves.not.toThrow()
+
+    // No accounts table (there are no accounts), but the row-errors table
+    // must render, and hasHeldResults-driven code (submitImport itself, and
+    // the beforeunload watch below) must not have thrown either.
+    expect(wrapper.find('[data-testid="rotated-accounts-table"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('Row Errors (1)')
+  })
+
+  it('renders "not sent — email is not configured" for not_configured rows without throwing', async () => {
+    const notConfiguredReport = {
+      ...report,
+      job_id: '',
+      accounts: [
+        { row: 1, student_number: 'N1', student_id_ext: 's1', email: 'a@example.com', password: 'pw1', outcome: 'created', email_status: 'not_configured' },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(notConfiguredReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    const rows = wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].text()).toContain('not sent')
+    expect(rows[0].text()).toContain('not configured')
+    // Must NOT read as if it were queued/sent.
+    expect(rows[0].text()).not.toContain('queued')
   })
 
   it('does claim passwords are being emailed when job_id is present', async () => {

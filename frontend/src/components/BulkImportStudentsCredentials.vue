@@ -28,7 +28,7 @@ interface RotatedAccount {
   email: string
   password: string
   outcome: 'created' | 'updated'
-  email_status: 'queued' | 'no_email'
+  email_status: 'queued' | 'no_email' | 'not_configured'
 }
 
 interface RotatingImportReport {
@@ -36,8 +36,11 @@ interface RotatingImportReport {
   created: number
   updated: number
   skipped: number
-  errors: ImportError[]
-  accounts: RotatedAccount[]
+  // Server-typed as always-present ([] on a clean/all-skipped import — see
+  // student_import_service.go), but declared optional here defensively: the
+  // component must not trust the wire format and throw on a stray null.
+  errors?: ImportError[] | null
+  accounts?: RotatedAccount[] | null
   job_id: string
 }
 
@@ -55,16 +58,35 @@ const result = ref<RotatingImportReport | null>(null)
 // it again on every request — this input is convenience, not security.
 const confirmed = computed(() => confirmPhrase.value === 'ROTATE')
 
+// Defensive accessors: the server always sends [] (never null) for a clean or
+// all-skipped import (see student_import_service.go), but a nil/absent array
+// must never be able to throw during render regardless — a TypeError here
+// used to abort the whole results subtree mid-patch, leaving the admin with a
+// green success toast and NO table, right after every student in the file was
+// already rotated and signed out. Every other read of accounts/errors in this
+// component goes through these two computed refs, not result.value directly.
+const resultAccounts = computed<RotatedAccount[]>(() => result.value?.accounts ?? [])
+const resultErrors = computed<ImportError[]>(() => result.value?.errors ?? [])
+
 // True exactly while a batch of unrecoverable, one-time-shown passwords is
 // sitting in this tab's memory. Drives BOTH the beforeunload guard below and
 // the "are you sure" gate in front of the two actions that would wipe them
 // silently (a second import, picking a different file) — same discipline as
 // BulkPasswordReset.vue's hasHeldResults.
-const hasHeldResults = computed(() => (result.value?.accounts.length ?? 0) > 0)
+const hasHeldResults = computed(() => resultAccounts.value.length > 0)
 
 // Known server error codes mapped to sentences an admin can act on. Anything
 // not in this map (e.g. a file-parsing message) is already a human-readable
 // sentence from the backend and is shown as-is via the fallback.
+//
+// confirmation_required is currently unreachable through this UI: submitImport
+// always sends confirm=ROTATE verbatim (hardcoded below) and the button stays
+// disabled until `confirmed` is true, so this component can never produce a
+// request the server would reject on that check. Kept anyway, deliberately,
+// as a defensive mapping: the server re-validates `confirm` on every request
+// regardless of what the UI already gated (by design — see
+// ImportStudentsWithCredentials), so it remains the authority and could still
+// return this code (a future UI bug, a direct API call, etc.).
 const KNOWN_ERROR_CODES: Record<string, string> = {
   confirmation_required: 'Confirmation phrase did not match. Please retype ROTATE and try again.',
 }
@@ -163,27 +185,40 @@ async function copyPassword(text: string) {
 // delivery silently fails — are only recoverable from here, so EVERY account
 // row goes into the CSV, not just the failed ones.
 function downloadAllAsCsv() {
-  if (!result.value) return
   const content = toCsv(
     ['student_id_ext', 'email', 'password'],
-    result.value.accounts.map(a => [a.student_id_ext, a.email, a.password]),
+    resultAccounts.value.map(a => [a.student_id_ext, a.email, a.password]),
   )
   downloadCsv('rotated-credentials.csv', content)
 }
 
-const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () => {
-  if (!fileForm.validateAll()) return
-  if (!selectedFile.value || !confirmed.value) return
-
-  if (hasHeldResults.value) {
-    const ok = await confirm({
-      title: 'Discard generated passwords?',
-      body: 'These passwords are shown only once and cannot be re-viewed after this. Make sure they have been downloaded, copied, or delivered to students first.',
-      confirmLabel: 'Discard',
-      danger: true,
-    })
-    if (!ok) return
+// The email column must never claim delivery happened when it didn't:
+// "not_configured" is rendered as a distinct, explicit "not sent" message,
+// not folded into the same bucket as "queued" or silently miscounted as
+// "no email" (which would imply the row itself has no address on file).
+function emailStatusLabel(a: RotatedAccount): string {
+  switch (a.email_status) {
+    case 'queued':
+      return `✉ queued — ${a.email}`
+    case 'not_configured':
+      return 'not sent — email is not configured on this server'
+    default:
+      return 'no email'
   }
+}
+
+// The actual import (validation already done, confirm dialog already
+// resolved) is the only part guarded by useSingleFlight: importLoading
+// (and the spinner it drives) must reflect ONLY this network round trip, not
+// the discard-confirmation dialog above it. Wrapping the confirm() await in
+// the same guarded region used to hold the spinner up the entire time the
+// "discard generated passwords?" modal sat open, which lies about what the
+// button is actually waiting on.
+const { inFlight: importLoading, run: runImport } = useSingleFlight(async () => {
+  // Re-checked here (not just by submitImport below) because this function is
+  // the actual async boundary TypeScript narrows across; submitImport's own
+  // check does not persist into a separately-declared callback.
+  if (!selectedFile.value) return
 
   topLevelError.value = ''
   result.value = null
@@ -227,6 +262,27 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
     handleApiError(err, { fallback: 'Import failed' })
   }
 })
+
+// The public entry point bound to the submit button. Validation and the
+// discard-confirmation dialog run OUTSIDE the useSingleFlight guard on
+// purpose (see runImport above) — only the network round trip itself sets
+// importLoading/shows the spinner.
+async function submitImport() {
+  if (!fileForm.validateAll()) return
+  if (!selectedFile.value || !confirmed.value) return
+
+  if (hasHeldResults.value) {
+    const ok = await confirm({
+      title: 'Discard generated passwords?',
+      body: 'These passwords are shown only once and cannot be re-viewed after this. Make sure they have been downloaded, copied, or delivered to students first.',
+      confirmLabel: 'Discard',
+      danger: true,
+    })
+    if (!ok) return
+  }
+
+  await runImport()
+}
 
 // Registered the instant results with accounts land and removed the instant
 // they're gone (second import, new file selection, or unmount) — matching
@@ -295,8 +351,8 @@ onUnmounted(() => {
     <div v-if="topLevelError" class="error-box">{{ topLevelError }}</div>
 
     <div v-if="result !== null" role="status" aria-live="polite" class="sr-only">
-      Import complete: {{ result.accounts.length }} account{{ result.accounts.length !== 1 ? 's' : '' }},
-      {{ result.errors.length }} row error{{ result.errors.length !== 1 ? 's' : '' }}.
+      Import complete: {{ resultAccounts.length }} account{{ resultAccounts.length !== 1 ? 's' : '' }},
+      {{ resultErrors.length }} row error{{ resultErrors.length !== 1 ? 's' : '' }}.
     </div>
 
     <div v-if="result !== null" class="results-section">
@@ -307,9 +363,9 @@ onUnmounted(() => {
         <div class="summary-cell"><div class="summary-value">{{ result.skipped }}</div><div class="summary-label">Skipped</div></div>
       </div>
 
-      <div v-if="result.accounts.length > 0" class="created-section">
+      <div v-if="resultAccounts.length > 0" class="created-section">
         <div class="section-head">
-          <h3>Passwords ({{ result.accounts.length }})</h3>
+          <h3>Passwords ({{ resultAccounts.length }})</h3>
           <button type="button" class="copy-btn" data-testid="rotate-copy-csv" @click="downloadAllAsCsv">
             Copy all as CSV
           </button>
@@ -321,10 +377,10 @@ onUnmounted(() => {
               <tr><th>Login ID</th><th>Outcome</th><th>Email</th><th>Password</th><th></th></tr>
             </thead>
             <tbody>
-              <tr v-for="a in result.accounts" :key="a.row">
+              <tr v-for="a in resultAccounts" :key="a.row">
                 <td>{{ a.student_id_ext }}</td>
                 <td>{{ a.outcome }}</td>
-                <td>{{ a.email_status === 'queued' ? `✉ queued — ${a.email}` : 'no email' }}</td>
+                <td>{{ emailStatusLabel(a) }}</td>
                 <td><code class="pw-cell">{{ a.password }}</code></td>
                 <td><button type="button" class="copy-btn" @click="copyPassword(a.password)">Copy</button></td>
               </tr>
@@ -333,13 +389,13 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div v-if="result.errors.length > 0" class="errors-section">
-        <h3>Row Errors ({{ result.errors.length }})</h3>
+      <div v-if="resultErrors.length > 0" class="errors-section">
+        <h3>Row Errors ({{ resultErrors.length }})</h3>
         <div class="errors-table-wrap">
           <table class="errors-table">
             <thead><tr><th>Row</th><th>Student Number</th><th>Reason</th></tr></thead>
             <tbody>
-              <tr v-for="e in result.errors" :key="e.row">
+              <tr v-for="e in resultErrors" :key="e.row">
                 <td>{{ e.row }}</td><td>{{ e.student_number || '—' }}</td><td>{{ e.message }}</td>
               </tr>
             </tbody>
