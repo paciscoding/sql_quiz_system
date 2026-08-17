@@ -20,6 +20,9 @@ type BulkResetTarget struct {
 	LastName      string
 	SecLec        string
 	SecLab        string
+	// Email is "" when the student has no address on file. Resolved with the
+	// rest of the target row so the optional send below needs no second query.
+	Email string
 }
 
 // BulkResetResult is one successfully reset student, as returned to the
@@ -35,6 +38,12 @@ type BulkResetResult struct {
 	SecLec        string `json:"sec_lec"`
 	SecLab        string `json:"sec_lab"`
 	Password      string `json:"password"`
+	Email         string `json:"email"`
+	// EmailStatus is set by the controller (the service does not know whether a
+	// sender is configured or what the admin asked for) and is EMPTY on a
+	// normal, non-emailing reset -- this endpoint's default. It is only
+	// meaningful when the request opted in with send_email.
+	EmailStatus string `json:"email_status,omitempty"`
 }
 
 // BulkResetFailure records one target that could not be reset within a batch.

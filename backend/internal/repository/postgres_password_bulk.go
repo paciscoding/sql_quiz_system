@@ -60,7 +60,8 @@ func (r *PostgresRepository) ResolveBulkResetTargets(ctx context.Context, mode s
 	selectArgs := append(append([]interface{}{}, args...), limit)
 	selectQuery := fmt.Sprintf(`
 		SELECT u.id, u.username, COALESCE(u.student_number, ''), COALESCE(u.first_name, ''),
-		       COALESCE(u.last_name, ''), COALESCE(u.sec_lec, ''), COALESCE(u.sec_lab, '')
+		       COALESCE(u.last_name, ''), COALESCE(u.sec_lec, ''), COALESCE(u.sec_lab, ''),
+		       COALESCE(u.email, '')
 		%s
 		%s
 		ORDER BY u.id ASC
@@ -75,7 +76,7 @@ func (r *PostgresRepository) ResolveBulkResetTargets(ctx context.Context, mode s
 	targets = []models.BulkResetTarget{}
 	for rows.Next() {
 		var t models.BulkResetTarget
-		if err := rows.Scan(&t.UserID, &t.Username, &t.StudentNumber, &t.FirstName, &t.LastName, &t.SecLec, &t.SecLab); err != nil {
+		if err := rows.Scan(&t.UserID, &t.Username, &t.StudentNumber, &t.FirstName, &t.LastName, &t.SecLec, &t.SecLab, &t.Email); err != nil {
 			return nil, 0, err
 		}
 		targets = append(targets, t)

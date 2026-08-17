@@ -33,7 +33,20 @@ import (
 )
 
 // multipartRoster builds a multipart body with a CSV roster and a confirm field.
+// It sends no send_email field, so it also covers the "flag absent" contract:
+// delivery stays on, exactly as it behaved before the flag existed.
 func multipartRoster(t *testing.T, csv, confirm string) (*bytes.Buffer, string) {
+	t.Helper()
+	fields := map[string]string{}
+	if confirm != "" {
+		fields["confirm"] = confirm
+	}
+	return multipartRosterFields(t, csv, fields)
+}
+
+// multipartRosterFields is multipartRoster plus arbitrary extra form fields
+// (send_email, ...). multipartRoster delegates to it so the two cannot drift.
+func multipartRosterFields(t *testing.T, csv string, fields map[string]string) (*bytes.Buffer, string) {
 	t.Helper()
 	body := &bytes.Buffer{}
 	w := multipart.NewWriter(body)
@@ -44,9 +57,9 @@ func multipartRoster(t *testing.T, csv, confirm string) (*bytes.Buffer, string) 
 	if _, err := part.Write([]byte(csv)); err != nil {
 		t.Fatalf("write csv: %v", err)
 	}
-	if confirm != "" {
-		if err := w.WriteField("confirm", confirm); err != nil {
-			t.Fatalf("WriteField: %v", err)
+	for k, v := range fields {
+		if err := w.WriteField(k, v); err != nil {
+			t.Fatalf("WriteField(%s): %v", k, err)
 		}
 	}
 	if err := w.Close(); err != nil {
@@ -781,5 +794,117 @@ func TestImportCredentials_EmailWorkerPanicOnMiddleRow_PerRowRecoveryOnly(t *tes
 	}
 	if len(job.Failures) != 1 || job.Failures[0] != "cred-p2" {
 		t.Errorf("job.Failures = %+v, want [\"cred-p2\"]", job.Failures)
+	}
+}
+
+// send_email=false is the admin's explicit "rotate but don't email" choice:
+// the passwords still come back in the response (that table is then the ONLY
+// copy), but nothing is sent, no job is registered, and every row that WOULD
+// have been emailed is reported as "skipped" -- not "queued" (a lie), not
+// "not_configured" (blames the server for the admin's choice), not "no_email"
+// (falsely claims no address is on file).
+//
+// The email spy here is a real, working sender, so a regression that ignores
+// the flag would send for real: this cannot pass by accident on an
+// unconfigured server.
+func TestImportCredentials_SendEmailFalse_SkipsDelivery(t *testing.T) {
+	env := newImportCredentialsTestEnv(t)
+	body, contentType := multipartRosterFields(t, testRosterCSV, map[string]string{
+		"confirm":    "ROTATE",
+		"send_email": "false",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/students/import-credentials", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+env.adminToken)
+	rec := httptest.NewRecorder()
+	env.engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var report struct {
+		Total    int    `json:"total"`
+		JobID    string `json:"job_id"`
+		Accounts []struct {
+			StudentIDExt string `json:"student_id_ext"`
+			Password     string `json:"password"`
+			EmailStatus  string `json:"email_status"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode report: %v", err)
+	}
+	if report.Total != 2 || len(report.Accounts) != 2 {
+		t.Fatalf("report total=%d accounts=%d, want 2/2", report.Total, len(report.Accounts))
+	}
+	if report.JobID != "" {
+		t.Errorf("job_id = %q, want empty: nothing was sent, so there is no job to poll", report.JobID)
+	}
+	// Row 1 has an address (would have been queued); row 2 has none.
+	if report.Accounts[0].EmailStatus != "skipped" {
+		t.Errorf("row with an address: email_status = %q, want \"skipped\"", report.Accounts[0].EmailStatus)
+	}
+	if report.Accounts[1].EmailStatus != "no_email" {
+		t.Errorf("row without an address: email_status = %q, want \"no_email\"", report.Accounts[1].EmailStatus)
+	}
+	// The passwords must still come back: with no email sent, this response is
+	// the only place the admin can get them.
+	for _, a := range report.Accounts {
+		if a.Password == "" {
+			t.Errorf("%s: empty password -- the admin has no way to deliver it", a.StudentIDExt)
+		}
+	}
+
+	// Delivery is asynchronous when it happens at all, so poll rather than
+	// reading the counter once: a regression that still starts the worker
+	// would otherwise race this assertion and pass intermittently.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if env.email.CredentialCount() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := env.email.CredentialCount(); got != 0 {
+		t.Errorf("SendCredential called %d times, want 0 (admin chose not to send)", got)
+	}
+	if got := env.email.NoticeCount(); got != 0 {
+		t.Errorf("SendChangeNotice called %d times, want 0", got)
+	}
+}
+
+// A malformed send_email must be rejected BEFORE any password is rotated,
+// rather than defaulting to true: defaulting garbage to "send" would mail
+// plaintext passwords to an entire roster on a typo, and no send can be
+// recalled. Rejecting also means nothing was rotated, so the admin can simply
+// retry -- the failure is free.
+func TestImportCredentials_InvalidSendEmail_Rejected(t *testing.T) {
+	env := newImportCredentialsTestEnv(t)
+	body, contentType := multipartRosterFields(t, testRosterCSV, map[string]string{
+		"confirm":    "ROTATE",
+		"send_email": "yes-please",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/students/import-credentials", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+env.adminToken)
+	rec := httptest.NewRecorder()
+	env.engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if resp.Error != "invalid_send_email" {
+		t.Errorf("error = %q, want \"invalid_send_email\"", resp.Error)
+	}
+	if got := env.email.CredentialCount(); got != 0 {
+		t.Errorf("SendCredential called %d times on a rejected request, want 0", got)
 	}
 }

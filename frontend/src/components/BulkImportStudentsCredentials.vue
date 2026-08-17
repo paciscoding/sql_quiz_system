@@ -28,7 +28,8 @@ interface RotatedAccount {
   email: string
   password: string
   outcome: 'created' | 'updated'
-  email_status: 'queued' | 'no_email' | 'not_configured'
+  // 'skipped' = has an address, but the admin chose not to send this time.
+  email_status: 'queued' | 'no_email' | 'not_configured' | 'skipped'
 }
 
 interface RotatingImportReport {
@@ -61,6 +62,12 @@ const selectedFile = ref<File | null>(null)
 const confirmPhrase = ref('')
 const topLevelError = ref('')
 const result = ref<RotatingImportReport | null>(null)
+
+// Delivery mode. Defaults to sending, which matches the endpoint's own default
+// and keeps the safer path (students actually get told) the one you fall into
+// by doing nothing. Turning it off is for rosters with no working addresses, or
+// when the admin wants to hand out passwords in the room instead.
+const sendEmail = ref(true)
 
 // Exact-match gate, same rule as BulkPasswordReset's RESET. The server checks
 // it again on every request — this input is convenience, not security.
@@ -210,6 +217,11 @@ function emailStatusLabel(a: RotatedAccount): string {
       return `✉ queued — ${a.email}`
     case 'not_configured':
       return 'not sent — email is not configured on this server'
+    case 'skipped':
+      // Deliberately NOT phrased as a failure: the admin asked for this. But
+      // it must still read as "this student has not been told", because the
+      // table on screen is the only place that password now exists.
+      return `not sent — deliver by hand (${a.email})`
     case 'no_email':
       return 'no email'
     default:
@@ -238,9 +250,15 @@ const { inFlight: importLoading, run: runImport } = useSingleFlight(async () => 
   result.value = null
 
   const token = localStorage.getItem('sql_quiz_token')
+  // Read once, here, into a local: the mode that governs the toast and the
+  // rest of this run must be the one that was actually submitted, not
+  // whatever the radio holds by the time the response lands.
+  const sentWithEmail = sendEmail.value
+
   const formData = new FormData()
   formData.append('file', selectedFile.value)
   formData.append('confirm', 'ROTATE')
+  formData.append('send_email', sentWithEmail ? 'true' : 'false')
 
   try {
     const response = await fetch('/api/v1/students/import-credentials', {
@@ -267,6 +285,10 @@ const { inFlight: importLoading, run: runImport } = useSingleFlight(async () => 
     if (data.job_id) {
       emit('job-started', data.job_id)
       notify('Import complete — passwords are being emailed.', 'success')
+    } else if (!sentWithEmail && data.accounts && data.accounts.length > 0) {
+      // No-email mode: say so plainly rather than reusing the "no emails were
+      // queued" wording below, which reads as something that went wrong.
+      notify('Import complete — no emails sent. The passwords below are the only copy; download the CSV.', 'info')
     } else if (data.accounts && data.accounts.length > 0) {
       notify('Import complete — no emails were queued. Copy the passwords below and deliver them by hand.', 'info')
     } else {
@@ -367,8 +389,9 @@ onUnmounted(() => {
     <h2>Import &amp; Email Passwords</h2>
     <p class="desc">
       Same file format as the roster import, plus an Email column. Every student in the file —
-      new and returning — gets a brand-new password emailed to them, and is signed out of any
-      current session. Rows without an email address are still imported; copy their passwords below.
+      new and returning — gets a brand-new password and is signed out of any current session.
+      Choose below whether to email those passwords out or only display them here. Rows without
+      an email address are always imported; copy their passwords below.
     </p>
 
     <div class="form-row">
@@ -384,6 +407,34 @@ onUnmounted(() => {
       />
       <FieldError :message="fileForm.touched.file ? fileForm.errors.file : ''" id="err-rotate-file" />
     </div>
+
+    <fieldset class="form-row mode-row" :disabled="importLoading">
+      <legend class="confirm-label">Delivery</legend>
+      <label class="mode-option">
+        <input
+          type="radio"
+          name="rotate-send-mode"
+          data-testid="rotate-send-email"
+          :value="true"
+          v-model="sendEmail"
+        />
+        <span>Email each student their new password</span>
+      </label>
+      <label class="mode-option">
+        <input
+          type="radio"
+          name="rotate-send-mode"
+          data-testid="rotate-no-email"
+          :value="false"
+          v-model="sendEmail"
+        />
+        <span>Don't send email — show the passwords here only</span>
+      </label>
+      <p v-if="!sendEmail" class="mode-warning" data-testid="rotate-no-email-warning">
+        No student will be told their new password. Everyone in the file is still signed out
+        immediately, and the table below is the only copy — download the CSV before leaving.
+      </p>
+    </fieldset>
 
     <div class="form-row">
       <label class="confirm-label" for="rotate-confirm">Type <code>ROTATE</code> to confirm</label>
@@ -403,7 +454,7 @@ onUnmounted(() => {
         :disabled="importLoading || !selectedFile || !confirmed"
         @click="submitImport"
       >
-        <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : 'Import & Email Passwords' }}
+        <Spinner v-if="importLoading" size="sm" inline :invert="true" />{{ importLoading ? 'Importing' : (sendEmail ? 'Import & Email Passwords' : 'Import Without Emailing') }}
       </button>
     </div>
 
@@ -479,6 +530,11 @@ h3 { margin: 0 0 var(--space-2) 0; font-size: 1rem; font-weight: 800; }
 .desc { color: var(--color-text-muted); margin: 0; font-size: 0.9rem; }
 .form-row { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
 .confirm-label { font-size: 0.85rem; font-weight: 700; }
+.mode-row { border: 2px solid var(--color-border); border-radius: 0; padding: var(--space-3) var(--space-4); margin: 0; }
+.mode-row legend { padding: 0 var(--space-2); }
+.mode-option { display: flex; align-items: center; gap: var(--space-2); font-size: 0.9rem; cursor: pointer; }
+.mode-option input { cursor: pointer; }
+.mode-warning { flex-basis: 100%; margin: 0; font-size: 0.85rem; font-weight: 700; color: var(--color-danger); }
 .file-input {
   flex: 1; min-width: 200px; padding: var(--space-2);
   border: 2px solid var(--color-border); border-radius: 0;

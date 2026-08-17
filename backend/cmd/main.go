@@ -152,6 +152,10 @@ func main() {
 	emailJobRegistry := services.NewEmailJobRegistry()
 	lecturerCtrl.SetEmailJobRegistry(emailJobRegistry)
 	userCtrl := controllers.NewUserController(authService, studentImportService)
+	// Same registry instance as the lecturer controller above, deliberately:
+	// both bulk credential paths register jobs into it, and the single
+	// job-status endpoint the admin UI polls reads it.
+	userCtrl.SetEmailJobRegistry(emailJobRegistry)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
 	examCategoryCtrl := controllers.NewExamCategoryController(repo)
 	announcementCtrl := controllers.NewAnnouncementController(repo)

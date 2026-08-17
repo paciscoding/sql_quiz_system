@@ -488,3 +488,152 @@ describe('beforeunload guard (ARCH-033 G4)', () => {
     expect(removeSpy.mock.calls.some((c) => c[0] === 'beforeunload')).toBe(true)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. Optional credential email (opt-in)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('optional credential email', () => {
+  /** Drives select -> confirm -> submit, optionally ticking the email box. */
+  async function runReset(wrapper: Awaited<ReturnType<typeof mountBulkReset>>, withEmail: boolean) {
+    await wrapper.findComponent(StudentMultiSelect).vm.$emit('update:modelValue', ['stu-1'])
+    await flushPromises()
+    await wrapper.find('.btn-primary').trigger('click')
+    if (withEmail) {
+      await wrapper.find('[data-testid="bulk-reset-send-email"]').setValue(true)
+    }
+    await wrapper.find('[data-testid="bulk-reset-confirm-input"]').setValue('RESET')
+    await wrapper.find('[data-testid="bulk-reset-submit"]').trigger('click')
+    await flushPromises()
+  }
+
+  it('sends send_email=false by default, so the long-standing print-only behaviour is unchanged', async () => {
+    installFetch((url) => defaultRoutes(url) ?? jsonResponse(bulkResp([resultRow('stu-1', 'alice')], { job_id: '' })))
+
+    const wrapper = await mountBulkReset()
+    // The confirm screen must say plainly that nothing will be mailed.
+    await wrapper.findComponent(StudentMultiSelect).vm.$emit('update:modelValue', ['stu-1'])
+    await flushPromises()
+    await wrapper.find('.btn-primary').trigger('click')
+    expect((wrapper.find('[data-testid="bulk-reset-send-email"]').element as HTMLInputElement).checked).toBe(false)
+    expect(wrapper.find('[data-testid="bulk-reset-no-email-note"]').exists()).toBe(true)
+
+    await wrapper.find('[data-testid="bulk-reset-confirm-input"]').setValue('RESET')
+    await wrapper.find('[data-testid="bulk-reset-submit"]').trigger('click')
+    await flushPromises()
+
+    const body = JSON.parse(bulkPostCalls()[0][1]!.body as string)
+    expect(body.send_email).toBe(false)
+    // No email column on a run that never asked to email.
+    expect(wrapper.find('[data-testid="bulk-reset-results-table"]').text()).not.toContain('no address on file')
+  })
+
+  it('sends send_email=true once the box is ticked', async () => {
+    installFetch((url) => defaultRoutes(url) ?? jsonResponse(bulkResp([resultRow('stu-1', 'alice')], { job_id: 'job-1' })))
+
+    const wrapper = await mountBulkReset()
+    await runReset(wrapper, true)
+
+    const body = JSON.parse(bulkPostCalls()[0][1]!.body as string)
+    expect(body.send_email).toBe(true)
+  })
+
+  it('tracks every batch job id, so the bubble covers the whole paginated run', async () => {
+    const pages = [
+      bulkResp([resultRow('stu-1', 'alice')], { job_id: 'job-a', remaining: 1, next_after_user_id: 'stu-1' }),
+      bulkResp([resultRow('stu-2', 'bob')], { job_id: 'job-b' }),
+    ]
+    let page = 0
+    installFetch((url) => {
+      const preset = defaultRoutes(url)
+      if (preset) return preset
+      if (url.endsWith('/api/v1/users/bulk-reset-password')) return jsonResponse(pages[page++])
+      // The job-status poll started by tracking both ids.
+      return jsonResponse({ job_id: 'x', total: 1, sent: 1, failed: 0, done: true, failures: [] })
+    })
+
+    const wrapper = await mountBulkReset()
+    await runReset(wrapper, true)
+
+    // Both batches ran...
+    expect(bulkPostCalls().length).toBe(2)
+    // ...and BOTH job ids are being polled: tracking only the newest would
+    // report the last batch's progress as though it were the whole run.
+    const statusUrls = (fetchMock.mock.calls as unknown as Array<[string, unknown]>)
+      .map((c) => c[0])
+      .filter((u) => u.includes('/import-credentials/'))
+    expect(statusUrls.some((u) => u.includes('job-a'))).toBe(true)
+    expect(statusUrls.some((u) => u.includes('job-b'))).toBe(true)
+  })
+
+  it('labels each row by what actually happened to its email', async () => {
+    const rows = [
+      { ...resultRow('stu-1', 'alice'), email: 'a@example.com', email_status: 'queued' },
+      { ...resultRow('stu-2', 'bob'), email: '', email_status: 'no_email' },
+      { ...resultRow('stu-3', 'cara'), email: 'c@example.com', email_status: 'not_configured' },
+    ]
+    installFetch((url) => {
+      const preset = defaultRoutes(url)
+      if (preset) return preset
+      if (url.endsWith('/api/v1/users/bulk-reset-password')) return jsonResponse(bulkResp(rows, { job_id: 'job-1' }))
+      return jsonResponse({ job_id: 'job-1', total: 1, sent: 1, failed: 0, done: true, failures: [] })
+    })
+
+    const wrapper = await mountBulkReset()
+    await runReset(wrapper, true)
+
+    const tableRows = wrapper.findAll('[data-testid="bulk-reset-results-table"] tbody tr')
+    expect(tableRows).toHaveLength(3)
+    expect(tableRows[0].text()).toContain('a@example.com')
+    // A student with no address must not read as though mail went out.
+    expect(tableRows[1].text()).toContain('no address on file')
+    // An unconfigured server must not claim a send either.
+    expect(tableRows[2].text()).toContain('not configured')
+    // Every password is still on screen regardless of delivery outcome.
+    expect(tableRows[1].text()).toContain('pw-stu-2')
+  })
+})
+
+describe('email progress does not leak between runs', () => {
+  it('a second run reports only its own batches', async () => {
+    // DISTINCT job ids per run: reusing one id would let track()'s dedupe make
+    // this test pass with or without the fix.
+    let run = 0
+    installFetch((url) => {
+      const preset = defaultRoutes(url)
+      if (preset) return preset
+      if (url.endsWith('/api/v1/users/bulk-reset-password')) {
+        run += 1
+        return jsonResponse(bulkResp([resultRow('stu-1', 'alice')], { job_id: `run-job-${run}` }))
+      }
+      const id = url.includes('run-job-2') ? 'run-job-2' : 'run-job-1'
+      return jsonResponse({ job_id: id, total: 1, sent: 1, failed: 0, done: true, failures: [] })
+    })
+
+    const wrapper = await mountBulkReset()
+    await wrapper.findComponent(StudentMultiSelect).vm.$emit('update:modelValue', ['stu-1'])
+    await flushPromises()
+    await wrapper.find('.btn-primary').trigger('click')
+    await wrapper.find('[data-testid="bulk-reset-send-email"]').setValue(true)
+    await wrapper.find('[data-testid="bulk-reset-confirm-input"]').setValue('RESET')
+    await wrapper.find('[data-testid="bulk-reset-submit"]').trigger('click')
+    await flushPromises()
+
+    // Back to the selection screen and run it again.
+    await wrapper.find('[data-testid="bulk-reset-clear"]').trigger('click')
+    await flushPromises()
+    await wrapper.findComponent(StudentMultiSelect).vm.$emit('update:modelValue', ['stu-1'])
+    await flushPromises()
+    await wrapper.find('.btn-primary').trigger('click')
+    await wrapper.find('[data-testid="bulk-reset-send-email"]').setValue(true)
+    await wrapper.find('[data-testid="bulk-reset-confirm-input"]').setValue('RESET')
+    await wrapper.find('[data-testid="bulk-reset-submit"]').trigger('click')
+    await flushPromises()
+
+    // The bubble must describe THIS run (1 email), not both runs summed.
+    const bubble = wrapper.find('[data-testid="email-job-bubble"]')
+    expect(bubble.exists()).toBe(true)
+    expect(bubble.text()).toContain('1/1')
+    expect(bubble.text()).not.toContain('2/2')
+  })
+})

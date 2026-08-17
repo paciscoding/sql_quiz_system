@@ -597,6 +597,7 @@ func (s *AuthService) BulkResetPasswords(ctx context.Context, actor models.User,
 			SecLec:        target.SecLec,
 			SecLab:        target.SecLab,
 			Password:      password,
+			Email:         target.Email,
 		})
 	}
 	return results, failures

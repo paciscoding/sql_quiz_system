@@ -172,6 +172,7 @@ type bulkResetResponseBody struct {
 	KeyConfigured   bool                      `json:"key_configured"`
 	Results         []models.BulkResetResult  `json:"results"`
 	Failures        []models.BulkResetFailure `json:"failures"`
+	JobID           string                    `json:"job_id"`
 }
 
 func postBulkReset(r *gin.Engine, token string, body map[string]interface{}) (*httptest.ResponseRecorder, bulkResetResponseBody) {
@@ -1050,5 +1051,190 @@ func TestBulkResetPassword_ExamRoster_EmptyRoster_HTTP(t *testing.T) {
 	}
 	if resp.NextAfterUserID != nil {
 		t.Fatalf("expected next_after_user_id=null for a zero-target request, got %v", *resp.NextAfterUserID)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Optional credential email (opt-in). The default path is pinned by
+// TestBulkResetPassword_NeverEmails_HTTP above, which sends no send_email at
+// all: these cover what happens once an admin asks for delivery.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// bulkResetEmailEnv builds the router with a counting email spy and a live job
+// registry, and returns everything a delivery scenario needs.
+type bulkResetEmailEnv struct {
+	engine   *gin.Engine
+	spy      *mutexRecordingEmailSender
+	registry *services.EmailJobRegistry
+	repo     *repository.PostgresRepository
+	token    string
+	adminID  int
+	baseline int
+}
+
+func newBulkResetEmailEnv(t *testing.T, sender services.EmailSender) *bulkResetEmailEnv {
+	t.Helper()
+	repo := openCtrlTestRepo(t)
+	t.Setenv(services.PasswordCryptoEnvKey, ctrlTestKey)
+	// Armed BEFORE construction: s.adminEmail is read once in NewAuthService,
+	// so a later Setenv would leave the SendChangeNotice assertion vacuous.
+	t.Setenv("ADMIN_NOTIFY_EMAIL", "admin-notify@example.com")
+
+	auth := services.NewAuthService(repo, "test-jwt-secret-least-32-characters-long")
+	spy, _ := sender.(*mutexRecordingEmailSender)
+	if sender != nil {
+		auth.SetEmailSender(sender)
+	}
+
+	userCtrl := NewUserController(auth, services.NewStudentImportService(repo))
+	registry := services.NewEmailJobRegistry()
+	userCtrl.SetEmailJobRegistry(registry)
+	engine := buildBulkResetRouter(auth, userCtrl)
+
+	admin := mkCtrlUser(t, repo, models.RoleAdmin, "adminpw")
+	return &bulkResetEmailEnv{
+		engine:   engine,
+		spy:      spy,
+		registry: registry,
+		repo:     repo,
+		token:    login(t, engine, admin.Username, "adminpw"),
+		adminID:  int(admin.ID),
+		baseline: maxUserID(t, repo),
+	}
+}
+
+// waitForBulkJob blocks until the background send finishes, so the assertions
+// below observe a settled job rather than racing the worker.
+func (e *bulkResetEmailEnv) waitForBulkJob(t *testing.T, jobID string) services.EmailJob {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		job, ok := e.registry.Get(jobID, e.adminID)
+		if ok && job.Done {
+			return job
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("email job %q never finished", jobID)
+	return services.EmailJob{}
+}
+
+func TestBulkResetPassword_SendEmailTrue_EmailsAndReportsStatus(t *testing.T) {
+	env := newBulkResetEmailEnv(t, &mutexRecordingEmailSender{})
+	cheapHash, err := bcrypt.GenerateFromPassword([]byte("shared-fixture-pw"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One student WITH an address, one WITHOUT: the two must be reported and
+	// treated differently.
+	mkBulkStudentWithEmail(t, env.repo, "mailed", "ME-1", "fixture-pw")
+	mkBulkStudentFast(t, env.repo, "unmailed", "UM-1", string(cheapHash))
+
+	w, resp := postBulkReset(env.engine, env.token, map[string]interface{}{
+		"mode": "all_students", "confirm": "RESET",
+		"after_user_id": publicid.Encode(publicid.TypeUser, env.baseline),
+		"batch_size":    10,
+		"send_email":    true,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if resp.Succeeded != 2 {
+		t.Fatalf("expected 2 resets, got %+v", resp)
+	}
+	if resp.JobID == "" {
+		t.Fatal("job_id is empty: the UI has no way to show send progress")
+	}
+
+	var queued, noEmail int
+	for _, r := range resp.Results {
+		switch r.EmailStatus {
+		case services.EmailStatusQueued:
+			queued++
+			if r.Email == "" {
+				t.Errorf("%s: queued with no address", r.Username)
+			}
+		case services.EmailStatusNoEmail:
+			noEmail++
+		default:
+			t.Errorf("%s: unexpected email_status %q", r.Username, r.EmailStatus)
+		}
+		// Delivery outcome must never suppress the password: the response is
+		// still the only copy.
+		if r.Password == "" {
+			t.Errorf("%s: empty password", r.Username)
+		}
+	}
+	if queued != 1 || noEmail != 1 {
+		t.Errorf("statuses = %d queued / %d no_email, want 1/1", queued, noEmail)
+	}
+
+	job := env.waitForBulkJob(t, resp.JobID)
+	if job.Total != 1 || job.Sent != 1 || job.Failed != 0 {
+		t.Errorf("job = %+v, want total/sent/failed 1/1/0 (only the row with an address)", job)
+	}
+	if got := env.spy.CredentialCount(); got != 1 {
+		t.Errorf("SendCredential called %d times, want 1", got)
+	}
+	// The single-user reset path emails ADMIN_NOTIFY_EMAIL per event; the bulk
+	// path must not, or one reset of 200 students becomes 200 admin emails.
+	if got := env.spy.NoticeCount(); got != 0 {
+		t.Errorf("SendChangeNotice called %d times, want 0", got)
+	}
+}
+
+// With no real sender wired in (EMAIL_SENDER_ADDRESS unset in a deployment,
+// reproduced here by leaving AuthService's NoopEmailSender in place), an opt-in
+// send must report "not_configured" rather than claiming delivery:
+// NoopEmailSender.SendCredential returns nil, so counting it as success would
+// tell the admin every student was emailed when none were.
+func TestBulkResetPassword_SendEmailTrue_NotConfigured_ClaimsNothing(t *testing.T) {
+	env := newBulkResetEmailEnv(t, nil)
+	mkBulkStudentWithEmail(t, env.repo, "noconf", "NC-1", "fixture-pw")
+
+	w, resp := postBulkReset(env.engine, env.token, map[string]interface{}{
+		"mode": "all_students", "confirm": "RESET",
+		"after_user_id": publicid.Encode(publicid.TypeUser, env.baseline),
+		"batch_size":    10,
+		"send_email":    true,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if resp.JobID != "" {
+		t.Errorf("job_id = %q, want empty: nothing can be sent, so there is no job", resp.JobID)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].EmailStatus != services.EmailStatusNotConfigured {
+		t.Fatalf("results = %+v, want one row with email_status=not_configured", resp.Results)
+	}
+}
+
+// The default path must stay non-emailing AND must not grow an email_status:
+// an empty field is what tells the UI this run never asked to send, so it can
+// leave the column off instead of showing a row of blanks.
+func TestBulkResetPassword_DefaultOmitsEmailStatusAndJob(t *testing.T) {
+	env := newBulkResetEmailEnv(t, &mutexRecordingEmailSender{})
+	mkBulkStudentWithEmail(t, env.repo, "default", "DF-1", "fixture-pw")
+
+	w, resp := postBulkReset(env.engine, env.token, map[string]interface{}{
+		"mode": "all_students", "confirm": "RESET",
+		"after_user_id": publicid.Encode(publicid.TypeUser, env.baseline),
+		"batch_size":    10,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if resp.JobID != "" {
+		t.Errorf("job_id = %q, want empty on a non-emailing reset", resp.JobID)
+	}
+	if len(resp.Results) != 1 {
+		t.Fatalf("want 1 result, got %d", len(resp.Results))
+	}
+	if resp.Results[0].EmailStatus != "" {
+		t.Errorf("email_status = %q, want empty on a run that never asked to email", resp.Results[0].EmailStatus)
+	}
+	// A student WITH an address on file still gets no mail by default.
+	if got := env.spy.CredentialCount(); got != 0 {
+		t.Errorf("SendCredential called %d times, want 0", got)
 	}
 }

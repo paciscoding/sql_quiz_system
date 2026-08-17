@@ -14,8 +14,10 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import StudentMultiSelect from './StudentMultiSelect.vue'
 import Spinner from './Spinner.vue'
 import EmptyState from './EmptyState.vue'
+import EmailJobBubble from './EmailJobBubble.vue'
 import FieldError from './FieldError.vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
+import { useEmailJobStatus } from '../composables/useEmailJobStatus'
 import { handleApiError } from '../services/error_handler'
 import { useConfirm } from '../services/confirm_service'
 import { toCsv, downloadCsv } from '../utils/csv'
@@ -114,6 +116,26 @@ function backToSelect() {
 // --- STATE B: confirmation gate ---
 const confirmText = ref('')
 
+// Optional credential email. Defaults to OFF: this screen has never sent mail
+// (its results are built to be printed and handed out), so an admin running
+// their usual reset must not suddenly mail a whole roster. Turning it on is a
+// deliberate act, and the server defaults the same way.
+const sendEmail = ref(false)
+
+// Each paginated batch starts its own email job. This screen is its own route
+// (not embedded in AdminView), so it carries its own progress bubble; the
+// composable persists the tracked ids, so the bubble on the admin page picks
+// the same run up if the admin navigates away mid-send.
+const {
+  job: emailJob,
+  state: emailJobState,
+  track: trackEmailJob,
+  restore: restoreEmailJob,
+  dismiss: dismissEmailJob,
+} = useEmailJobStatus()
+
+onMounted(restoreEmailJob)
+
 // --- STATE C/D: run + results ---
 const results = ref<BulkResetResultRow[]>([])
 const failures = ref<BulkResetFailureRow[]>([])
@@ -125,6 +147,10 @@ const { inFlight: resetRunning, run: runReset } = useSingleFlight(async () => {
   if (confirmText.value !== 'RESET') return
 
   stage.value = 'running'
+  // Drop the previous run's email jobs before this run starts registering its
+  // own. Tracking is cumulative (one job per batch), so leaving them attached
+  // would fold the last run's totals into this one's progress figure.
+  dismissEmailJob()
   results.value = []
   failures.value = []
   runError.value = ''
@@ -135,12 +161,15 @@ const { inFlight: resetRunning, run: runReset } = useSingleFlight(async () => {
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      const payload: BulkResetPasswordsRequest = { mode: mode.value, confirm: 'RESET' }
+      const payload: BulkResetPasswordsRequest = { mode: mode.value, confirm: 'RESET', send_email: sendEmail.value }
       if (mode.value === 'ids') payload.user_ids = selectedStudentIds.value
       if (mode.value === 'exam_roster') payload.exam_id = selectedExamId.value
       if (afterUserId) payload.after_user_id = afterUserId
 
       const resp = await bulkResetPasswords(payload)
+      // Emitted per batch, as each batch's job starts, so progress is visible
+      // while the remaining batches are still being reset.
+      if (resp.job_id) trackEmailJob(resp.job_id)
       results.value.push(...resp.results)
       failures.value.push(...resp.failures)
       processedSoFar.value += resp.processed
@@ -175,6 +204,27 @@ async function clearResults() {
   runError.value = ''
   confirmText.value = ''
   stage.value = 'select'
+}
+
+// True only for a run that actually asked to email, so the results table does
+// not grow a column of blanks on the ordinary print-and-hand-out path. Read
+// from the RESULTS, not from the checkbox: the admin can retoggle the box
+// after a run, and the table must keep describing the run that produced it.
+const emailWasRequested = computed(() => results.value.some((r) => !!r.email_status))
+
+// The email column must never imply a delivery that did not happen.
+function emailStatusLabel(r: BulkResetResultRow): string {
+  switch (r.email_status) {
+    case 'queued':
+      return `✉ ${r.email}`
+    case 'no_email':
+      return 'no address on file — deliver by hand'
+    case 'not_configured':
+      return 'not sent — email is not configured on this server'
+    default:
+      // Includes the ordinary no-send run, where the field is absent entirely.
+      return '—'
+  }
 }
 
 // --- beforeunload guard while results are held in memory ---
@@ -300,9 +350,25 @@ onUnmounted(() => {
       <h2>2. Confirm</h2>
       <p>
         This will reset the password for <strong>{{ targetCount }}</strong> student{{ targetCount !== 1 ? 's' : '' }}.
-        Every one of them is signed out immediately. <strong>Nothing is emailed.</strong> The new passwords are
+        Every one of them is signed out immediately. The new passwords are
         shown only once, on this page — download the CSV or print before you leave.
       </p>
+
+      <fieldset class="delivery-box" :disabled="resetRunning">
+        <legend>Delivery</legend>
+        <label class="delivery-option">
+          <input type="checkbox" v-model="sendEmail" data-testid="bulk-reset-send-email" />
+          <span>Also email each student their new password</span>
+        </label>
+        <p v-if="sendEmail" class="delivery-note" data-testid="bulk-reset-send-email-note">
+          {{ targetCount }} email{{ targetCount !== 1 ? 's' : '' }} will be sent in the background.
+          Students with no address on file are still reset — hand those passwords over from the table.
+        </p>
+        <p v-else class="delivery-note muted" data-testid="bulk-reset-no-email-note">
+          Nothing is emailed. The table on the next screen, its CSV and the printed slips are the only
+          copies of these passwords.
+        </p>
+      </fieldset>
 
       <div class="input-group">
         <label for="bulk-reset-confirm-input">Type RESET to continue</label>
@@ -365,6 +431,7 @@ onUnmounted(() => {
                 <th>Student #</th>
                 <th>Name</th>
                 <th>Sec Lec / Lab</th>
+                <th v-if="emailWasRequested">Email</th>
                 <th>Password</th>
               </tr>
             </thead>
@@ -374,6 +441,7 @@ onUnmounted(() => {
                 <td>{{ r.student_number }}</td>
                 <td>{{ r.first_name }} {{ r.last_name }}</td>
                 <td>{{ r.sec_lec }} / {{ r.sec_lab }}</td>
+                <td v-if="emailWasRequested">{{ emailStatusLabel(r) }}</td>
                 <td><code>{{ r.password }}</code></td>
               </tr>
             </tbody>
@@ -443,10 +511,29 @@ onUnmounted(() => {
         <div class="slip-note">Sign in and change this password. Keep it safe.</div>
       </div>
     </div>
+
+    <EmailJobBubble :job="emailJob" :state="emailJobState" @dismiss="dismissEmailJob" />
   </div>
 </template>
 
 <style scoped>
+.delivery-box {
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: var(--space-3) var(--space-4);
+  margin: var(--space-4) 0;
+}
+.delivery-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+.delivery-note {
+  margin: var(--space-2) 0 0 0;
+  font-size: 0.85rem;
+}
+
 .bulk-reset-view {
   max-width: 900px;
   margin: 0 auto;

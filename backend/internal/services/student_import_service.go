@@ -238,6 +238,15 @@ const (
 	// this distinct status, every row would read "queued" even though nothing
 	// was ever sent.
 	EmailStatusNotConfigured = "not_configured"
+	// EmailStatusSkipped marks a row that has an email address, on a server
+	// where email IS configured, that was deliberately not emailed because the
+	// admin chose "don't send email" for this import. Distinct from
+	// EmailStatusNotConfigured (a server limitation the admin did not choose)
+	// and from EmailStatusNoEmail (no address on file): the admin needs to
+	// know these students were never told their password, and that the
+	// results table is the only copy. Set by the controller, like
+	// EmailStatusNotConfigured.
+	EmailStatusSkipped = "skipped"
 )
 
 // RotatedAccount is one account touched by the rotating importer. Unlike

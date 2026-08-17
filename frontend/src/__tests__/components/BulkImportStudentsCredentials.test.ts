@@ -682,3 +682,102 @@ describe('BulkImportStudentsCredentials', () => {
     })
   })
 })
+
+// Delivery-mode toggle: the admin can rotate WITHOUT emailing, in which case
+// the on-screen table (and its CSV) is the only copy of every password.
+describe('BulkImportStudentsCredentials delivery mode', () => {
+  beforeEach(() => {
+    localStorage.setItem('sql_quiz_token', 't')
+    mockConfirm.mockReset().mockResolvedValue(true)
+    mockNotify.mockClear()
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  it('defaults to emailing and posts send_email=true', async () => {
+    const fetchMock = routedFetch({})
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    // The safer mode must be the one you land on by doing nothing.
+    expect((wrapper.find('[data-testid="rotate-send-email"]').element as HTMLInputElement).checked).toBe(true)
+    expect(wrapper.find('[data-testid="rotate-no-email-warning"]').exists()).toBe(false)
+
+    await importSuccessfully(wrapper)
+
+    const [, init] = postCalls(fetchMock)[0] as unknown as [string, RequestInit]
+    expect((init.body as FormData).get('send_email')).toBe('true')
+  })
+
+  it('posts send_email=false when the no-email mode is picked, and warns before submitting', async () => {
+    const noJobReport = {
+      ...report,
+      job_id: '',
+      accounts: [
+        { ...report.accounts[0], email_status: 'skipped' },
+        report.accounts[1],
+      ],
+    }
+    const fetchMock = routedFetch({ importResponse: () => jsonResponse(noJobReport) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await wrapper.find('[data-testid="rotate-no-email"]').setValue()
+    // The consequence is stated BEFORE the import runs, not after every
+    // password has already been rotated.
+    expect(wrapper.find('[data-testid="rotate-no-email-warning"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="rotate-import-submit"]').text()).toContain('Without Emailing')
+
+    await importSuccessfully(wrapper)
+
+    const [, init] = postCalls(fetchMock)[0] as unknown as [string, RequestInit]
+    expect((init.body as FormData).get('send_email')).toBe('false')
+    // Nothing is being emailed, so there is no job to poll and the progress
+    // bubble must not appear claiming otherwise.
+    expect(wrapper.emitted('job-started')).toBeUndefined()
+  })
+
+  it('renders skipped rows as "not sent" with the address, never as "no email"', async () => {
+    const noJobReport = {
+      ...report,
+      job_id: '',
+      accounts: [{ ...report.accounts[0], email_status: 'skipped' }],
+    }
+    vi.stubGlobal('fetch', routedFetch({ importResponse: () => jsonResponse(noJobReport) }))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await wrapper.find('[data-testid="rotate-no-email"]').setValue()
+    await importSuccessfully(wrapper)
+
+    const rows = wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].text()).toContain('not sent')
+    expect(rows[0].text()).toContain('a@example.com')
+    // "no email" would assert the row has no address on file -- it has one.
+    expect(rows[0].text()).not.toContain('no email')
+    // An unhandled status would render as "unknown status: skipped".
+    expect(rows[0].text()).not.toContain('unknown status')
+    // The password must still be on screen: it exists nowhere else.
+    expect(rows[0].text()).toContain('pw1')
+  })
+
+  it('tells the admin no emails were sent rather than reusing the "nothing queued" wording', async () => {
+    const noJobReport = {
+      ...report,
+      job_id: '',
+      accounts: [{ ...report.accounts[0], email_status: 'skipped' }],
+    }
+    vi.stubGlobal('fetch', routedFetch({ importResponse: () => jsonResponse(noJobReport) }))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await wrapper.find('[data-testid="rotate-no-email"]').setValue()
+    await importSuccessfully(wrapper)
+
+    const messages = mockNotify.mock.calls.map(([msg]) => String(msg))
+    expect(messages.some(m => /no emails sent/i.test(m))).toBe(true)
+    expect(messages.some(m => /being emailed/i.test(m))).toBe(false)
+  })
+})

@@ -1,10 +1,18 @@
 package controllers
 
-// Smoke test for ARCH-031/032 S4: the admin bulk password-reset endpoint must
-// NEVER deliver the newly generated password by email — not to the student,
-// not to the configured admin-notify address, not to anyone. The plaintext
-// travels on exactly one channel: the HTTP response body shown to the admin
-// who triggered the reset.
+// Smoke test for ARCH-031/032 S4, as NARROWED on 2026-08-17: by default the
+// admin bulk password-reset endpoint must deliver the newly generated password
+// to nobody — not the student, not the configured admin-notify address, not
+// anyone — so that on the default path the plaintext still travels on exactly
+// one channel: the HTTP response body shown to the admin who triggered it.
+//
+// S4's original "NEVER, under any circumstances" was relaxed by owner decision
+// to add an opt-in credential email (request field send_email, default false).
+// Every request below deliberately OMITS send_email, so this file continues to
+// pin the default path — which is what an admin who has not changed their
+// habits actually gets. The opt-in path has its own coverage in
+// bulk_reset_http_test.go (TestBulkResetPassword_SendEmailTrue_*), including
+// that it STILL never fans out an admin change-notice per event.
 //
 // The test is deliberately hostile to the invariant:
 //

@@ -1,5 +1,87 @@
 # CHANGELOG.md
 
+## [2026-08-17] Bulk password reset: opt-in credential email
+
+**Narrows a standing security decision.** ARCH-031/032 S4 said the bulk
+password-reset endpoint must NEVER email a generated password — the plaintext
+was to travel on exactly one channel, the HTTP response shown to the admin who
+triggered it. By owner decision that becomes: never **by default**, with an
+explicit per-request opt-in. The default path is unchanged and still covered by
+`bulk_reset_no_email_smoke_test.go`, whose header now documents the narrowing
+instead of claiming an absolute that no longer holds.
+
+### Added
+- **`send_email` on `POST /api/v1/users/bulk-reset-password`** (bool, **default
+  `false`**). This is the page where an admin can actually *choose which
+  students* to act on — the three existing modes (`ids`, `all_students`,
+  `exam_roster`) — which the file-driven rotating importer cannot do. Opting in
+  emails each reset student their new password; omitting it keeps the
+  print-and-hand-out behaviour byte for byte, `email_status` omitted from every
+  result row so the UI leaves the column off.
+- **`email` and `email_status` on each result row**, resolved with the target in
+  the same query (no second lookup). `queued` / `no_email` / `not_configured`,
+  with the same "never claim a delivery that didn't happen" rule as the importer.
+- **`job_id` per batch**, plus a **delivery tick box and Email column** in
+  `BulkPasswordReset.vue` and its own progress bubble (the page is its own route,
+  not part of AdminView).
+- **Multi-job progress aggregation** in `useEmailJobStatus`: it now tracks a SET
+  of job ids and reports their sum. Bulk reset is paginated, so a 250-student run
+  is three jobs; tracking only the newest would have shown "40/100" while 150
+  further emails were in flight. Jobs are polled concurrently, so one slow batch
+  cannot stall the others, and the stored value is now a JSON array (a legacy
+  single-id string still restores).
+
+### Changed
+- **Shared credential-email worker** extracted to
+  `controllers/credential_email_worker.go` (`startCredentialEmailJob` +
+  `sendOneCredential`). Both bulk paths now use it, so the serial-send,
+  per-row-panic-recovery and job-bookkeeping rules exist once instead of twice.
+  `lecturer_controller.go`'s private `sendOne` is gone, replaced by a call.
+
+### Security
+- Rows that **failed** to reset are never emailed: their old password still
+  works, so mailing the new one would tell a student to type a password that
+  does not exist.
+- The opt-in send still **never** routes through `logPasswordEvent`, so a
+  200-student reset does not fan out 200 `ADMIN_NOTIFY_EMAIL` notices. Asserted
+  with `ADMIN_NOTIFY_EMAIL` set BEFORE the `AuthService` is constructed —
+  otherwise that assertion is vacuous.
+
+---
+
+## [2026-08-17] Rotating import: optional email delivery
+
+### Added
+- **`send_email` on `POST /api/v1/students/import-credentials`.** The admin can
+  now rotate a whole roster **without** emailing anyone and read the new
+  passwords off the results table / CSV instead. Optional multipart field;
+  **absent means `true`**, so the endpoint's original always-email contract is
+  unchanged for any existing caller. With `send_email=false` the rotation is
+  identical (new password per row, `token_version` bumped, every student signed
+  out) but no send is attempted, no email job is registered (`job_id` stays
+  `""`, so no progress bubble appears), and every row that would have been
+  queued reports the new `email_status: "skipped"`.
+- **`email_status: "skipped"`** — distinct from `"not_configured"` (the server
+  cannot send) and `"no_email"` (no address on file), because only this one is
+  the admin's own choice, and only the admin knows those students still need to
+  be told. Rendered as `not sent — deliver by hand (<address>)`.
+- **UI delivery selector** in `BulkImportStudentsCredentials.vue`: a two-option
+  radio defaulting to "email", an on-the-spot warning when the no-email mode is
+  picked, and a submit button that relabels to **"Import Without Emailing"** so
+  the active mode is visible at the point of click.
+
+### Security
+- An unparseable `send_email` is **rejected with `400 invalid_send_email`
+  before any password is rotated**, rather than falling back to the default
+  `true`. Defaulting a typo to "send" would mail plaintext passwords to an
+  entire roster, and no send can be recalled; rejecting costs nothing, since
+  nothing was written.
+- The admin's choice is applied **before** the `EmailConfigured()` downgrade and
+  wins over it, so a no-email import can never report `"not_configured"` —
+  which would blame the server for a decision the admin made.
+
+---
+
 ## [2026-08-17] Admin rotating credential import (branch `feat/rotating-credential-import`)
 
 **New admin-only capability, additive: `POST /lecturer/students/import` is completely unchanged, including its Admin/Lecturer permissions and its "existing student keeps their password" behaviour.**

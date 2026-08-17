@@ -809,6 +809,21 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 		return
 	}
 
+	// send_email selects delivery mode. Absent means true so the original
+	// contract (this endpoint always emailed) still holds for any caller that
+	// predates the flag. A malformed value is rejected rather than defaulted:
+	// defaulting garbage to true would mail plaintext passwords to a whole
+	// roster on a typo, and that send cannot be recalled.
+	sendEmail := true
+	if v := c.PostForm("send_email"); v != "" {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_send_email"})
+			return
+		}
+		sendEmail = parsed
+	}
+
 	rows, ok := ctrl.parseRosterFromRequest(c)
 	if !ok {
 		return
@@ -847,6 +862,23 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 	// nobody told them about. Downgrade those rows here, before anything
 	// below reads EmailStatus, so the job-registration/worker logic and the
 	// response body agree.
+	// The admin's own choice is applied FIRST and wins over the
+	// configuration-based downgrade below: on a no-email import nothing is
+	// sent regardless of whether a sender is wired in, so reporting
+	// "not_configured" there would blame the server for a decision the admin
+	// made. After this loop no row is left "queued", so the downgrade below
+	// is a no-op on this path -- and no job is registered further down,
+	// because that too keys off EmailStatusQueued.
+	if !sendEmail {
+		for i := range report.Accounts {
+			if report.Accounts[i].EmailStatus == services.EmailStatusQueued {
+				report.Accounts[i].EmailStatus = services.EmailStatusSkipped
+			}
+		}
+		log.Printf("import-credentials: admin=%s (id=%d) rotated %d account(s) with delivery disabled; passwords were returned to the browser only",
+			admin.Username, admin.ID, len(report.Accounts))
+	}
+
 	emailConfigured := ctrl.authService != nil && ctrl.authService.EmailConfigured()
 	if !emailConfigured {
 		for i := range report.Accounts {
@@ -895,57 +927,15 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 	// Rows are only ever queued here when emailConfigured is true (see the
 	// EmailStatus downgrade above), so no job is registered and no worker
 	// starts when delivery is not configured.
-	toSend := make([]services.RotatedAccount, 0, len(report.Accounts))
+	toSend := make([]credentialRecipient, 0, len(report.Accounts))
 	for _, a := range report.Accounts {
 		if a.EmailStatus == services.EmailStatusQueued {
-			toSend = append(toSend, a)
+			toSend = append(toSend, credentialRecipient{Email: a.Email, LoginID: a.StudentIDExt, Password: a.Password})
 		}
 	}
-	if len(toSend) > 0 && ctrl.authService != nil && ctrl.emailJobs != nil {
-		job := ctrl.emailJobs.Register(int(admin.ID), len(toSend))
-		report.JobID = job.ID
-		if job.ID == "" {
-			// crypto/rand failed inside Register, which degrades to an unregistered
-			// job rather than a predictable id (see EmailJobRegistry.Register). That
-			// leaves report.JobID == "", the same value used when no row had an
-			// email address -- so make the actual cause explicit here instead of
-			// silently reusing that signal. The emails still go out below; they are
-			// just untracked, since every MarkSent/MarkFailed/Finish call against an
-			// unregistered id is a no-op.
-			log.Printf("import-credentials: email job registration failed (crypto/rand); sending %d email(s) without progress tracking", len(toSend))
-		}
-		go func(jobID string, accounts []services.RotatedAccount) {
-			defer ctrl.emailJobs.Finish(jobID)
-			for _, a := range accounts {
-				sendOne(ctrl, jobID, a)
-			}
-		}(job.ID, toSend)
-	}
+	report.JobID = startCredentialEmailJob(ctrl.authService, ctrl.emailJobs, int(admin.ID), toSend)
 
 	c.JSON(http.StatusOK, report)
-}
-
-// sendOne sends a single rotated credential and records the outcome in the
-// job registry. It carries its OWN per-iteration recover(): the worker loop
-// used to wrap a single recover() around the WHOLE send loop, so a panic on
-// (say) row 3 of 200 abandoned rows 4-200 with no MarkFailed call for any of
-// them -- Finish still ran, so the admin saw a job reporting "done" with a
-// misleadingly small failure count while 197 rows silently got nothing.
-// Recovering per-iteration means one bad row is recorded as failed and the
-// loop moves on, exactly like a returned error from SendCredentialEmail.
-func sendOne(ctrl *LecturerController, jobID string, a services.RotatedAccount) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("import-credentials: email worker panic for %q: %v", a.StudentIDExt, r)
-			ctrl.emailJobs.MarkFailed(jobID, a.StudentIDExt)
-		}
-	}()
-	if err := ctrl.authService.SendCredentialEmail(a.Email, a.StudentIDExt, a.Password); err != nil {
-		log.Printf("import-credentials: SendCredential failed for %q: %v", a.StudentIDExt, err)
-		ctrl.emailJobs.MarkFailed(jobID, a.StudentIDExt)
-		return
-	}
-	ctrl.emailJobs.MarkSent(jobID)
 }
 
 // ImportCredentialsJobStatus handles

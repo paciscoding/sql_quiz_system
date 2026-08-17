@@ -171,6 +171,11 @@ export interface BulkResetResultRow {
   /** Plaintext, shown to the admin exactly once — this response is the ONLY
    * channel it ever travels on (ARCH-031/032); never persisted client-side. */
   password: string
+  /** "" when no address is on file. */
+  email: string
+  /** Absent on a normal (non-emailing) reset — this endpoint does not send
+   * mail unless the request opted in with send_email. */
+  email_status?: 'queued' | 'no_email' | 'not_configured'
 }
 export interface BulkResetFailureRow {
   user_id: string
@@ -187,6 +192,10 @@ export interface BulkResetResponse {
   key_configured: boolean
   results: BulkResetResultRow[]
   failures: BulkResetFailureRow[]
+  /** Progress-job id for this batch's credential emails; "" when nothing is
+   * being sent. Each paginated batch starts its OWN job, so a multi-batch run
+   * yields several ids — track them all (see useEmailJobStatus). */
+  job_id: string
 }
 
 export interface BulkResetPasswordsRequest {
@@ -198,6 +207,9 @@ export interface BulkResetPasswordsRequest {
   confirm: string
   after_user_id?: string
   batch_size?: number
+  /** Opt IN to emailing each new password. Omitted/false keeps this endpoint's
+   * long-standing behaviour: reset, show, print — never send. */
+  send_email?: boolean
 }
 
 /** POST /api/v1/users/bulk-reset-password — admin-only bulk reset (ARCH-031). */

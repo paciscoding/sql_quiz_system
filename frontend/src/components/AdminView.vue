@@ -289,6 +289,15 @@ const runExportNow = async () => {
 // restored on mount — a reload must not lose the progress bubble.
 const { job: emailJob, state: emailJobState, track: trackEmailJob, restore: restoreEmailJob, dismiss: dismissEmailJob } = useEmailJobStatus()
 
+// One import starts exactly one job, so a new import REPLACES the bubble
+// rather than adding to it: tracking is cumulative (bulk reset needs that for
+// its per-batch jobs), and without this clear the previous import's totals
+// would still be counted in this one's progress.
+function startImportEmailJob(jobId: string) {
+  dismissEmailJob()
+  trackEmailJob(jobId)
+}
+
 onMounted(() => {
   fetchUsers()
   fetchExportSettings()
@@ -418,7 +427,7 @@ onMounted(() => {
       </div>
 
       <!-- Rotating credential import (admin-only) -->
-      <BulkImportStudentsCredentials @job-started="trackEmailJob" />
+      <BulkImportStudentsCredentials @job-started="startImportEmailJob" />
     </div>
 
     <!-- User List -->

@@ -17,10 +17,22 @@ import (
 type UserController struct {
 	authService    *services.AuthService
 	studentService *services.StudentImportService
+	emailJobs      *services.EmailJobRegistry
 }
 
 func NewUserController(authService *services.AuthService, studentService *services.StudentImportService) *UserController {
 	return &UserController{authService: authService, studentService: studentService}
+}
+
+// SetEmailJobRegistry wires the in-memory progress registry used by the opt-in
+// credential email on bulk password reset. It must be the SAME registry
+// instance the LecturerController holds: the admin UI polls one status
+// endpoint (GET /students/import-credentials/:job_id/status) for jobs started
+// by either path, and that endpoint reads the lecturer controller's registry.
+// Leaving it nil disables the send outright (startCredentialEmailJob returns
+// "" and no worker runs) rather than sending untracked.
+func (ctrl *UserController) SetEmailJobRegistry(reg *services.EmailJobRegistry) {
+	ctrl.emailJobs = reg
 }
 
 func (ctrl *UserController) Login(c *gin.Context) {
@@ -323,6 +335,13 @@ type bulkResetPasswordRequest struct {
 	Confirm     string   `json:"confirm"`
 	AfterUserID string   `json:"after_user_id"`
 	BatchSize   *int     `json:"batch_size"`
+	// SendEmail opts INTO emailing each new password. It defaults to false
+	// (absent == false, the zero value) on purpose: this endpoint has never
+	// sent mail, its results are designed to be printed and handed out, and a
+	// silent default of true would mail an entire roster the first time an
+	// admin ran their usual reset. The rotating roster importer defaults the
+	// other way because emailing is that endpoint's whole point.
+	SendEmail bool `json:"send_email"`
 }
 
 // BulkResetPassword handles POST /api/v1/users/bulk-reset-password
@@ -467,6 +486,40 @@ func (ctrl *UserController) BulkResetPassword(c *gin.Context) {
 
 	results, failures := ctrl.authService.BulkResetPasswords(ctx, actor, targets)
 
+	// Optional delivery (opt-in; see bulkResetPasswordRequest.SendEmail). Only
+	// rows that actually reset are considered -- a failed reset left that
+	// student's OLD password in place, so mailing the new one would tell them
+	// to type a password that does not work.
+	//
+	// This runs per batch: a 250-student reset is three requests and therefore
+	// three jobs. The admin UI tracks the whole set (see useEmailJobStatus's
+	// multi-job aggregation) rather than only the newest one, so the progress
+	// it shows covers the entire run instead of the last 50 students.
+	jobID := ""
+	if req.SendEmail {
+		emailConfigured := ctrl.authService != nil && ctrl.authService.EmailConfigured()
+		recipients := make([]credentialRecipient, 0, len(results))
+		for i := range results {
+			switch {
+			case results[i].Email == "":
+				// No address on file. Still reset, still in the response --
+				// this password can only be delivered by hand.
+				results[i].EmailStatus = services.EmailStatusNoEmail
+			case !emailConfigured:
+				// Never claim a send on a server with no sender wired in:
+				// NoopEmailSender.SendCredential returns nil, so counting it
+				// as success would report "40/40 emailed" with nothing sent.
+				results[i].EmailStatus = services.EmailStatusNotConfigured
+			default:
+				results[i].EmailStatus = services.EmailStatusQueued
+				recipients = append(recipients, credentialRecipient{
+					Email: results[i].Email, LoginID: results[i].Username, Password: results[i].Password,
+				})
+			}
+		}
+		jobID = startCredentialEmailJob(ctrl.authService, ctrl.emailJobs, int(actor.ID), recipients)
+	}
+
 	remaining := repoRemaining - len(targets)
 	if remaining < 0 {
 		remaining = 0
@@ -483,8 +536,8 @@ func (ctrl *UserController) BulkResetPassword(c *gin.Context) {
 	for i, t := range targets {
 		affectedIDs[i] = t.UserID
 	}
-	log.Printf("audit: bulk_password_reset actor=%q actor_id=%d mode=%s exam_id=%d requested=%d succeeded=%d failed=%d user_ids=%v",
-		actor.Username, actor.ID, req.Mode, examID, len(targets), len(results), len(failures), affectedIDs)
+	log.Printf("audit: bulk_password_reset actor=%q actor_id=%d mode=%s exam_id=%d requested=%d succeeded=%d failed=%d send_email=%t user_ids=%v",
+		actor.Username, actor.ID, req.Mode, examID, len(targets), len(results), len(failures), req.SendEmail, affectedIDs)
 
 	// S7: POST-only (never GET) and no-store, so a credential dump can never
 	// land in a URL, browser history, proxy access log, or be replayed from
@@ -500,6 +553,9 @@ func (ctrl *UserController) BulkResetPassword(c *gin.Context) {
 		"key_configured":     ctrl.authService.KeyConfigured(),
 		"results":            results,
 		"failures":           failures,
+		// "" whenever nothing is being sent: send_email was false (the
+		// default), no reset row had an address, or delivery is not configured.
+		"job_id": jobID,
 	})
 }
 
