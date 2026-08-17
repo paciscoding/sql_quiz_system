@@ -13,7 +13,7 @@ const visible = computed(() => props.state !== 'idle')
 // The counter tracks successful sends against the roster total; failures are
 // surfaced separately (a "12/40, 2 failed" split reads clearer than folding
 // failures into the numerator).
-const processed = computed(() => props.job?.sent ?? 0)
+const sentCount = computed(() => props.job?.sent ?? 0)
 const total = computed(() => props.job?.total ?? 0)
 const failed = computed(() => props.job?.failed ?? 0)
 const failures = computed(() => props.job?.failures ?? [])
@@ -25,10 +25,14 @@ const tone = computed(() => {
 })
 
 // Ten dots is a fixed-width progress track — it reads at a glance without the
-// layout shifting as the roster size changes.
+// layout shifting as the roster size changes. The track fills on ATTEMPTED
+// sends (sent + failed), not successes: once the worker is done, attempted
+// always equals total, so the track reads as finished even when some sends
+// failed. The numeral above stays sent-only — it answers "how many students
+// actually received their password."
 const filledDots = computed(() => {
   if (!total.value) return 0
-  return Math.round((processed.value / total.value) * 10)
+  return Math.round(((sentCount.value + failed.value) / total.value) * 10)
 })
 </script>
 
@@ -50,7 +54,7 @@ const filledDots = computed(() => {
     <template v-else>
       <div class="headline">
         &#9993; {{ state === 'done' ? 'Passwords emailed' : 'Emailing passwords' }}
-        <span class="count" aria-live="polite">{{ processed }}/{{ total }}</span>
+        <span class="count">{{ sentCount }}/{{ total }}</span>
       </div>
       <div class="track" aria-hidden="true">
         <span v-for="n in 10" :key="n" class="dot" :class="{ filled: n <= filledDots }">&#9679;</span>

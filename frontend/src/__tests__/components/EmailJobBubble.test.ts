@@ -46,4 +46,15 @@ describe('EmailJobBubble', () => {
     await wrapper.find('[data-testid="email-job-dismiss"]').trigger('click')
     expect(wrapper.emitted('dismiss')).toHaveLength(1)
   })
+
+  it('fully lights the dot track when done with partial failures, not stuck mid-progress', () => {
+    const wrapper = mount(EmailJobBubble, {
+      props: {
+        job: { job_id: 'j1', total: 40, sent: 36, failed: 4, done: true, failures: ['s7', 's9'] },
+        state: 'done',
+      },
+    })
+    const dots = wrapper.findAll('[data-testid="email-job-bubble"] .dot.filled')
+    expect(dots).toHaveLength(10)
+  })
 })
