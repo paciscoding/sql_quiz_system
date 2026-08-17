@@ -5,11 +5,12 @@
 // and is signed out of any current session. The confirm gate below follows
 // BulkPasswordReset.vue's inline-typed-phrase pattern (services/confirm_service's
 // ConfirmOptions has no text-input field, so a dialog can't hold the phrase).
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { useSingleFlight } from '../composables/useSingleFlight'
 import { useNotifications } from '../services/notification_service'
 import { handleApiError } from '../services/error_handler'
 import { useFormValidation } from '../composables/useFormValidation'
+import { useConfirm } from '../services/confirm_service'
 import { toCsv, downloadCsv } from '../utils/csv'
 import FieldError from './FieldError.vue'
 import Spinner from './Spinner.vue'
@@ -43,6 +44,7 @@ interface RotatingImportReport {
 const emit = defineEmits<{ (e: 'job-started', jobId: string): void }>()
 
 const { notify } = useNotifications()
+const { confirm } = useConfirm()
 
 const selectedFile = ref<File | null>(null)
 const confirmPhrase = ref('')
@@ -53,6 +55,25 @@ const result = ref<RotatingImportReport | null>(null)
 // it again on every request — this input is convenience, not security.
 const confirmed = computed(() => confirmPhrase.value === 'ROTATE')
 
+// True exactly while a batch of unrecoverable, one-time-shown passwords is
+// sitting in this tab's memory. Drives BOTH the beforeunload guard below and
+// the "are you sure" gate in front of the two actions that would wipe them
+// silently (a second import, picking a different file) — same discipline as
+// BulkPasswordReset.vue's hasHeldResults.
+const hasHeldResults = computed(() => (result.value?.accounts.length ?? 0) > 0)
+
+// Known server error codes mapped to sentences an admin can act on. Anything
+// not in this map (e.g. a file-parsing message) is already a human-readable
+// sentence from the backend and is shown as-is via the fallback.
+const KNOWN_ERROR_CODES: Record<string, string> = {
+  confirmation_required: 'Confirmation phrase did not match. Please retype ROTATE and try again.',
+}
+
+function friendlyImportError(code: string | undefined, fallback: string): string {
+  if (!code) return fallback
+  return KNOWN_ERROR_CODES[code] ?? code
+}
+
 const fileValidator = (file: File | null) => {
   if (!file) return 'Please select a file'
   if (!file.name.match(/\.(csv|xlsx)$/i)) return 'File must be .csv or .xlsx'
@@ -60,9 +81,21 @@ const fileValidator = (file: File | null) => {
 }
 const fileForm = useFormValidation({ file: { rules: [fileValidator] } })
 
-const handleFileChange = (event: Event) => {
+const handleFileChange = async (event: Event) => {
   const input = event.target as HTMLInputElement
-  selectedFile.value = input.files?.[0] ?? null
+  const nextFile = input.files?.[0] ?? null
+
+  if (hasHeldResults.value) {
+    const ok = await confirm({
+      title: 'Discard generated passwords?',
+      body: 'These passwords are shown only once and cannot be re-viewed after this. Make sure they have been downloaded, copied, or delivered to students first.',
+      confirmLabel: 'Discard',
+      danger: true,
+    })
+    if (!ok) return
+  }
+
+  selectedFile.value = nextFile
   fileForm.values.file = selectedFile.value
   topLevelError.value = ''
   result.value = null
@@ -97,6 +130,16 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
   if (!fileForm.validateAll()) return
   if (!selectedFile.value || !confirmed.value) return
 
+  if (hasHeldResults.value) {
+    const ok = await confirm({
+      title: 'Discard generated passwords?',
+      body: 'These passwords are shown only once and cannot be re-viewed after this. Make sure they have been downloaded, copied, or delivered to students first.',
+      confirmLabel: 'Discard',
+      danger: true,
+    })
+    if (!ok) return
+  }
+
   topLevelError.value = ''
   result.value = null
 
@@ -115,7 +158,7 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
 
     if (!response.ok) {
       if (response.status === 400) {
-        topLevelError.value = data.error || 'File format rejected'
+        topLevelError.value = friendlyImportError(data.error, 'File format rejected')
         return
       }
       throw new Error(data.error || 'Import failed')
@@ -123,11 +166,39 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
 
     result.value = data
     confirmPhrase.value = ''
-    if (data.job_id) emit('job-started', data.job_id)
-    notify('Import complete — passwords are being emailed.', 'success')
+
+    // The toast must reflect what actually happened, not what usually
+    // happens: job_id is "" whenever no row in the file carried an email
+    // address, and accounts can be empty when every row landed in errors[].
+    if (data.job_id) {
+      emit('job-started', data.job_id)
+      notify('Import complete — passwords are being emailed.', 'success')
+    } else if (data.accounts && data.accounts.length > 0) {
+      notify('Import complete — no emails were queued. Copy the passwords below and deliver them by hand.', 'info')
+    } else {
+      notify('Import complete — nothing was imported. See the row errors below.', 'info')
+    }
   } catch (err: any) {
     handleApiError(err, { fallback: 'Import failed' })
   }
+})
+
+// Registered the instant results with accounts land and removed the instant
+// they're gone (second import, new file selection, or unmount) — matching
+// BulkPasswordReset.vue's lifetime discipline: the listener must not outlive
+// the secrets, and must not leak past this component's life.
+function beforeUnloadGuard(e: BeforeUnloadEvent) {
+  e.preventDefault()
+  e.returnValue = ''
+}
+
+watch(hasHeldResults, (held) => {
+  if (held) window.addEventListener('beforeunload', beforeUnloadGuard)
+  else window.removeEventListener('beforeunload', beforeUnloadGuard)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('beforeunload', beforeUnloadGuard)
 })
 </script>
 
@@ -141,12 +212,14 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
     </p>
 
     <div class="form-row">
+      <label class="confirm-label" for="rotate-file">Roster file</label>
       <input
+        id="rotate-file"
         type="file"
         accept=".csv,.xlsx"
         :disabled="importLoading"
         class="file-input"
-        aria-describedby="err-rotate-file"
+        :aria-describedby="fileForm.touched.file && fileForm.errors.file ? 'err-rotate-file' : undefined"
         @change="handleFileChange"
       />
       <FieldError :message="fileForm.touched.file ? fileForm.errors.file : ''" id="err-rotate-file" />
@@ -164,6 +237,7 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
         autocomplete="off"
       />
       <button
+        type="button"
         class="primary-btn danger"
         data-testid="rotate-import-submit"
         :disabled="importLoading || !selectedFile || !confirmed"
@@ -174,6 +248,11 @@ const { inFlight: importLoading, run: submitImport } = useSingleFlight(async () 
     </div>
 
     <div v-if="topLevelError" class="error-box">{{ topLevelError }}</div>
+
+    <div v-if="result !== null" role="status" aria-live="polite" class="sr-only">
+      Import complete: {{ result.accounts.length }} account{{ result.accounts.length !== 1 ? 's' : '' }},
+      {{ result.errors.length }} row error{{ result.errors.length !== 1 ? 's' : '' }}.
+    </div>
 
     <div v-if="result !== null" class="results-section">
       <div class="summary-grid">
@@ -275,4 +354,15 @@ h3 { margin: 0 0 var(--space-2) 0; font-size: 1rem; font-weight: 800; }
   font-weight: 700; cursor: pointer; white-space: nowrap;
 }
 .copy-btn:hover { background: var(--color-surface-muted); }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 </style>

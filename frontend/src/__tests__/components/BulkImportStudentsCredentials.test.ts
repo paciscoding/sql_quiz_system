@@ -6,6 +6,22 @@ vi.mock('../../utils/csv', async (importOriginal) => {
   return { ...actual, downloadCsv: vi.fn() }
 })
 
+// Unviewed passwords can only be destroyed after the admin confirms (a second
+// import, or picking a different file) — same gate as BulkPasswordReset.vue's
+// "Clear results". mockConfirm is controlled per-test so both the accept and
+// the decline branches can be exercised.
+const mockConfirm = vi.fn()
+vi.mock('../../services/confirm_service', () => ({
+  useConfirm: () => ({ confirm: mockConfirm }),
+}))
+
+// Mocked so the new-toast tests can assert on exact message text instead of
+// reading rendered toast DOM (this component doesn't mount a toast host).
+const mockNotify = vi.fn()
+vi.mock('../../services/notification_service', () => ({
+  useNotifications: () => ({ notify: mockNotify }),
+}))
+
 import BulkImportStudentsCredentials from '../../components/BulkImportStudentsCredentials.vue'
 import { downloadCsv } from '../../utils/csv'
 
@@ -27,16 +43,31 @@ function jsonResponse(data: unknown, ok = true, status = 200) {
 }
 
 /** Attach a fake file so the component's validation passes without a real input. */
-async function selectFile(wrapper: ReturnType<typeof mount>) {
-  const file = new File(['x'], 'roster.csv', { type: 'text/csv' })
+async function selectFile(wrapper: ReturnType<typeof mount>, name = 'roster.csv') {
+  const file = new File(['x'], name, { type: 'text/csv' })
   const input = wrapper.find('input[type="file"]')
   Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
   await input.trigger('change')
 }
 
+async function importSuccessfully(wrapper: ReturnType<typeof mount>) {
+  await selectFile(wrapper)
+  await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+  await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+  await flushPromises()
+}
+
 describe('BulkImportStudentsCredentials', () => {
-  beforeEach(() => { localStorage.setItem('sql_quiz_token', 't') })
-  afterEach(() => { vi.restoreAllMocks(); localStorage.clear() })
+  beforeEach(() => {
+    localStorage.setItem('sql_quiz_token', 't')
+    mockConfirm.mockReset().mockResolvedValue(true)
+    mockNotify.mockClear()
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
 
   it('refuses to submit until ROTATE is typed exactly', async () => {
     const wrapper = mount(BulkImportStudentsCredentials)
@@ -105,5 +136,152 @@ describe('BulkImportStudentsCredentials', () => {
     expect(lines).toHaveLength(3) // header + 2 rows
     expect(lines[0]).toBe('student_id_ext,email,password')
     expect(lines[1]).toContain('pw1')
+  })
+
+  // -------------------------------------------------------------------------
+  // Unviewed-password destruction guards (declining leaves results intact)
+  // -------------------------------------------------------------------------
+
+  it('prompts for confirmation before a second import overwrites displayed results; declining keeps them and fires no fetch', async () => {
+    const fetchMock = vi.fn(() => jsonResponse(report))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    // Second attempt: admin declines the "discard?" prompt.
+    mockConfirm.mockResolvedValueOnce(false)
+    await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+    await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+    await flushPromises()
+
+    expect(mockConfirm).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(1) // no second network call
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+  })
+
+  it('lets a second import proceed once confirmed, replacing the displayed results', async () => {
+    const secondReport = { ...report, accounts: [report.accounts[0]] }
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => jsonResponse(report))
+      .mockImplementationOnce(() => jsonResponse(secondReport))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+
+    await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+    await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(1)
+  })
+
+  it('prompts for confirmation before changing the selected file wipes displayed results; declining keeps them', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(report)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+
+    mockConfirm.mockResolvedValueOnce(false)
+    await selectFile(wrapper, 'another-roster.csv')
+
+    expect(mockConfirm).toHaveBeenCalledTimes(1)
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+  })
+
+  it('lets a file change proceed once confirmed, clearing the displayed results', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(report)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+    expect(wrapper.find('[data-testid="rotated-accounts-table"]').exists()).toBe(true)
+
+    await selectFile(wrapper, 'another-roster.csv')
+
+    expect(wrapper.find('[data-testid="rotated-accounts-table"]').exists()).toBe(false)
+  })
+
+  // -------------------------------------------------------------------------
+  // Toast must reflect what actually happened, not assume emails are in flight
+  // -------------------------------------------------------------------------
+
+  it('does not claim passwords are being emailed when job_id is empty (no row had an email)', async () => {
+    const noEmailReport = { ...report, job_id: '' }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(noEmailReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    expect(wrapper.emitted('job-started')).toBeUndefined()
+    const emailingClaims = mockNotify.mock.calls.filter(([msg]) => String(msg).includes('being emailed'))
+    expect(emailingClaims).toHaveLength(0)
+    expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining('deliver them by hand'), 'info')
+  })
+
+  it('does not claim passwords are being emailed when everything errored (no accounts, no job)', async () => {
+    const allErrorsReport = { ...report, job_id: '', accounts: [], errors: [{ row: 1, student_number: 'N1', message: 'bad row' }] }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(allErrorsReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    const emailingClaims = mockNotify.mock.calls.filter(([msg]) => String(msg).includes('being emailed'))
+    expect(emailingClaims).toHaveLength(0)
+  })
+
+  it('does claim passwords are being emailed when job_id is present', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(report)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining('being emailed'), 'success')
+  })
+
+  // -------------------------------------------------------------------------
+  // beforeunload guard lifetime matches whether unrecoverable secrets are held
+  // -------------------------------------------------------------------------
+
+  it('registers the beforeunload guard once results with accounts exist, and removes it once cleared', async () => {
+    const addSpy = vi.spyOn(window, 'addEventListener')
+    const removeSpy = vi.spyOn(window, 'removeEventListener')
+
+    const emptyOnSecond = { ...report, job_id: '', accounts: [], errors: [{ row: 1, student_number: 'N1', message: 'bad row' }] }
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => jsonResponse(report))
+      .mockImplementationOnce(() => jsonResponse(emptyOnSecond))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+
+    expect(addSpy).not.toHaveBeenCalledWith('beforeunload', expect.any(Function))
+
+    await importSuccessfully(wrapper)
+    expect(addSpy).toHaveBeenCalledWith('beforeunload', expect.any(Function))
+    expect(removeSpy).not.toHaveBeenCalledWith('beforeunload', expect.any(Function))
+
+    // Second import (confirmed) resolves to zero accounts -> guard must come off.
+    await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+    await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+    await flushPromises()
+
+    expect(removeSpy).toHaveBeenCalledWith('beforeunload', expect.any(Function))
+  })
+
+  it('removes the beforeunload guard on unmount so it never leaks past this component', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(report)))
+    const removeSpy = vi.spyOn(window, 'removeEventListener')
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    wrapper.unmount()
+    expect(removeSpy).toHaveBeenCalledWith('beforeunload', expect.any(Function))
   })
 })
