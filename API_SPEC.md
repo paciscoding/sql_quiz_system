@@ -44,6 +44,8 @@ No request struct uses `binding:"required"` except where explicitly noted (`Impo
 | Admin | POST | `/users/:id/resend-credential` | Admin |
 | Admin | GET | `/users/:id/password-events` | Admin |
 | Admin | POST | `/users/bulk-reset-password` | Admin |
+| Admin | POST | `/students/import-credentials` | Admin |
+| Admin | GET | `/students/import-credentials/:job_id/status` | Admin |
 | Admin | GET | `/export/settings` | Admin |
 | Admin | PUT | `/export/settings` | Admin |
 | Admin | POST | `/export/run-now` | Admin |
@@ -360,6 +362,20 @@ Legacy shared-template import; retained for scripting, no longer surfaced in the
 - **Behaviour:** upserts by `student_number`; new students get `username = student_number` and initial `password = student_number` (bcrypt). Re-import updates profile/section fields but **preserves `password_hash`**. Post-commit best-effort `create` audit + credential emails for newly-created rows.
 - **200:** `{"total", "created", "updated", "skipped", "errors": [{"row", "student_number", "message"}]}`.
 - **400:** `{"error": "file is required"}` / missing required header / parse error. **500:** import service not configured.
+
+### Import & Rotate Credentials (multipart, Admin-only)
+Admin-only counterpart to **Import Student Roster** above: rotates the password of **every** row in the file, new and returning students alike, and emails each credential from a background worker. `POST /lecturer/students/import` itself is completely unchanged by this endpoint — its Admin/Lecturer permissions and its "existing student keeps their password" behaviour still apply there.
+- `POST /students/import-credentials`
+- **Content-Type:** `multipart/form-data`; same fields and columns as `/lecturer/students/import` (`file`, `.csv`/`.xlsx`), plus `confirm` — must be the literal string `ROTATE` on every request; the server re-checks it independently of the UI, the same rule as **Bulk Reset Passwords**' `RESET`.
+- **Behaviour:** every row gets a freshly generated password (never the student number), **bumping `token_version`** so any existing session for that student is evicted — do not run this while an exam is in progress. Rows with no email address are still imported; their `email_status` is `"no_email"` and the plaintext password is only ever recoverable from this response. One `app.password_events` row is written per rotated account (`create` source for new rows, `admin_reset` for returning ones) via `AuthService.LogBulkCredentials`, which deliberately bypasses the single-user reset path's admin-notice email so a large import does not fan out one `ADMIN_EMAIL` notice per row. Rows with an email address are queued to a background worker that sends them **serially, one at a time**; the saved `email_status` stays `"queued"` forever regardless of whether the send later succeeds — there is no durable delivery record and no retry.
+- **200:** `{"total", "created", "updated", "skipped", "errors": [{"row", "student_number", "message"}], "accounts": [{"row", "student_number", "student_id_ext", "email", "password", "outcome": "created"|"updated", "email_status": "queued"|"no_email"}], "job_id": "..."}`. `job_id` is `""` when no row in the file carried an email address.
+- **400:** `{"error": "confirmation_required"}` when `confirm` is absent or not exactly `ROTATE` / missing required header / parse error. **500:** import service not configured.
+- **Notable:** **no rate limiter on this endpoint** — the same accepted residual as `POST /users/bulk-reset-password`. Emailing plaintext passwords in bulk, and returning every one of them in the HTTP response body, is the deliberate point of this endpoint.
+
+### Import & Rotate Credentials — Job Status (Admin-only)
+- `GET /students/import-credentials/:job_id/status`
+- **200:** `{"job_id", "total", "sent", "failed", "done", "failures": ["<student_id_ext>", ...]}` — progress of the background email worker started by the import above.
+- **404:** `{"error": "job not found"}` — an unknown id, an id belonging to a **different** admin (deliberately indistinguishable, so the endpoint cannot be used to probe another admin's activity), or any id at all after a server restart. Progress tracking is **in-memory and single-process**, retained only 30 minutes after the job finishes; a `404` here is an ordinary expected outcome, not an error condition.
 
 ### List / Create Examinations
 - `GET /lecturer/exams` → **200:** array of `LecturerExaminationResponse`: `{"id", "title", "is_active", "created_by", "created_at", "activated_at?", "archived_at?", "scheduled_start_at?", "scheduled_end_at?", "effective_state", "introduction", "curriculum_schema", "question_count", "total_points", "uncaptured_count"}`. `uncaptured_count > 0` means the exam cannot yet be activated.

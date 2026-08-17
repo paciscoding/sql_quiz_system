@@ -277,9 +277,12 @@ mutation, `useFormValidation` with the same `.csv|.xlsx` file rule, `FieldError`
 `Spinner`, `handleApiError`, `useNotifications`, and `useConfirm` for the
 confirmation gate.
 
-Flow: pick file → press **Import & Email Passwords** → confirm dialog explains
-that every student in the file gets a new password and is logged out, and
-requires typing `ROTATE` → POST with `file` + `confirm`.
+Flow: pick file → type `ROTATE` into an inline confirmation input → press
+**Import & Email Passwords**, which stays disabled until the phrase matches
+exactly. This mirrors `BulkPasswordReset.vue`'s `RESET` gate;
+`services/confirm_service.ts`'s `ConfirmOptions` has no text-input field, so a
+modal could not carry the typed phrase. The server re-checks the phrase on every
+request regardless.
 
 Result table columns: **Login ID**, **Outcome** (created / updated), **Email**
 (`✉ queued` when sent to the worker, `—` when the row had no address),
