@@ -38,8 +38,13 @@ export function useEmailJobStatus(): {
 
   let timer: ReturnType<typeof setTimeout> | null = null
   let startedAt = 0
+  // Monotonic request identity. Every track()/dismiss() bumps this via stop(),
+  // which invalidates any poll() continuation still suspended on a stale
+  // epoch — it must not mutate job/state or reschedule itself once it wakes.
+  let epoch = 0
 
   function stop() {
+    epoch += 1
     if (timer !== null) {
       clearTimeout(timer)
       timer = null
@@ -47,6 +52,7 @@ export function useEmailJobStatus(): {
   }
 
   async function poll(jobId: string) {
+    const myEpoch = epoch
     const token = localStorage.getItem('sql_quiz_token')
     let response: Response
     try {
@@ -55,10 +61,13 @@ export function useEmailJobStatus(): {
         { headers: { Authorization: `Bearer ${token}` } },
       )
     } catch {
+      if (myEpoch !== epoch) return
       state.value = 'unavailable'
       stop()
       return
     }
+
+    if (myEpoch !== epoch) return
 
     if (!response.ok) {
       // A 404 here is an ordinary, expected outcome (job expired from the
@@ -69,7 +78,19 @@ export function useEmailJobStatus(): {
       return
     }
 
-    job.value = (await response.json()) as EmailJobStatus
+    let parsed: EmailJobStatus
+    try {
+      parsed = (await response.json()) as EmailJobStatus
+    } catch {
+      if (myEpoch !== epoch) return
+      state.value = 'unavailable'
+      stop()
+      return
+    }
+
+    if (myEpoch !== epoch) return
+
+    job.value = parsed
     if (job.value.done) {
       state.value = 'done'
       stop()
