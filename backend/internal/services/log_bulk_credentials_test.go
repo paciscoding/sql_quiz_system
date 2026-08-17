@@ -35,6 +35,12 @@ func (s *noticeSpy) SendChangeNotice(adminEmail string, ev models.PasswordEvent)
 // 200-row import into 200 admin emails.
 func TestLogBulkCredentials_PersistsEventsAndSendsNoEmail(t *testing.T) {
 	repo := integrationRepo(t)
+	// ADMIN_NOTIFY_EMAIL must be set BEFORE newIntegrationAuth (which calls
+	// NewAuthService): s.adminEmail is read once at construction, so setting
+	// it afterwards would leave the change-notice path permanently disarmed
+	// and the spy.notices == 0 assertion below would pass vacuously no
+	// matter what LogBulkCredentials does. Mirrors bulk_reset_http_test.go.
+	t.Setenv("ADMIN_NOTIFY_EMAIL", "admin-notify@example.com")
 	auth := newIntegrationAuth(t, repo)
 	spy := &noticeSpy{}
 	auth.SetEmailSender(spy)
@@ -63,11 +69,21 @@ func TestLogBulkCredentials_PersistsEventsAndSendsNoEmail(t *testing.T) {
 	if len(events) != 1 || events[0].Source != models.PasswordEventCreate {
 		t.Errorf("student 1 events = %+v, want exactly one %q event", events, models.PasswordEventCreate)
 	}
+	// GetPasswordEvents resolves changed_by to a username via a join, so
+	// comparing ChangedByUsername to the acting admin's username proves the
+	// row was written with ChangedBy = &actorID (the acting admin's id),
+	// not left nil or set to some other user.
+	if len(events) == 1 && events[0].ChangedByUsername != admin.Username {
+		t.Errorf("student 1 event ChangedByUsername = %q, want %q (the acting admin)", events[0].ChangedByUsername, admin.Username)
+	}
 	events, err = repo.GetPasswordEvents(ctx, int(s2.ID))
 	if err != nil {
 		t.Fatalf("GetPasswordEvents: %v", err)
 	}
 	if len(events) != 1 || events[0].Source != models.PasswordEventAdminReset {
 		t.Errorf("student 2 events = %+v, want exactly one %q event", events, models.PasswordEventAdminReset)
+	}
+	if len(events) == 1 && events[0].ChangedByUsername != admin.Username {
+		t.Errorf("student 2 event ChangedByUsername = %q, want %q (the acting admin)", events[0].ChangedByUsername, admin.Username)
 	}
 }
