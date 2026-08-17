@@ -764,6 +764,26 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 	c.JSON(http.StatusOK, report)
 }
 
+// ImportStudentsWithCredentialsPreflight handles
+// GET /api/v1/students/import-credentials/preflight.
+//
+// Owner-approved safeguard: rotating every student's password evicts every
+// affected student's session immediately, so running this while an exam is
+// in progress signs the whole class out mid-exam. The UI calls this BEFORE
+// the admin picks a file and commits to the action, so the warning lands
+// before anything is uploaded — not after every password has already been
+// rotated. This never blocks: it only reports the exam_active flag the UI
+// uses to demand a second, explicit confirmation. An admin must keep the
+// ability to act in an emergency.
+func (ctrl *LecturerController) ImportStudentsWithCredentialsPreflight(c *gin.Context) {
+	active, err := ctrl.repo.IsAnyExamActive(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exam_active": active})
+}
+
 // ImportStudentsWithCredentials handles POST /api/v1/students/import-credentials.
 //
 // Admin-only counterpart to ImportStudents: it rotates the password of EVERY
@@ -794,11 +814,30 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 		return
 	}
 
+	// Owner-approved safeguard: warn, but never block. The UI already asked
+	// the admin to confirm a second time when its own preflight call reported
+	// an exam active; this is the detective control for when that UI check is
+	// bypassed (a direct API call, a stale page). Checked at the moment the
+	// import actually runs -- not reused from the preflight call, which may be
+	// stale or may never have happened -- and recorded on the report itself
+	// (like JobID, set by the controller rather than the service) so the
+	// audit trail reflects ground truth regardless of what the UI did.
+	examActive, err := ctrl.repo.IsAnyExamActive(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if examActive {
+		log.Printf("import-credentials: WARNING proceeding while an exam is active -- admin=%s (id=%d) rows=%d; every affected student will be signed out immediately",
+			admin.Username, admin.ID, len(rows))
+	}
+
 	report, err := ctrl.importService.ImportRotating(c.Request.Context(), int(admin.ID), rows)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	report.ExamActive = examActive
 
 	// Tell the truth about delivery: ImportRotating marks a row "queued"
 	// purely based on whether it has an email address, with no way to know

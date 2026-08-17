@@ -128,6 +128,7 @@ func buildImportCredentialsRouter(auth *services.AuthService, userCtrl *UserCont
 	{
 		staff.POST("/students/import-credentials", RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportStudentsWithCredentials)
 		staff.GET("/students/import-credentials/:job_id/status", RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportCredentialsJobStatus)
+		staff.GET("/students/import-credentials/preflight", RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportStudentsWithCredentialsPreflight)
 	}
 	return r
 }

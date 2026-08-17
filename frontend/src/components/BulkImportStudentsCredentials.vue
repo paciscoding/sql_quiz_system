@@ -263,9 +263,51 @@ const { inFlight: importLoading, run: runImport } = useSingleFlight(async () => 
   }
 })
 
-// The public entry point bound to the submit button. Validation and the
-// discard-confirmation dialog run OUTSIDE the useSingleFlight guard on
-// purpose (see runImport above) — only the network round trip itself sets
+// Owner-approved safeguard: warn, but let the admin override (never a hard
+// block). Called from submitImport BEFORE runImport's actual upload, so the
+// warning lands before the admin commits to the action rather than after
+// every password has already been rotated. Returns true when the import
+// should proceed.
+//
+//   - exam_active: true  -> a SECOND explicit confirmation naming the
+//     consequence plainly (an exam is in progress; every student in this
+//     file will be signed out immediately, including anyone sitting it).
+//   - exam_active: false -> proceeds silently, exactly as before this
+//     safeguard existed.
+//   - the preflight request itself fails -> fails CLOSED: neither silently
+//     proceeds as though no exam were active, nor blocks the admin outright.
+//     Warns that exam status could not be checked and asks for the same
+//     explicit confirmation, so an admin can still act in an emergency.
+async function checkExamActiveAndConfirm(): Promise<boolean> {
+  const token = localStorage.getItem('sql_quiz_token')
+  try {
+    const response = await fetch('/api/v1/students/import-credentials/preflight', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!response.ok) throw new Error('preflight check failed')
+    const data = await response.json()
+
+    if (data.exam_active !== true) return true
+
+    return await confirm({
+      title: 'An exam is currently in progress',
+      body: 'Rotating passwords now will sign every student in this file out immediately — including anyone currently sitting the exam. This cannot be undone. Proceed anyway?',
+      confirmLabel: 'Rotate anyway',
+      danger: true,
+    })
+  } catch {
+    return await confirm({
+      title: 'Exam status could not be checked',
+      body: 'We could not confirm whether an exam is currently in progress. If one is, rotating passwords now will sign every student in this file out immediately — including anyone currently sitting it. Proceed anyway?',
+      confirmLabel: 'Proceed anyway',
+      danger: true,
+    })
+  }
+}
+
+// The public entry point bound to the submit button. Validation and both
+// confirmation dialogs run OUTSIDE the useSingleFlight guard on purpose (see
+// runImport above) — only the network round trip itself sets
 // importLoading/shows the spinner.
 async function submitImport() {
   if (!fileForm.validateAll()) return
@@ -280,6 +322,9 @@ async function submitImport() {
     })
     if (!ok) return
   }
+
+  const okToProceed = await checkExamActiveAndConfirm()
+  if (!okToProceed) return
 
   await runImport()
 }

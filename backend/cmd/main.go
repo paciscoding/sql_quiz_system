@@ -321,6 +321,10 @@ func main() {
 			// password for EVERY row, unlike /lecturer/students/import.
 			staff.POST("/students/import-credentials", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportStudentsWithCredentials)
 			staff.GET("/students/import-credentials/:job_id/status", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportCredentialsJobStatus)
+			// Preflight check the UI calls before uploading anything, so an
+			// exam-active warning lands before the admin commits to the
+			// action rather than after every password has already rotated.
+			staff.GET("/students/import-credentials/preflight", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportStudentsWithCredentialsPreflight)
 
 			// Submission-log export admin controls. exportCtrl is nil when SMTP is
 			// not configured; the routes stay registered but report 503 in that case.

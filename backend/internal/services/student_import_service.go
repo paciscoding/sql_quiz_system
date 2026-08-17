@@ -256,14 +256,19 @@ type RotatedAccount struct {
 
 // RotatingImportReport summarizes a rotating import. JobID identifies the
 // background email job and is filled in by the controller, not the service.
+// ExamActive is likewise filled in by the controller (see
+// ImportStudentsWithCredentials): it records whether any exam was active at
+// the moment this import ran, so the audit/report reflects it even when the
+// UI's own preflight check was bypassed.
 type RotatingImportReport struct {
-	Total    int              `json:"total"`
-	Created  int              `json:"created"`
-	Updated  int              `json:"updated"`
-	Skipped  int              `json:"skipped"`
-	Errors   []ImportRowError `json:"errors"`
-	Accounts []RotatedAccount `json:"accounts"`
-	JobID    string           `json:"job_id"`
+	Total      int              `json:"total"`
+	Created    int              `json:"created"`
+	Updated    int              `json:"updated"`
+	Skipped    int              `json:"skipped"`
+	Errors     []ImportRowError `json:"errors"`
+	Accounts   []RotatedAccount `json:"accounts"`
+	JobID      string           `json:"job_id"`
+	ExamActive bool             `json:"exam_active"`
 }
 
 // ImportRotating is the admin-only counterpart to Import: it rotates the

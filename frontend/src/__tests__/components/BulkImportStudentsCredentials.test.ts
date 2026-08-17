@@ -42,6 +42,30 @@ function jsonResponse(data: unknown, ok = true, status = 200) {
   return Promise.resolve({ ok, status, json: () => Promise.resolve(data) } as Response)
 }
 
+// Every submit now fires a GET .../preflight call BEFORE the actual upload
+// POST (the exam-active safeguard) -- see checkExamActiveAndConfirm in the
+// component. Most existing tests below don't care about that call at all: a
+// bare `vi.fn(() => jsonResponse(report))` answers it too, and since `report`
+// carries no exam_active field, `data.exam_active !== true` is true and the
+// component proceeds without an extra confirm. Tests that DO care which call
+// is which (finding the POST call, or supplying different bodies to
+// preflight vs import per invocation) use this URL-aware router instead of a
+// bare/sequential mock, so the preflight call can never be mistaken for the
+// import call or desync a sequential mockImplementationOnce chain.
+function routedFetch(opts: { preflight?: () => Promise<Response>; importResponse?: () => Promise<Response> }) {
+  return vi.fn((url: string) => {
+    if (typeof url === 'string' && url.includes('/preflight')) {
+      return (opts.preflight ?? (() => jsonResponse({ exam_active: false })))()
+    }
+    return (opts.importResponse ?? (() => jsonResponse(report)))()
+  })
+}
+
+/** Isolates the actual upload POST call(s) out of a fetch mock's call log. */
+function postCalls(fetchMock: ReturnType<typeof vi.fn>) {
+  return fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')
+}
+
 /** Attach a fake file so the component's validation passes without a real input. */
 async function selectFile(wrapper: ReturnType<typeof mount>, name = 'roster.csv') {
   const file = new File(['x'], name, { type: 'text/csv' })
@@ -93,12 +117,20 @@ describe('BulkImportStudentsCredentials', () => {
     await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
     await flushPromises()
 
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    // A preflight GET fires first (the exam-active safeguard), then the
+    // actual upload POST -- pick the POST call out explicitly rather than
+    // assuming index 0, since the preflight call now occupies that slot.
+    const [url, init] = postCalls(fetchMock)[0] as unknown as [string, RequestInit]
     expect(url).toBe('/api/v1/students/import-credentials')
     expect(init.method).toBe('POST')
     const body = init.body as FormData
     expect(body.get('confirm')).toBe('ROTATE')
     expect(body.get('file')).toBeInstanceOf(File)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/students/import-credentials/preflight',
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer t' }) }),
+    )
 
     expect(wrapper.emitted('job-started')).toEqual([['job-abc']])
   })
@@ -149,24 +181,35 @@ describe('BulkImportStudentsCredentials', () => {
     const wrapper = mount(BulkImportStudentsCredentials)
     await importSuccessfully(wrapper)
     expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    // Each submit fires a preflight GET before the upload POST (the
+    // exam-active safeguard), so a completed import is 2 calls, not 1.
+    expect(fetchMock).toHaveBeenCalledTimes(2)
 
-    // Second attempt: admin declines the "discard?" prompt.
+    // Second attempt: admin declines the "discard?" prompt. That gate runs
+    // BEFORE the preflight check, so declining must produce zero additional
+    // fetch calls of any kind (not even a preflight GET).
     mockConfirm.mockResolvedValueOnce(false)
     await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
     await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
     await flushPromises()
 
     expect(mockConfirm).toHaveBeenCalledTimes(1)
-    expect(fetchMock).toHaveBeenCalledTimes(1) // no second network call
+    expect(fetchMock).toHaveBeenCalledTimes(2) // no additional network call at all
     expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
   })
 
   it('lets a second import proceed once confirmed, replacing the displayed results', async () => {
     const secondReport = { ...report, accounts: [report.accounts[0]] }
-    const fetchMock = vi.fn()
-      .mockImplementationOnce(() => jsonResponse(report))
-      .mockImplementationOnce(() => jsonResponse(secondReport))
+    // Sequential per-import responses only apply to the upload POST calls;
+    // the preflight GET is answered separately by routedFetch so it can
+    // never consume a slot meant for an import response.
+    let importCallCount = 0
+    const fetchMock = routedFetch({
+      importResponse: () => {
+        importCallCount += 1
+        return jsonResponse(importCallCount === 1 ? report : secondReport)
+      },
+    })
     vi.stubGlobal('fetch', fetchMock)
 
     const wrapper = mount(BulkImportStudentsCredentials)
@@ -177,7 +220,7 @@ describe('BulkImportStudentsCredentials', () => {
     await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
     await flushPromises()
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(postCalls(fetchMock)).toHaveLength(2)
     expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(1)
   })
 
@@ -202,12 +245,18 @@ describe('BulkImportStudentsCredentials', () => {
 
     const button = wrapper.find('[data-testid="rotate-import-submit"]')
     expect(button.text()).not.toContain('Importing')
-    expect(fetchMock).toHaveBeenCalledTimes(1) // only the earlier setup import so far
+    // The discard-results confirm gate runs BEFORE the preflight check, and
+    // it is still awaiting a decision, so nothing past the earlier setup
+    // import's 2 calls (preflight + upload) has fired yet.
+    expect(fetchMock).toHaveBeenCalledTimes(2)
 
     resolveConfirm(true)
     await flushPromises()
 
-    expect(fetchMock).toHaveBeenCalledTimes(2) // the guarded import only starts once confirm resolves
+    // Once the discard confirm resolves, the guarded import proceeds through
+    // its own preflight check (exam_active is absent/false on `report`, so no
+    // second confirm) straight to the upload: 2 more calls.
+    expect(fetchMock).toHaveBeenCalledTimes(4)
   })
 
   it('prompts for confirmation before changing the selected file wipes displayed results; declining keeps them', async () => {
@@ -347,9 +396,16 @@ describe('BulkImportStudentsCredentials', () => {
     const removeSpy = vi.spyOn(window, 'removeEventListener')
 
     const emptyOnSecond = { ...report, job_id: '', accounts: [], errors: [{ row: 1, student_number: 'N1', message: 'bad row' }] }
-    const fetchMock = vi.fn()
-      .mockImplementationOnce(() => jsonResponse(report))
-      .mockImplementationOnce(() => jsonResponse(emptyOnSecond))
+    // Per-import sequential responses apply only to the upload POST; the
+    // preflight GET is routed separately so it can't consume a slot meant
+    // for one of the two import responses below.
+    let importCallCount = 0
+    const fetchMock = routedFetch({
+      importResponse: () => {
+        importCallCount += 1
+        return jsonResponse(importCallCount === 1 ? report : emptyOnSecond)
+      },
+    })
     vi.stubGlobal('fetch', fetchMock)
 
     const wrapper = mount(BulkImportStudentsCredentials)
@@ -436,11 +492,129 @@ describe('BulkImportStudentsCredentials', () => {
     await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
     await flushPromises()
 
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    // Held results from the first import still trigger the discard-confirm
+    // gate (resolved true by the default mock), and the submit's own
+    // preflight GET adds a second call -- 2 calls total, not 1.
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [, init] = postCalls(fetchMock)[0] as unknown as [string, RequestInit]
     const uploaded = (init.body as FormData).get('file') as File
     expect(uploaded.name).toBe(displayedName)
     expect(uploaded.name).not.toBe('file-b.csv')
     expect(uploaded.name).toBe('roster.csv')
+  })
+
+  // -------------------------------------------------------------------------
+  // Owner-approved safeguard: rotating passwords evicts every affected
+  // student's session immediately, so submitting while an exam is active
+  // must warn and demand a SECOND explicit confirmation naming the
+  // consequence plainly -- but never hard-block the admin. Each of these
+  // scenarios uses a fresh mount with no held results, so the ONLY confirm()
+  // call in play is the exam-active one (the pre-existing "discard held
+  // results?" gate never fires).
+  // -------------------------------------------------------------------------
+
+  describe('exam-active preflight safeguard', () => {
+    it('with exam_active: true, submitting shows a second confirm; declining issues no upload fetch', async () => {
+      const fetchMock = routedFetch({ preflight: () => jsonResponse({ exam_active: true }) })
+      vi.stubGlobal('fetch', fetchMock)
+      mockConfirm.mockResolvedValue(false) // decline the exam-active confirm
+
+      const wrapper = mount(BulkImportStudentsCredentials)
+      await selectFile(wrapper)
+      await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+      await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+      await flushPromises()
+
+      expect(mockConfirm).toHaveBeenCalledTimes(1)
+      const confirmArgs = mockConfirm.mock.calls[0][0]
+      expect(confirmArgs.danger).toBe(true)
+      const confirmText = `${confirmArgs.title} ${confirmArgs.body ?? ''}`
+      expect(confirmText).toMatch(/exam/i)
+      expect(confirmText).toMatch(/sign\w*\s+.*\bout\b/i)
+
+      // Declining must leave state untouched: no upload POST at all, and no
+      // job-started event -- only the preflight GET happened.
+      expect(postCalls(fetchMock)).toHaveLength(0)
+      expect(wrapper.emitted('job-started')).toBeUndefined()
+      expect(mockNotify).not.toHaveBeenCalled()
+    })
+
+    it('with exam_active: true, accepting the second confirm proceeds with the upload', async () => {
+      const fetchMock = routedFetch({ preflight: () => jsonResponse({ exam_active: true }) })
+      vi.stubGlobal('fetch', fetchMock)
+      mockConfirm.mockResolvedValue(true)
+
+      const wrapper = mount(BulkImportStudentsCredentials)
+      await selectFile(wrapper)
+      await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+      await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+      await flushPromises()
+
+      expect(mockConfirm).toHaveBeenCalledTimes(1)
+      expect(postCalls(fetchMock)).toHaveLength(1)
+      expect(wrapper.emitted('job-started')).toEqual([['job-abc']])
+    })
+
+    it('with exam_active: false, no second confirm prompt appears', async () => {
+      const fetchMock = routedFetch({ preflight: () => jsonResponse({ exam_active: false }) })
+      vi.stubGlobal('fetch', fetchMock)
+
+      const wrapper = mount(BulkImportStudentsCredentials)
+      await selectFile(wrapper)
+      await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+      await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+      await flushPromises()
+
+      expect(mockConfirm).not.toHaveBeenCalled()
+      expect(postCalls(fetchMock)).toHaveLength(1)
+      expect(wrapper.emitted('job-started')).toEqual([['job-abc']])
+    })
+
+    // Failing closed: an unreachable/erroring preflight must neither silently
+    // behave as if no exam were active (skip the confirm) nor hard-block the
+    // admin outright (refuse to proceed at all) -- it demands the same
+    // explicit confirmation the exam_active:true path does.
+    it('when the preflight request fails, the same confirmation is still required, and declining issues no upload fetch', async () => {
+      const fetchMock = vi.fn((url: string) => {
+        if (typeof url === 'string' && url.includes('/preflight')) {
+          return Promise.reject(new Error('network error'))
+        }
+        return jsonResponse(report)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      mockConfirm.mockResolvedValue(false)
+
+      const wrapper = mount(BulkImportStudentsCredentials)
+      await selectFile(wrapper)
+      await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+      await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+      await flushPromises()
+
+      expect(mockConfirm).toHaveBeenCalledTimes(1)
+      expect(mockConfirm.mock.calls[0][0].danger).toBe(true)
+      expect(postCalls(fetchMock)).toHaveLength(0)
+      expect(wrapper.emitted('job-started')).toBeUndefined()
+    })
+
+    it('when the preflight request fails, accepting the confirmation still proceeds with the upload', async () => {
+      const fetchMock = vi.fn((url: string) => {
+        if (typeof url === 'string' && url.includes('/preflight')) {
+          return Promise.reject(new Error('network error'))
+        }
+        return jsonResponse(report)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      mockConfirm.mockResolvedValue(true)
+
+      const wrapper = mount(BulkImportStudentsCredentials)
+      await selectFile(wrapper)
+      await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+      await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+      await flushPromises()
+
+      expect(mockConfirm).toHaveBeenCalledTimes(1)
+      expect(postCalls(fetchMock)).toHaveLength(1)
+      expect(wrapper.emitted('job-started')).toEqual([['job-abc']])
+    })
   })
 })
