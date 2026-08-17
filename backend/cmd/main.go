@@ -149,6 +149,8 @@ func main() {
 	lecturerCtrl := controllers.NewLecturerController(repo, hub)
 	lecturerCtrl.SetStudentImportService(studentImportService)
 	lecturerCtrl.SetAuthService(authService)
+	emailJobRegistry := services.NewEmailJobRegistry()
+	lecturerCtrl.SetEmailJobRegistry(emailJobRegistry)
 	userCtrl := controllers.NewUserController(authService, studentImportService)
 	practiceCtrl := controllers.NewPracticeController(repo, valService, authService)
 	examCategoryCtrl := controllers.NewExamCategoryController(repo)
@@ -315,6 +317,10 @@ func main() {
 			staff.POST("/users", controllers.RoleMiddleware(models.RoleAdmin), userCtrl.CreateAccount)
 			// Single-student create/upsert — shares the importer's parity path.
 			staff.POST("/students", controllers.RoleMiddleware(models.RoleAdmin, models.RoleLecturer), userCtrl.CreateStudent)
+			// Admin-only rotating credential import: rotates and emails a fresh
+			// password for EVERY row, unlike /lecturer/students/import.
+			staff.POST("/students/import-credentials", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportStudentsWithCredentials)
+			staff.GET("/students/import-credentials/:job_id/status", controllers.RoleMiddleware(models.RoleAdmin), lecturerCtrl.ImportCredentialsJobStatus)
 
 			// Submission-log export admin controls. exportCtrl is nil when SMTP is
 			// not configured; the routes stay registered but report 503 in that case.

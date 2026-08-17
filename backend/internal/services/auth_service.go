@@ -242,6 +242,13 @@ func (s *AuthService) LogBulkCredentials(ctx context.Context, actor models.User,
 	}
 }
 
+// SendCredentialEmail exposes the credential email to callers that own their
+// own delivery loop (the rotating importer's background worker), which needs to
+// record per-send success or failure rather than fire-and-forget.
+func (s *AuthService) SendCredentialEmail(toEmail, username, password string) error {
+	return s.email.SendCredential(toEmail, username, password)
+}
+
 // ForgotResetThrottle is the minimum interval between honoured forgot-password
 // requests for a single account. A request inside this window is silently
 // dropped (the generic success response is still returned).

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -64,6 +65,7 @@ type LecturerController struct {
 	importService *services.StudentImportService
 	authService   *services.AuthService
 	hub           *services.Hub
+	emailJobs     *services.EmailJobRegistry
 }
 
 func NewLecturerController(repo *repository.PostgresRepository, hub *services.Hub) *LecturerController {
@@ -84,6 +86,12 @@ func (ctrl *LecturerController) SetStudentImportService(importService *services.
 // password event and email the generated credential for each new student.
 func (ctrl *LecturerController) SetAuthService(authService *services.AuthService) {
 	ctrl.authService = authService
+}
+
+// SetEmailJobRegistry wires the in-memory registry that backs the rotating
+// importer's background credential-email worker and the admin progress poll.
+func (ctrl *LecturerController) SetEmailJobRegistry(reg *services.EmailJobRegistry) {
+	ctrl.emailJobs = reg
 }
 
 func (ctrl *LecturerController) ListExaminations(c *gin.Context) {
@@ -694,6 +702,34 @@ func (ctrl *LecturerController) ImportSchema(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Database schema imported successfully"})
 }
 
+// parseRosterFromRequest reads the "file" multipart field off the request and
+// parses it into roster rows, writing the same 400 responses/status codes
+// ImportStudents has always used on failure. Shared by ImportStudents and
+// ImportStudentsWithCredentials so the two endpoints' file-intake behaviour
+// (and its error strings) cannot drift apart. Returns ok=false after already
+// writing the response; callers must return immediately in that case.
+func (ctrl *LecturerController) parseRosterFromRequest(c *gin.Context) (rows []services.ParsedStudentRow, ok bool) {
+	header, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
+		return nil, false
+	}
+
+	file, err := header.Open()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return nil, false
+	}
+	defer file.Close()
+
+	rows, err = services.ParseRoster(header.Filename, file)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return nil, false
+	}
+	return rows, true
+}
+
 func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 	if ctrl.importService == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "student import service is not configured"})
@@ -703,22 +739,8 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 	userVal, _ := c.Get("user")
 	lecturer := userVal.(models.User)
 
-	header, err := c.FormFile("file")
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
-		return
-	}
-
-	file, err := header.Open()
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	defer file.Close()
-
-	rows, err := services.ParseRoster(header.Filename, file)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	rows, ok := ctrl.parseRosterFromRequest(c)
+	if !ok {
 		return
 	}
 
@@ -739,6 +761,107 @@ func (ctrl *LecturerController) ImportStudents(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, report)
+}
+
+// ImportStudentsWithCredentials handles POST /api/v1/students/import-credentials.
+//
+// Admin-only counterpart to ImportStudents: it rotates the password of EVERY
+// row in the roster — new and returning students alike — evicting their
+// sessions, and emails each new credential from a background worker whose
+// progress the admin can poll. Emailing plaintext passwords in bulk is the
+// deliberate point of this endpoint; the typed confirmation phrase and the
+// admin-only role gate are what stand in front of it.
+func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
+	if ctrl.importService == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "student import service is not configured"})
+		return
+	}
+
+	userVal, _ := c.Get("user")
+	admin := userVal.(models.User)
+
+	// The confirmation phrase is checked server-side on EVERY request; the
+	// server never trusts the UI's own confirm gate (same rule as
+	// BulkResetPassword's "RESET").
+	if c.PostForm("confirm") != "ROTATE" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation_required"})
+		return
+	}
+
+	rows, ok := ctrl.parseRosterFromRequest(c)
+	if !ok {
+		return
+	}
+
+	report, err := ctrl.importService.ImportRotating(c.Request.Context(), int(admin.ID), rows)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Post-commit audit trail: one password_events row per rotated account, and
+	// deliberately NO email from this path (see LogBulkCredentials).
+	if ctrl.authService != nil {
+		events := make([]services.BulkCredentialEvent, 0, len(report.Accounts))
+		for _, a := range report.Accounts {
+			source := models.PasswordEventAdminReset
+			if a.Outcome == "created" {
+				source = models.PasswordEventCreate
+			}
+			events = append(events, services.BulkCredentialEvent{
+				UserID: a.UserID, Source: source, Plaintext: a.Password,
+			})
+		}
+		ctrl.authService.LogBulkCredentials(c.Request.Context(), admin, events)
+	}
+
+	// Hand delivery to a single background goroutine. Serial by design: one SMTP
+	// connection at a time keeps the send under Gmail's rate limits instead of
+	// bursting into a rejection. The request context is already cancelled by the
+	// time this runs, hence context.Background().
+	toSend := make([]services.RotatedAccount, 0, len(report.Accounts))
+	for _, a := range report.Accounts {
+		if a.EmailStatus == "queued" {
+			toSend = append(toSend, a)
+		}
+	}
+	if len(toSend) > 0 && ctrl.authService != nil && ctrl.emailJobs != nil {
+		job := ctrl.emailJobs.Register(int(admin.ID), len(toSend))
+		report.JobID = job.ID
+		go func(jobID string, accounts []services.RotatedAccount) {
+			defer ctrl.emailJobs.Finish(jobID)
+			for _, a := range accounts {
+				if err := ctrl.authService.SendCredentialEmail(a.Email, a.StudentIDExt, a.Password); err != nil {
+					log.Printf("import-credentials: SendCredential failed for %q: %v", a.StudentIDExt, err)
+					ctrl.emailJobs.MarkFailed(jobID, a.StudentIDExt)
+					continue
+				}
+				ctrl.emailJobs.MarkSent(jobID)
+			}
+		}(job.ID, toSend)
+	}
+
+	c.JSON(http.StatusOK, report)
+}
+
+// ImportCredentialsJobStatus handles
+// GET /api/v1/students/import-credentials/:job_id/status.
+// A job belonging to another admin is reported as not-found, so the endpoint
+// cannot be used to probe other admins' activity.
+func (ctrl *LecturerController) ImportCredentialsJobStatus(c *gin.Context) {
+	if ctrl.emailJobs == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	userVal, _ := c.Get("user")
+	admin := userVal.(models.User)
+
+	job, ok := ctrl.emailJobs.Get(c.Param("job_id"), int(admin.ID))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	c.JSON(http.StatusOK, job)
 }
 
 // SetExamIntroduction handles PUT /api/v1/lecturer/exams/:id/introduction
