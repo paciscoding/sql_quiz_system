@@ -49,6 +49,12 @@ func NewEmailJobRegistry() *EmailJobRegistry {
 
 // Register mints a job with a 128-bit crypto/rand id — unguessable and never
 // sequential, since the id is the only handle on another admin's progress.
+//
+// The returned *EmailJob is a SNAPSHOT, not the entry the registry mutates:
+// it never aliases the map's struct. The background worker keeps updating
+// progress through MarkSent/MarkFailed/Finish under the registry's mutex, so
+// callers must re-read current progress via Get rather than reading fields
+// off the returned pointer directly.
 func (r *EmailJobRegistry) Register(ownerID, total int) *EmailJob {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
@@ -62,7 +68,10 @@ func (r *EmailJobRegistry) Register(ownerID, total int) *EmailJob {
 	defer r.mu.Unlock()
 	r.sweepLocked()
 	r.jobs[job.ID] = job
-	return job
+
+	snapshot := *job
+	snapshot.Failures = append([]string(nil), job.Failures...)
+	return &snapshot
 }
 
 // sweepLocked drops expired finished jobs, then enforces the cap by dropping
