@@ -81,9 +81,20 @@ const fileValidator = (file: File | null) => {
 }
 const fileForm = useFormValidation({ file: { rules: [fileValidator] } })
 
+// Invariant: what the file input DISPLAYS and what a submit would UPLOAD can
+// never disagree. The browser swaps the native input's shown filename and
+// .files to the newly picked file BEFORE this handler runs — that happens
+// synchronously as part of the OS file-pick and cannot be intercepted or
+// deferred. So if the admin declines the discard prompt below, the input is
+// already showing the new file while selectedFile.value (what submit
+// actually uploads) still points at the old one. Left alone, that's a silent
+// wrong-roster upload: the screen shows the new class, the request sends the
+// old one. We restore the input to reflect the file that is actually staged
+// so a decline is a true no-op from the admin's point of view.
 const handleFileChange = async (event: Event) => {
   const input = event.target as HTMLInputElement
   const nextFile = input.files?.[0] ?? null
+  const previouslyStaged = selectedFile.value
 
   if (hasHeldResults.value) {
     const ok = await confirm({
@@ -92,13 +103,47 @@ const handleFileChange = async (event: Event) => {
       confirmLabel: 'Discard',
       danger: true,
     })
-    if (!ok) return
+    if (!ok) {
+      restoreDisplayedFile(input, previouslyStaged)
+      return
+    }
   }
 
   selectedFile.value = nextFile
   fileForm.values.file = selectedFile.value
   topLevelError.value = ''
   result.value = null
+}
+
+// Rebuilds the input's FileList via DataTransfer so the previously staged
+// file is what's shown again — a real no-op for the admin, and the preferred
+// path. DataTransfer-based FileList construction is standard and supported
+// by evergreen browsers. If reassigning `.files` isn't possible in a given
+// host environment (DataTransfer missing, or the property isn't writable),
+// fall back to clearing the input instead of leaving it pointed at a file
+// that's no longer staged — and clear selectedFile/fileForm right along with
+// it, so displayed/staged/uploaded can never drift apart from one another.
+function restoreDisplayedFile(input: HTMLInputElement, file: File | null) {
+  let restored = false
+  if (typeof DataTransfer !== 'undefined') {
+    try {
+      const dt = new DataTransfer()
+      if (file) dt.items.add(file)
+      input.files = dt.files
+      restored = true
+    } catch {
+      // Assignment blocked in this environment — fall through to clearing.
+    }
+  }
+
+  if (restored) {
+    selectedFile.value = file
+    fileForm.values.file = file
+  } else {
+    input.value = ''
+    selectedFile.value = null
+    fileForm.values.file = null
+  }
 }
 
 async function copyPassword(text: string) {

@@ -284,4 +284,69 @@ describe('BulkImportStudentsCredentials', () => {
     wrapper.unmount()
     expect(removeSpy).toHaveBeenCalledWith('beforeunload', expect.any(Function))
   })
+
+  // -------------------------------------------------------------------------
+  // Regression: the browser swaps the native <input type="file">'s displayed
+  // filename and .files BEFORE the change handler ever runs, and that cannot
+  // be intercepted. Declining the discard prompt must not leave the input
+  // showing a new file while the component still uploads the old one.
+  // -------------------------------------------------------------------------
+
+  it('after declining a file swap, the input keeps showing the file that will actually be uploaded', async () => {
+    const fetchMock = vi.fn(() => jsonResponse(report))
+    vi.stubGlobal('fetch', fetchMock)
+
+    // This test deliberately does NOT use the shared selectFile()/importSuccessfully()
+    // helpers above: those simulate a file pick via a non-writable Object.defineProperty
+    // on `input.files`, which (unlike real browsers) permanently blocks any later native
+    // assignment to that same property. A real <input type="file"> keeps `.files` a live,
+    // re-assignable accessor (that's exactly what `input.files = dataTransfer.files`
+    // relies on), so this test drives file selection through DataTransfer end-to-end to
+    // stay faithful to that and to let the fix's own DataTransfer-based restore run for real.
+    const wrapper = mount(BulkImportStudentsCredentials)
+    const inputEl = wrapper.find('input[type="file"]').element as HTMLInputElement
+
+    const fileA = new File(['x'], 'roster.csv', { type: 'text/csv' })
+    const dtA = new DataTransfer()
+    dtA.items.add(fileA)
+    inputEl.files = dtA.files
+    await wrapper.find('input[type="file"]').trigger('change')
+    await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+    await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2) // results now held
+
+    // Admin picks a different file — the browser has ALREADY updated the
+    // input's displayed filename/.files to file-b.csv by the time `change`
+    // fires — then declines the discard prompt.
+    mockConfirm.mockResolvedValueOnce(false)
+    const fileB = new File(['y'], 'file-b.csv', { type: 'text/csv' })
+    const dtB = new DataTransfer()
+    dtB.items.add(fileB)
+    inputEl.files = dtB.files
+    await wrapper.find('input[type="file"]').trigger('change')
+
+    expect(mockConfirm).toHaveBeenCalledTimes(1)
+    // Results must still be intact (decline = no destruction).
+    expect(wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')).toHaveLength(2)
+
+    // The input's displayed file must agree with what a submit would upload —
+    // it must NOT still be showing file-b.csv while roster.csv gets uploaded.
+    const displayedName = (wrapper.find('input[type="file"]').element as HTMLInputElement).files?.[0]?.name
+    expect(displayedName).not.toBe('file-b.csv')
+
+    // A subsequent submit must upload exactly the file the input indicates —
+    // proven against the actual FormData sent to fetch, not just internal state.
+    fetchMock.mockClear()
+    await wrapper.find('[data-testid="rotate-confirm-input"]').setValue('ROTATE')
+    await wrapper.find('[data-testid="rotate-import-submit"]').trigger('click')
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    const uploaded = (init.body as FormData).get('file') as File
+    expect(uploaded.name).toBe(displayedName)
+    expect(uploaded.name).not.toBe('file-b.csv')
+    expect(uploaded.name).toBe('roster.csv')
+  })
 })
