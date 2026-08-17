@@ -805,7 +805,7 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 		events := make([]services.BulkCredentialEvent, 0, len(report.Accounts))
 		for _, a := range report.Accounts {
 			source := models.PasswordEventAdminReset
-			if a.Outcome == "created" {
+			if a.Outcome == services.OutcomeCreated {
 				source = models.PasswordEventCreate
 			}
 			events = append(events, services.BulkCredentialEvent{
@@ -815,21 +815,38 @@ func (ctrl *LecturerController) ImportStudentsWithCredentials(c *gin.Context) {
 		ctrl.authService.LogBulkCredentials(c.Request.Context(), admin, events)
 	}
 
-	// Hand delivery to a single background goroutine. Serial by design: one SMTP
-	// connection at a time keeps the send under Gmail's rate limits instead of
-	// bursting into a rejection. The request context is already cancelled by the
-	// time this runs, hence context.Background().
+	// Hand delivery to a single background goroutine per import. Serial within
+	// that goroutine by design: one SMTP connection at a time per import keeps
+	// the send under Gmail's rate limits instead of bursting into a rejection
+	// (two overlapping imports still run two concurrent send loops). SendCredentialEmail
+	// takes no context, so the request's own (already-cancelled-by-the-time-this-runs)
+	// context cannot leak into the send.
 	toSend := make([]services.RotatedAccount, 0, len(report.Accounts))
 	for _, a := range report.Accounts {
-		if a.EmailStatus == "queued" {
+		if a.EmailStatus == services.EmailStatusQueued {
 			toSend = append(toSend, a)
 		}
 	}
 	if len(toSend) > 0 && ctrl.authService != nil && ctrl.emailJobs != nil {
 		job := ctrl.emailJobs.Register(int(admin.ID), len(toSend))
 		report.JobID = job.ID
+		if job.ID == "" {
+			// crypto/rand failed inside Register, which degrades to an unregistered
+			// job rather than a predictable id (see EmailJobRegistry.Register). That
+			// leaves report.JobID == "", the same value used when no row had an
+			// email address -- so make the actual cause explicit here instead of
+			// silently reusing that signal. The emails still go out below; they are
+			// just untracked, since every MarkSent/MarkFailed/Finish call against an
+			// unregistered id is a no-op.
+			log.Printf("import-credentials: email job registration failed (crypto/rand); sending %d email(s) without progress tracking", len(toSend))
+		}
 		go func(jobID string, accounts []services.RotatedAccount) {
 			defer ctrl.emailJobs.Finish(jobID)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("import-credentials: email worker panic: %v", r)
+				}
+			}()
 			for _, a := range accounts {
 				if err := ctrl.authService.SendCredentialEmail(a.Email, a.StudentIDExt, a.Password); err != nil {
 					log.Printf("import-credentials: SendCredential failed for %q: %v", a.StudentIDExt, err)

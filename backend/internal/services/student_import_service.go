@@ -214,6 +214,18 @@ func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows [
 	return report, err
 }
 
+// Outcome and EmailStatus values for RotatedAccount. Callers outside this
+// package (the controller, for password-event routing and email selection)
+// must use these constants rather than re-typing the literals: an
+// uncoordinated rename here would otherwise misroute password events or skip
+// emails with no compile error to catch it.
+const (
+	OutcomeCreated     = "created"
+	OutcomeUpdated     = "updated"
+	EmailStatusQueued  = "queued"
+	EmailStatusNoEmail = "no_email"
+)
+
 // RotatedAccount is one account touched by the rotating importer. Unlike
 // CreatedStudent it is emitted for updates too, because on that path the
 // student's password is replaced and the plaintext is meaningful for every row.
@@ -224,8 +236,8 @@ type RotatedAccount struct {
 	StudentIDExt  string `json:"student_id_ext"`
 	Email         string `json:"email"`
 	Password      string `json:"password"`
-	Outcome       string `json:"outcome"`      // "created" | "updated"
-	EmailStatus   string `json:"email_status"` // "queued" | "no_email"
+	Outcome       string `json:"outcome"`      // OutcomeCreated | OutcomeUpdated
+	EmailStatus   string `json:"email_status"` // EmailStatusQueued | EmailStatusNoEmail
 }
 
 // RotatingImportReport summarizes a rotating import. JobID identifies the
@@ -312,9 +324,9 @@ func (s *StudentImportService) ImportRotating(ctx context.Context, creatorID int
 			}
 
 			switch outcome {
-			case "created":
+			case OutcomeCreated:
 				report.Created++
-			case "updated":
+			case OutcomeUpdated:
 				report.Updated++
 			default:
 				report.Skipped++
@@ -323,9 +335,9 @@ func (s *StudentImportService) ImportRotating(ctx context.Context, creatorID int
 
 			// Decided synchronously, before any send is attempted, so the value is
 			// accurate even though delivery is asynchronous.
-			emailStatus := "no_email"
+			emailStatus := EmailStatusNoEmail
 			if row.Email != "" {
-				emailStatus = "queued"
+				emailStatus = EmailStatusQueued
 			}
 			report.Accounts = append(report.Accounts, RotatedAccount{
 				UserID:        uid,
