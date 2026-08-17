@@ -513,6 +513,70 @@ describe('BulkImportStudentsCredentials', () => {
   // results?" gate never fires).
   // -------------------------------------------------------------------------
 
+  // -------------------------------------------------------------------------
+  // MINOR 2: exam_active on the IMPORT response itself (not the preflight
+  // check) covers the window between preflight and the import actually
+  // running -- an exam that goes active in that gap is exactly the case
+  // preflight cannot catch. The admin must be able to see it happened.
+  // -------------------------------------------------------------------------
+
+  it('renders an exam-active warning in the results when the import response carries exam_active: true', async () => {
+    const examActiveReport = { ...report, exam_active: true }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(examActiveReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    const warning = wrapper.find('[data-testid="exam-active-warning"]')
+    expect(warning.exists()).toBe(true)
+    expect(warning.text()).toMatch(/exam/i)
+    expect(warning.text()).toMatch(/signed out/i)
+  })
+
+  it('renders no exam-active warning when exam_active is false', async () => {
+    const examInactiveReport = { ...report, exam_active: false }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(examInactiveReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    expect(wrapper.find('[data-testid="exam-active-warning"]').exists()).toBe(false)
+  })
+
+  it('renders no exam-active warning when exam_active is absent from the response', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(report)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    expect(wrapper.find('[data-testid="exam-active-warning"]').exists()).toBe(false)
+  })
+
+  // -------------------------------------------------------------------------
+  // MINOR 3: an unrecognised email_status must not render as "no email" --
+  // that positively (and possibly falsely) asserts the row has no address on
+  // file, the same class of dishonest-label bug as the "200/200 emailed with
+  // SMTP unconfigured" Critical this feature already had to fix.
+  // -------------------------------------------------------------------------
+
+  it('does not render an unrecognised email_status as "no email"', async () => {
+    const unknownStatusReport = {
+      ...report,
+      accounts: [
+        { row: 1, student_number: 'N1', student_id_ext: 's1', email: 'a@example.com', password: 'pw1', outcome: 'created', email_status: 'some_future_status' },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(unknownStatusReport)))
+
+    const wrapper = mount(BulkImportStudentsCredentials)
+    await importSuccessfully(wrapper)
+
+    const rows = wrapper.findAll('[data-testid="rotated-accounts-table"] tbody tr')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].text()).not.toContain('no email')
+    expect(rows[0].text()).toContain('some_future_status')
+  })
+
   describe('exam-active preflight safeguard', () => {
     it('with exam_active: true, submitting shows a second confirm; declining issues no upload fetch', async () => {
       const fetchMock = routedFetch({ preflight: () => jsonResponse({ exam_active: true }) })

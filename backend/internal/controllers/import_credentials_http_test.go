@@ -183,6 +183,30 @@ func (panicEmailSender) SendChangeNotice(adminEmail string, ev models.PasswordEv
 	return nil
 }
 
+// panicOnUsernameEmailSender panics only when SendCredential is called for a
+// specific username (the row's student_id_ext), succeeding for every other
+// row. It exists to discriminate per-iteration recovery from loop-level
+// recovery in sendOne: TestImportCredentials_EmailWorkerPanicRecovered drives
+// testRosterCSV, which has exactly ONE emailed row, so with a single send
+// per-iteration and loop-level recover() are observationally identical (both
+// leave the process alive and the job Done). This sender is paired with a
+// THREE-row roster and panics on the middle row, so only per-row recovery
+// lets the third row's send still happen.
+type panicOnUsernameEmailSender struct {
+	panicUsername string
+}
+
+func (s panicOnUsernameEmailSender) SendCredential(toEmail, username, password string) error {
+	if username == s.panicUsername {
+		panic("simulated SMTP client panic for " + username)
+	}
+	return nil
+}
+func (panicOnUsernameEmailSender) SendResetCode(toEmail, username, code string) error { return nil }
+func (panicOnUsernameEmailSender) SendChangeNotice(adminEmail string, ev models.PasswordEvent) error {
+	return nil
+}
+
 // failingEmailSender always returns an error (never panics) from
 // SendCredential, so the worker's per-row failure bookkeeping (MarkFailed) can
 // be exercised deterministically.
@@ -701,4 +725,61 @@ func TestImportCredentials_EmailWorkerPanicRecovered(t *testing.T) {
 	// Reaching this line means the test binary is still executing after the
 	// panicking SendCredential call ran -- the real proof recover() caught it.
 	t.Log("process survived the worker's panic: recover() in the email worker goroutine caught it, and Finish still ran")
+}
+
+// This is the discriminating test for the per-iteration recover() in
+// sendOne. TestImportCredentials_EmailWorkerPanicRecovered above only proves
+// the process survives a panic; with its single-row roster, a loop-level
+// recover() (which aborts the rest of the batch on the first panic, with no
+// MarkFailed call for the panicking row -- see sendOne's docstring) would
+// pass it too, because there is nothing left in the loop to abandon.
+//
+// Here the roster has THREE emailed rows and the sender panics only on the
+// second (cred-p2). Under per-iteration recovery: row 1 sends, row 2 panics
+// and is recorded failed, row 3 still sends -- Sent=2, Failed=1,
+// Failures=["cred-p2"]. Under loop-level recovery: row 1 sends, row 2's
+// panic unwinds the whole loop with no MarkFailed call, row 3 is never
+// attempted -- Sent=1, Failed=0, Failures=[]. The two are distinguishable,
+// which is the point.
+func TestImportCredentials_EmailWorkerPanicOnMiddleRow_PerRowRecoveryOnly(t *testing.T) {
+	env := buildImportCredentialsEnvWithSender(t, panicOnUsernameEmailSender{panicUsername: "cred-p2"})
+	csv := "Student Number,Student_id,SecLec,SecLab,First Name,Last Name,Email\n" +
+		"N301,cred-p1,LEC1,LAB1,Ann,One,ann-p1@example.com\n" +
+		"N302,cred-p2,LEC1,LAB1,Bob,Two,bob-p2@example.com\n" +
+		"N303,cred-p3,LEC1,LAB1,Cid,Three,cid-p3@example.com\n"
+	body, contentType := multipartRoster(t, csv, "ROTATE")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/students/import-credentials", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+env.adminToken)
+	rec := httptest.NewRecorder()
+	env.engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var report struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode report: %v (body: %s)", err, rec.Body.String())
+	}
+	if report.JobID == "" {
+		t.Fatal("job_id is empty: the roster has three rows with email addresses")
+	}
+	env.waitForJobDone(t, report.JobID)
+
+	job, ok := env.registry.Get(report.JobID, env.adminID)
+	if !ok {
+		t.Fatalf("job %q not found after completion", report.JobID)
+	}
+	if job.Sent != 2 {
+		t.Errorf("job.Sent = %d, want 2 (rows 1 and 3 must still send after row 2 panics)", job.Sent)
+	}
+	if job.Failed != 1 {
+		t.Errorf("job.Failed = %d, want 1", job.Failed)
+	}
+	if len(job.Failures) != 1 || job.Failures[0] != "cred-p2" {
+		t.Errorf("job.Failures = %+v, want [\"cred-p2\"]", job.Failures)
+	}
 }

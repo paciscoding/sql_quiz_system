@@ -42,6 +42,14 @@ interface RotatingImportReport {
   errors?: ImportError[] | null
   accounts?: RotatedAccount[] | null
   job_id: string
+  // Stamped by the controller from a fresh IsAnyExamActive check taken at
+  // import time (not the earlier preflight check) -- it exists precisely for
+  // the window between preflight and the import itself, when an exam can go
+  // from inactive to active after the admin already clicked through. The
+  // preflight-based confirm above cannot catch that window; this field is
+  // the only place the admin can still learn it happened. Optional because
+  // it is only meaningful once an import has actually run.
+  exam_active?: boolean
 }
 
 const emit = defineEmits<{ (e: 'job-started', jobId: string): void }>()
@@ -202,8 +210,14 @@ function emailStatusLabel(a: RotatedAccount): string {
       return `✉ queued — ${a.email}`
     case 'not_configured':
       return 'not sent — email is not configured on this server'
-    default:
+    case 'no_email':
       return 'no email'
+    default:
+      // An unrecognised status (a future fourth value this component hasn't
+      // been taught about yet) must NOT fall through to "no email" -- that
+      // positively asserts the row has no address on file, which may well be
+      // false. Show the raw status instead of guessing why.
+      return `unknown status: ${a.email_status}`
   }
 }
 
@@ -401,6 +415,11 @@ onUnmounted(() => {
     </div>
 
     <div v-if="result !== null" class="results-section">
+      <div v-if="result.exam_active" class="error-box" data-testid="exam-active-warning">
+        An exam was in progress when this import ran. The students in this file have been
+        signed out immediately, including anyone who was actively taking that exam.
+      </div>
+
       <div class="summary-grid">
         <div class="summary-cell"><div class="summary-value">{{ result.total }}</div><div class="summary-label">Total</div></div>
         <div class="summary-cell"><div class="summary-value">{{ result.created }}</div><div class="summary-label">Created</div></div>
