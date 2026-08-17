@@ -14,6 +14,7 @@ import (
 // *repository.PostgresRepository satisfies this interface.
 type ImportRepo interface {
 	UpsertStudentByNumber(ctx context.Context, tx pgx.Tx, in models.StudentImportRow, creatorID int) (string, int, error)
+	UpsertStudentRotating(ctx context.Context, tx pgx.Tx, in models.StudentImportRow, creatorID int) (string, int, error)
 	WithTransaction(ctx context.Context, fn func(pgx.Tx) error) error
 }
 
@@ -206,6 +207,136 @@ func (s *StudentImportService) Import(ctx context.Context, creatorID int, rows [
 				// Should not happen based on ARCH-005 spec
 				report.Skipped++
 			}
+		}
+		return nil
+	})
+
+	return report, err
+}
+
+// RotatedAccount is one account touched by the rotating importer. Unlike
+// CreatedStudent it is emitted for updates too, because on that path the
+// student's password is replaced and the plaintext is meaningful for every row.
+type RotatedAccount struct {
+	UserID        int    `json:"-"`
+	Row           int    `json:"row"`
+	StudentNumber string `json:"student_number"`
+	StudentIDExt  string `json:"student_id_ext"`
+	Email         string `json:"email"`
+	Password      string `json:"password"`
+	Outcome       string `json:"outcome"`      // "created" | "updated"
+	EmailStatus   string `json:"email_status"` // "queued" | "no_email"
+}
+
+// RotatingImportReport summarizes a rotating import. JobID identifies the
+// background email job and is filled in by the controller, not the service.
+type RotatingImportReport struct {
+	Total    int              `json:"total"`
+	Created  int              `json:"created"`
+	Updated  int              `json:"updated"`
+	Skipped  int              `json:"skipped"`
+	Errors   []ImportRowError `json:"errors"`
+	Accounts []RotatedAccount `json:"accounts"`
+	JobID    string           `json:"job_id"`
+}
+
+// ImportRotating is the admin-only counterpart to Import: it rotates the
+// credential of EVERY row in the roster — new and returning students alike —
+// and reports the plaintext for each so it can be emailed and shown once. The
+// transaction/savepoint structure is deliberately identical to Import's, so a
+// single bad row is isolated instead of failing the file.
+func (s *StudentImportService) ImportRotating(ctx context.Context, creatorID int, rows []ParsedStudentRow) (RotatingImportReport, error) {
+	report := RotatingImportReport{Total: len(rows)}
+
+	err := s.repo.WithTransaction(ctx, func(tx pgx.Tx) error {
+		for _, row := range rows {
+			if row.StudentNumber == "" {
+				report.Skipped++
+				report.Errors = append(report.Errors, ImportRowError{
+					Row:           row.RowNumber,
+					StudentNumber: "",
+					Message:       "Student number is required",
+				})
+				continue
+			}
+			if row.StudentIDExt == "" {
+				report.Skipped++
+				report.Errors = append(report.Errors, ImportRowError{
+					Row:           row.RowNumber,
+					StudentNumber: row.StudentNumber,
+					Message:       "Student ID is required",
+				})
+				continue
+			}
+
+			savepointName := fmt.Sprintf("row_%d", row.RowNumber)
+			if _, err := tx.Exec(ctx, "SAVEPOINT "+savepointName); err != nil {
+				return fmt.Errorf("failed to establish savepoint: %w", err)
+			}
+
+			password := GeneratePassword()
+			hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if err != nil {
+				tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepointName)
+				report.Skipped++
+				report.Errors = append(report.Errors, ImportRowError{
+					Row: row.RowNumber, StudentNumber: row.StudentNumber, Message: err.Error(),
+				})
+				continue
+			}
+
+			outcome, uid, err := s.repo.UpsertStudentRotating(ctx, tx, models.StudentImportRow{
+				StudentNumber: row.StudentNumber,
+				StudentIDExt:  row.StudentIDExt,
+				SecLec:        row.SecLec,
+				SecLab:        row.SecLab,
+				FirstName:     row.FirstName,
+				LastName:      row.LastName,
+				Email:         row.Email,
+				PasswordHash:  string(hash),
+			}, creatorID)
+			if err != nil {
+				tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepointName)
+				if repository.IsEmailConflict(err) {
+					err = ErrEmailInUse
+				}
+				report.Skipped++
+				report.Errors = append(report.Errors, ImportRowError{
+					Row: row.RowNumber, StudentNumber: row.StudentNumber, Message: err.Error(),
+				})
+				continue
+			}
+
+			if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT "+savepointName); err != nil {
+				return fmt.Errorf("failed to release savepoint: %w", err)
+			}
+
+			switch outcome {
+			case "created":
+				report.Created++
+			case "updated":
+				report.Updated++
+			default:
+				report.Skipped++
+				continue
+			}
+
+			// Decided synchronously, before any send is attempted, so the value is
+			// accurate even though delivery is asynchronous.
+			emailStatus := "no_email"
+			if row.Email != "" {
+				emailStatus = "queued"
+			}
+			report.Accounts = append(report.Accounts, RotatedAccount{
+				UserID:        uid,
+				Row:           row.RowNumber,
+				StudentNumber: row.StudentNumber,
+				StudentIDExt:  row.StudentIDExt,
+				Email:         row.Email,
+				Password:      password,
+				Outcome:       outcome,
+				EmailStatus:   emailStatus,
+			})
 		}
 		return nil
 	})

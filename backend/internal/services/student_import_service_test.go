@@ -32,6 +32,10 @@ func (f *fakeImportRepo) UpsertStudentByNumber(ctx context.Context, tx pgx.Tx, i
 	return outcome, idx + 1, err
 }
 
+func (f *fakeImportRepo) UpsertStudentRotating(ctx context.Context, tx pgx.Tx, in models.StudentImportRow, creatorID int) (string, int, error) {
+	return f.UpsertStudentByNumber(ctx, tx, in, creatorID)
+}
+
 func (f *fakeImportRepo) WithTransaction(ctx context.Context, fn func(pgx.Tx) error) error {
 	return fn(&fakeTx{})
 }
