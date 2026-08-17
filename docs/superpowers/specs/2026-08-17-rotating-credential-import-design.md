@@ -1,7 +1,7 @@
 # Rotating credential import — design
 
 Date: 2026-08-17
-Status: approved (design), not implemented
+Status: implemented (branch `feat/rotating-credential-import`)
 
 ## Problem
 

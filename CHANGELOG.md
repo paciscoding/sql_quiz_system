@@ -22,14 +22,32 @@
   rotated account (`PasswordEventCreate` for new rows, `PasswordEventAdminReset`
   for updated ones) but deliberately does not go through the existing
   `logPasswordEvent` helper, which emails `ADMIN_NOTIFY_EMAIL` once per event —
-  that would turn a 200-row import into 200 admin emails.
+  that would turn a 200-row import into 200 admin emails. **This requires
+  `PASSWORD_LOG_KEY` to be configured**; when it isn't, `LogBulkCredentials`
+  writes nothing and returns `0` (the number of events actually written), so
+  the controller can log a warning when the audit trail comes up short instead
+  of assuming every row landed. The controller also hands this call a
+  `context.WithoutCancel`-wrapped context, so the write survives the admin's
+  browser disconnecting mid-request (a 500-row roster's bcrypt hashing alone
+  can run ~40s).
+- **Delivery is only ever claimed when it's real.** `email_status` is
+  `"queued"` only when `AuthService.EmailConfigured()` is true (a real sender
+  was wired in via `SetEmailSender`, not the default `NoopEmailSender`); rows
+  with an address but no configured sender get the new `"not_configured"`
+  status instead, and no job is registered or worker started for them. Without
+  this, every row would read `"queued"` — and the progress bubble would
+  eventually report "sent" — even when `EMAIL_SENDER_ADDRESS` was never set
+  and nothing was ever sent.
 - **Background email delivery with pollable progress.** Rows with an email
   address are queued to a background worker that sends them serially, one at a
   time. A new in-memory `EmailJobRegistry` tracks per-job sent/failed counts,
   exposed at `GET /api/v1/students/import-credentials/:job_id/status`
   (ADMIN only). A job belonging to a different admin returns `404`,
   deliberately indistinguishable from an unknown id. `job_id` is `""` when no
-  row in the file carried an email address.
+  row in the file carried an email address, when delivery is not configured
+  (see "Delivery is only ever claimed when it's real" above), or when
+  `crypto/rand` failed inside `EmailJobRegistry.Register` (the emails still
+  send in that last case, just untracked). See API_SPEC.md for the full list.
 - **Frontend.** A second admin card, "Import & Email Passwords"
   (`BulkImportStudentsCredentials.vue`), mounted below the existing "Bulk
   Roster Import" card in `AdminView.vue`. Gated on typing `ROTATE` into an
@@ -53,11 +71,18 @@
   the deliberate point of the endpoint, not an oversight; the admin-only role
   gate and the typed `ROTATE` confirmation are what stand in front of it.
 - **Email progress is in-memory and single-process:** it is lost on a backend
-  restart and retained only 30 minutes after a job finishes, so a `404` from
-  the status endpoint is an ordinary expected outcome, not an error. There is
-  no durable delivery record and no retry of a failed send — the saved
-  per-row `email_status` stays `"queued"` forever regardless of whether the
-  send later actually succeeded or failed.
+  restart, so a `404` from the status endpoint is an ordinary expected
+  outcome, not an error. A finished job is eligible for eviction 30 minutes
+  after it finishes, but that eviction (`sweepLocked`) only actually runs the
+  next time `Register` is called by a subsequent import on the same process —
+  it is not a background timer — so a finished job can remain readable well
+  past 30 minutes if no further import runs. There is no durable delivery
+  record and no retry of a failed send — the saved per-row `email_status`
+  stays `"queued"` forever regardless of whether the send later actually
+  succeeded or failed.
+- **`failures` names at most 50 login ids** (`maxTrackedFailures`) even though
+  the `failed` counter keeps counting past that; a run with more than 50
+  failures reports an accurate total with an incomplete name list.
 
 ## [2026-08-10] DML search_path drops the public fallback (branch `fix/dml-public-fallback`)
 
