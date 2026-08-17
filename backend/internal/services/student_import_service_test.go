@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +32,10 @@ func (f *fakeImportRepo) UpsertStudentByNumber(ctx context.Context, tx pgx.Tx, i
 	}
 
 	return outcome, idx + 1, err
+}
+
+func (f *fakeImportRepo) UpsertStudentRotating(ctx context.Context, tx pgx.Tx, in models.StudentImportRow, creatorID int) (string, int, error) {
+	return f.UpsertStudentByNumber(ctx, tx, in, creatorID)
 }
 
 func (f *fakeImportRepo) WithTransaction(ctx context.Context, fn func(pgx.Tx) error) error {
@@ -166,6 +172,68 @@ func TestStudentImportService(t *testing.T) {
 		}
 		if report.Errors[0].Message != "Student ID is required" {
 			t.Fatalf("unexpected error message: %q", report.Errors[0].Message)
+		}
+	})
+
+	// CRITICAL 1: a completely clean import (every row succeeds, so Errors and
+	// CreatedAccounts are never appended to) must still marshal both fields as
+	// `[]`, never `null`. A nil Go slice marshals as JSON null, and
+	// BulkImportStudents.vue reads result.errors.length with no guard — null
+	// throws a TypeError during render and the whole results table fails to
+	// mount, even though the toast reports success.
+	//
+	// This asserts on the marshalled BYTES, not the Go struct: a struct
+	// equality check (e.g. reflect.DeepEqual against []ImportRowError{}) would
+	// pass for both nil and empty slices and would never have caught this bug.
+	t.Run("a completely clean import marshals errors and created_accounts as [] not null", func(t *testing.T) {
+		repo := &fakeImportRepo{outcomes: []string{"created", "created"}}
+		service := NewStudentImportService(repo)
+
+		report, err := service.Import(ctx, 99, []ParsedStudentRow{
+			{RowNumber: 2, StudentNumber: "5001", StudentIDExt: "E5001"},
+			{RowNumber: 3, StudentNumber: "5002", StudentIDExt: "E5002"},
+		})
+		if err != nil {
+			t.Fatalf("Import returned error: %v", err)
+		}
+		if len(report.Errors) != 0 {
+			t.Fatalf("expected zero errors, got %+v", report.Errors)
+		}
+
+		raw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		body := string(raw)
+		if strings.Contains(body, `"errors":null`) {
+			t.Errorf(`marshalled report has "errors":null, want "errors":[] — body: %s`, body)
+		}
+		if !strings.Contains(body, `"errors":[]`) {
+			t.Errorf(`marshalled report is missing "errors":[] — body: %s`, body)
+		}
+		// created_accounts is populated here (both rows created), so also prove
+		// the CreatedAccounts field itself is never left nil by construction:
+		// re-marshal a report with zero created rows (all updates) to exercise
+		// the empty-but-non-nil path for that field specifically.
+		repo2 := &fakeImportRepo{outcomes: []string{"updated", "updated"}}
+		service2 := NewStudentImportService(repo2)
+		report2, err := service2.Import(ctx, 99, []ParsedStudentRow{
+			{RowNumber: 2, StudentNumber: "6001", StudentIDExt: "E6001"},
+			{RowNumber: 3, StudentNumber: "6002", StudentIDExt: "E6002"},
+		})
+		if err != nil {
+			t.Fatalf("Import returned error: %v", err)
+		}
+		raw2, err := json.Marshal(report2)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		body2 := string(raw2)
+		if strings.Contains(body2, `"created_accounts":null`) {
+			t.Errorf(`marshalled report has "created_accounts":null, want "created_accounts":[] — body: %s`, body2)
+		}
+		if !strings.Contains(body2, `"created_accounts":[]`) {
+			t.Errorf(`marshalled report is missing "created_accounts":[] — body: %s`, body2)
 		}
 	})
 }

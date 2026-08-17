@@ -49,6 +49,17 @@ func (s *AuthService) SetEmailSender(sender EmailSender) { s.email = sender }
 // KeyConfigured reports whether the password-event encryption key is available.
 func (s *AuthService) KeyConfigured() bool { return s.cipher != nil }
 
+// EmailConfigured reports whether a REAL email sender is wired in (SetEmailSender
+// was called with something other than the default NoopEmailSender). Callers
+// that are about to claim delivery happened — e.g. the rotating credential
+// importer marking a row "queued" — must check this first: NoopEmailSender's
+// SendCredential logs a TODO and returns nil, which is indistinguishable from
+// a real send at the call site unless this is checked explicitly.
+func (s *AuthService) EmailConfigured() bool {
+	_, isNoop := s.email.(NoopEmailSender)
+	return !isNoop
+}
+
 func (s *AuthService) Login(ctx context.Context, username, password string) (models.LoginResponse, error) {
 	// Rate Limiting: 5 attempts per 10 minutes
 	now := time.Now()
@@ -195,6 +206,67 @@ func (s *AuthService) LogStudentCreate(ctx context.Context, creator models.User,
 	if err := s.email.SendCredential(email, username, password); err != nil {
 		log.Printf("auth: SendCredential failed for new student %q: %v", username, err)
 	}
+}
+
+// BulkCredentialEvent is one password-event to record for a bulk credential
+// operation. Source is models.PasswordEventCreate for a newly inserted student
+// and models.PasswordEventAdminReset for a rotated existing one.
+type BulkCredentialEvent struct {
+	UserID    int
+	Source    string
+	Plaintext string
+}
+
+// LogBulkCredentials records one app.password_events row per entry and sends
+// NO email of any kind.
+//
+// It deliberately does NOT call logPasswordEvent: that helper invokes
+// SendChangeNotice for EVERY event whenever ADMIN_EMAIL is configured, which
+// would turn a 200-row roster import into 200 emails to the admin — the same
+// trap BulkResetPasswords documents. Credential delivery to the students is the
+// background email worker's job, not this function's.
+//
+// Best-effort throughout: a failure to encrypt or insert is logged and skipped,
+// never returned, because the passwords are already committed and shown to the
+// admin.
+//
+// Returns the number of events actually written, so the caller can detect and
+// surface an incomplete audit trail (e.g. when s.cipher is nil, or individual
+// rows fail to encrypt/insert) rather than assuming every event landed just
+// because this call did not return an error.
+func (s *AuthService) LogBulkCredentials(ctx context.Context, actor models.User, events []BulkCredentialEvent) int {
+	if s.cipher == nil {
+		log.Printf("auth: password-event logging disabled (no key); %d bulk credential events not recorded", len(events))
+		return 0
+	}
+	actorID := int(actor.ID)
+	written := 0
+	for _, ev := range events {
+		ct, nonce, err := s.cipher.Encrypt(ev.Plaintext)
+		if err != nil {
+			log.Printf("auth: encrypt bulk credential event failed (user_id=%d): %v", ev.UserID, err)
+			continue
+		}
+		if _, err := s.repo.InsertPasswordEvent(ctx, models.PasswordEvent{
+			UserID:         ev.UserID,
+			ChangedBy:      &actorID,
+			Source:         ev.Source,
+			NewPasswordEnc: ct,
+			Nonce:          nonce,
+		}); err != nil {
+			log.Printf("auth: insert bulk credential event failed (user_id=%d): %v", ev.UserID, err)
+			continue
+		}
+		written++
+	}
+	return written
+}
+
+// SendCredentialEmail exposes the credential email to callers that own their
+// own delivery loop (the rotating importer's background worker), which needs to
+// record per-send success or failure rather than fire-and-forget.
+func (s *AuthService) SendCredentialEmail(toEmail, username, password string) error {
+	return s.email.SendCredential(toEmail, username, password)
 }
 
 // ForgotResetThrottle is the minimum interval between honoured forgot-password

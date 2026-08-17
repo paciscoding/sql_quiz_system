@@ -1,5 +1,89 @@
 # CHANGELOG.md
 
+## [2026-08-17] Admin rotating credential import (branch `feat/rotating-credential-import`)
+
+**New admin-only capability, additive: `POST /lecturer/students/import` is completely unchanged, including its Admin/Lecturer permissions and its "existing student keeps their password" behaviour.**
+
+### Added
+- **Admin rotating credential import.** `POST /api/v1/students/import-credentials`
+  (ADMIN only, multipart `file` + `confirm=ROTATE`) imports the same roster
+  format as `/lecturer/students/import` but rotates the password of **every**
+  row — new and returning students alike — bumping `token_version` so any
+  existing session for that student is evicted. `confirm` is checked
+  server-side on every request regardless of what the UI already gated,
+  mirroring `BulkResetPassword`'s `RESET` check. New repository method
+  `UpsertStudentRotating` and service method
+  `StudentImportService.ImportRotating`. Response `200` returns `{total,
+  created, updated, skipped, errors, accounts: [{row, student_number,
+  student_id_ext, email, password, outcome, email_status}], job_id}` — every
+  rotated password is returned in the body and shown once in the UI.
+- **Bulk password-event logging without an admin-notice fan-out.**
+  `AuthService.LogBulkCredentials` writes one `app.password_events` row per
+  rotated account (`PasswordEventCreate` for new rows, `PasswordEventAdminReset`
+  for updated ones) but deliberately does not go through the existing
+  `logPasswordEvent` helper, which emails `ADMIN_NOTIFY_EMAIL` once per event —
+  that would turn a 200-row import into 200 admin emails. **This requires
+  `PASSWORD_LOG_KEY` to be configured**; when it isn't, `LogBulkCredentials`
+  writes nothing and returns `0` (the number of events actually written), so
+  the controller can log a warning when the audit trail comes up short instead
+  of assuming every row landed. The controller also hands this call a
+  `context.WithoutCancel`-wrapped context, so the write survives the admin's
+  browser disconnecting mid-request (a 500-row roster's bcrypt hashing alone
+  can run ~40s).
+- **Delivery is only ever claimed when it's real.** `email_status` is
+  `"queued"` only when `AuthService.EmailConfigured()` is true (a real sender
+  was wired in via `SetEmailSender`, not the default `NoopEmailSender`); rows
+  with an address but no configured sender get the new `"not_configured"`
+  status instead, and no job is registered or worker started for them. Without
+  this, every row would read `"queued"` — and the progress bubble would
+  eventually report "sent" — even when `EMAIL_SENDER_ADDRESS` was never set
+  and nothing was ever sent.
+- **Background email delivery with pollable progress.** Rows with an email
+  address are queued to a background worker that sends them serially, one at a
+  time. A new in-memory `EmailJobRegistry` tracks per-job sent/failed counts,
+  exposed at `GET /api/v1/students/import-credentials/:job_id/status`
+  (ADMIN only). A job belonging to a different admin returns `404`,
+  deliberately indistinguishable from an unknown id. `job_id` is `""` when no
+  row in the file carried an email address, when delivery is not configured
+  (see "Delivery is only ever claimed when it's real" above), or when
+  `crypto/rand` failed inside `EmailJobRegistry.Register` (the emails still
+  send in that last case, just untracked). See API_SPEC.md for the full list.
+- **Frontend.** A second admin card, "Import & Email Passwords"
+  (`BulkImportStudentsCredentials.vue`), mounted below the existing "Bulk
+  Roster Import" card in `AdminView.vue`. Gated on typing `ROTATE` into an
+  inline confirmation input — not a modal dialog, since
+  `services/confirm_service.ts`'s `ConfirmOptions` has no text-input field —
+  mirroring `BulkPasswordReset.vue`'s `RESET` gate; the submit button stays
+  disabled until the phrase matches exactly. The results table shows every
+  account's login ID, outcome, email status, and password, plus a "Copy all as
+  CSV" download that is the only recovery path for rows with no email address.
+  A floating progress bubble (`EmailJobBubble.vue`, backed by the
+  `useEmailJobStatus` composable) polls the status endpoint and reports
+  sent/failed counts and any login IDs whose delivery failed; the job id
+  survives a page reload via `localStorage`. Leaving the page while unviewed
+  passwords are still displayed triggers a `beforeunload` warning.
+
+### Known limitations
+- **No rate limiter on the import endpoint** — the same accepted residual as
+  `POST /api/v1/users/bulk-reset-password`.
+- **Plaintext passwords are emailed in bulk by design, and the HTTP response
+  body carries every plaintext password** for every rotated account. This is
+  the deliberate point of the endpoint, not an oversight; the admin-only role
+  gate and the typed `ROTATE` confirmation are what stand in front of it.
+- **Email progress is in-memory and single-process:** it is lost on a backend
+  restart, so a `404` from the status endpoint is an ordinary expected
+  outcome, not an error. A finished job is eligible for eviction 30 minutes
+  after it finishes, but that eviction (`sweepLocked`) only actually runs the
+  next time `Register` is called by a subsequent import on the same process —
+  it is not a background timer — so a finished job can remain readable well
+  past 30 minutes if no further import runs. There is no durable delivery
+  record and no retry of a failed send — the saved per-row `email_status`
+  stays `"queued"` forever regardless of whether the send later actually
+  succeeded or failed.
+- **`failures` names at most 50 login ids** (`maxTrackedFailures`) even though
+  the `failed` counter keeps counting past that; a run with more than 50
+  failures reports an accurate total with an incomplete name list.
+
 ## [2026-08-10] DML search_path drops the public fallback (branch `fix/dml-public-fallback`)
 
 **Behaviour change for lecturers, not an internal-only fix: a DML question whose SQL relies on an unqualified table name that only exists in `public` may now fail — at save/capture time if re-saved, or at grade time if not.** Read "Before deploying" below before rolling this out to a database that holds real lecturer content.

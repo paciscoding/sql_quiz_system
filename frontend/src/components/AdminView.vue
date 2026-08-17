@@ -18,8 +18,11 @@ import Spinner from './Spinner.vue'
 import EmptyState from './EmptyState.vue'
 import Skeleton from './Skeleton.vue'
 import BulkImportStudents from './BulkImportStudents.vue'
+import BulkImportStudentsCredentials from './BulkImportStudentsCredentials.vue'
+import EmailJobBubble from './EmailJobBubble.vue'
 import AddStudentForm from './AddStudentForm.vue'
 import EmailReveal from './EmailReveal.vue'
+import { useEmailJobStatus } from '../composables/useEmailJobStatus'
 
 const { notify } = useNotifications()
 const { confirm } = useConfirm()
@@ -282,9 +285,14 @@ const runExportNow = async () => {
   }
 }
 
+// The credential-email worker outlives this page, so a stored job id is
+// restored on mount — a reload must not lose the progress bubble.
+const { job: emailJob, state: emailJobState, track: trackEmailJob, restore: restoreEmailJob, dismiss: dismissEmailJob } = useEmailJobStatus()
+
 onMounted(() => {
   fetchUsers()
   fetchExportSettings()
+  restoreEmailJob()
 })
 </script>
 
@@ -403,11 +411,14 @@ onMounted(() => {
       </div>
 
       <!-- Bulk Import -->
-      <div class="card">
+      <div class="card" style="margin-bottom: var(--space-6);">
         <h2 style="margin: 0 0 var(--space-1) 0;">Bulk Roster Import</h2>
-        <p class="muted" style="margin: 0 0 var(--space-4) 0;">Import students from CSV or XLSX.</p>
+        <p class="muted" style="margin: 0 0 var(--space-4) 0;">Import students from CSV or XLSX. Existing students keep their password.</p>
         <BulkImportStudents />
       </div>
+
+      <!-- Rotating credential import (admin-only) -->
+      <BulkImportStudentsCredentials @job-started="trackEmailJob" />
     </div>
 
     <!-- User List -->
@@ -533,6 +544,8 @@ onMounted(() => {
       </div>
     </div>
   </div>
+
+  <EmailJobBubble :job="emailJob" :state="emailJobState" @dismiss="dismissEmailJob" />
   </div>
 </template>
 
