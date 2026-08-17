@@ -327,3 +327,57 @@ func (r *PostgresRepository) UpsertStudentByNumber(ctx context.Context, tx pgx.T
 	}
 	return "updated", userID, nil
 }
+
+// UpsertStudentRotating is UpsertStudentByNumber plus credential rotation: on
+// conflict it ALSO replaces password_hash and bumps token_version, so a
+// re-imported student receives the freshly generated password and every
+// existing session is evicted in the same statement. It backs the admin-only
+// rotating credential import; the plain importer must keep using
+// UpsertStudentByNumber, which leaves an existing password alone.
+func (r *PostgresRepository) UpsertStudentRotating(ctx context.Context, tx pgx.Tx, in models.StudentImportRow, creatorID int) (outcome string, userID int, err error) {
+	query := `
+		INSERT INTO app.system_users (
+			username, password_hash, role, created_by,
+			student_number, student_id_ext, sec_lec, sec_lab, first_name, last_name, email
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (student_id_ext) WHERE student_id_ext IS NOT NULL DO UPDATE SET
+			username = EXCLUDED.username,
+			student_number = EXCLUDED.student_number,
+			sec_lec = EXCLUDED.sec_lec,
+			sec_lab = EXCLUDED.sec_lab,
+			first_name = EXCLUDED.first_name,
+			last_name = EXCLUDED.last_name,
+			email = EXCLUDED.email,
+			password_hash = EXCLUDED.password_hash,
+			token_version = app.system_users.token_version + 1
+		RETURNING id, (xmax = 0) AS inserted`
+
+	// email is stored NULL when empty so the column stays genuinely optional.
+	var emailArg *string
+	if in.Email != "" {
+		emailArg = &in.Email
+	}
+
+	var inserted bool
+	err = tx.QueryRow(ctx, query,
+		in.StudentIDExt,
+		in.PasswordHash,
+		string(models.RoleStudent),
+		creatorID,
+		in.StudentNumber,
+		in.StudentIDExt,
+		in.SecLec,
+		in.SecLab,
+		in.FirstName,
+		in.LastName,
+		emailArg,
+	).Scan(&userID, &inserted)
+	if err != nil {
+		return "", 0, err
+	}
+	if inserted {
+		return "created", userID, nil
+	}
+	return "updated", userID, nil
+}
