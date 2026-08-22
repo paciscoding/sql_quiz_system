@@ -1,4 +1,5 @@
 import { toCsv } from './csv'
+import { scoreClass } from './score_class'
 
 /**
  * MatrixQuestion isolates a narrow projection of PracticeQuestion (id/title/requirement/points/categoryName)
@@ -150,19 +151,9 @@ export function buildRowAxis(students: MatrixStudent[], rows: PracticeResultRow[
   return result
 }
 
-// CMS-spec mapping: 0 -> zero/red, between -> partial/amber, == max -> full/green, undefined -> pending/grey
-export function scoreClass(scored: number | null | undefined, max: number | null | undefined): string {
-  if (scored == null || max == null || max <= 0) {
-    return 'score-pending'
-  }
-  if (scored <= 0) {
-    return 'score-zero'
-  }
-  if (scored >= max) {
-    return 'score-full'
-  }
-  return 'score-partial'
-}
+// scoreClass lives in ./score_class so the exam matrix can share it without
+// importing this module. Re-exported here so existing call sites keep working.
+export { scoreClass } from './score_class'
 
 // Branch on cell.solved, NEVER on earned >= max directly.
 // A question worth 0 points makes earned === max === 0, which is indistinguishable

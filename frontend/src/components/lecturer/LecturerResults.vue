@@ -7,9 +7,12 @@ import EmptyState from '../EmptyState.vue'
 import Spinner from '../Spinner.vue'
 import { toCsv, downloadCsv } from '../../utils/csv'
 import PracticeQuizMatrix from './PracticeQuizMatrix.vue'
+import ExamScoreMatrix from './ExamScoreMatrix.vue'
 import { lecturerListQuestions } from '../../services/practice'
 import { toMatrixQuestions, columnsFromResults, buildMatrixCsv } from '../../utils/practice_matrix'
 import type { MatrixQuestion } from '../../utils/practice_matrix'
+import { toExamMatrixQuestions, buildExamMatrixCsv } from '../../utils/exam_matrix'
+import type { ExamMatrixQuestion } from '../../utils/exam_matrix'
 
 interface ConsolidatedScore {
   student_id: string
@@ -218,6 +221,10 @@ async function ensurePracticeQuestions() {
   }
 }
 
+function exportExamMatrixCSV() {
+  downloadCsv('exam_matrix.csv', buildExamMatrixCsv(drillRoster.value, drillQuestions.value, drillSubmissions.value))
+}
+
 function exportPracticeMatrixCSV() {
   downloadCsv('practice_quiz_matrix.csv', buildMatrixCsv(consolidatedScores.value, practiceQuestions.value, practiceResults.value))
 }
@@ -232,7 +239,7 @@ const practiceQuestionsLoaded = ref(false)
 const practiceQuestionsDegraded = ref(false)
 const resultsExamId = ref<string | null>(null)
 const drillLoading = ref(false)
-const drillQuestions = ref<any[]>([])
+const drillQuestions = ref<ExamMatrixQuestion[]>([])
 const drillSubmissions = ref<DrillSubmission[]>([])
 const drillRoster = ref<RosterStudent[]>([])
 
@@ -253,7 +260,7 @@ const drillQuestionStats = computed(() => {
       : 0
     // display_no is the backend's per-exam 1-based position (gap-free, restarts
     // at 1 per exam); id stays the row key and the submission join key.
-    return { id: q.id, displayNo: q.display_no ?? 0, requirement: q.requirement, attempts, correctStudents, avgScore }
+    return { id: q.id, displayNo: q.displayNo, requirement: q.requirement, attempts, correctStudents, avgScore }
   })
 })
 
@@ -275,7 +282,9 @@ async function fetchDrillData(examId: string) {
       fetch(`/api/v1/lecturer/exams/${examId}/students`, { headers: { 'Authorization': `Bearer ${token}` } })
     ])
     if (qResp.ok) {
-      drillQuestions.value = await qResp.json()
+      // Narrowed at the fetch boundary: the payload is the full models.Question,
+      // answer key (correct_sql, target_table, expected_result, ...) included.
+      drillQuestions.value = toExamMatrixQuestions((await qResp.json()) || [])
     }
     if (sResp.ok) {
       drillSubmissions.value = await sResp.json()
@@ -320,7 +329,8 @@ onMounted(() => {
         <button @click="exportExamCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Exam Scores (CSV)</button>
         <button @click="exportPracticeCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Practice Scores (CSV)</button>
         <button @click="exportPracticeBreakdownCSV" class="secondary-btn" style="margin: 0;" :disabled="practiceResults.length === 0">Export Practice Breakdown (CSV)</button>
-        <button v-if="resultsExamId === PRACTICE_MATRIX" @click="exportPracticeMatrixCSV" class="secondary-btn" style="margin: 0;" :disabled="loadingPracticeQuestions || practiceQuestions.length === 0 || consolidatedScores.length === 0">Export Practice Matrix (CSV)</button>
+        <button v-if="resultsExamId !== null && resultsExamId !== PRACTICE_MATRIX" @click="exportExamMatrixCSV" class="secondary-btn" style="margin: 0;" :disabled="drillLoading || drillQuestions.length === 0">Export Exam Matrix (CSV)</button>
+      <button v-if="resultsExamId === PRACTICE_MATRIX" @click="exportPracticeMatrixCSV" class="secondary-btn" style="margin: 0;" :disabled="loadingPracticeQuestions || practiceQuestions.length === 0 || consolidatedScores.length === 0">Export Practice Matrix (CSV)</button>
       </div>
     </div>
 
@@ -389,6 +399,16 @@ onMounted(() => {
     <template v-else>
       <Spinner v-if="drillLoading" inline />
       <template v-else>
+        <!-- Student x question score matrix -->
+        <div style="margin-top: var(--space-4);">
+          <h3 style="margin-bottom: var(--space-2);">Student &times; Question Scores</h3>
+          <ExamScoreMatrix
+            :students="drillRoster"
+            :questions="drillQuestions"
+            :submissions="drillSubmissions"
+          />
+        </div>
+
         <!-- Per-question difficulty table -->
         <div style="margin-top: var(--space-4);">
           <h3 style="margin-bottom: var(--space-2);">Question Difficulty</h3>
