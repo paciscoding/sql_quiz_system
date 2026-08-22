@@ -23,41 +23,43 @@ vi.mock('../../services/error_handler', () => ({
 }))
 
 const ISO_TIMESTAMP = '2024-06-01T14:30:00.000Z'
+// Exam ids are opaque publicid tokens on the wire, never bare integers.
+const EXAM_ID = 'exm_9Kq2Xb'
 
 function makeFetchMock() {
   return vi.fn().mockImplementation((url: string) => {
-    if (typeof url === 'string' && /\/results\/\d+$/.test(url)) {
+    // Per-exam details: GET /api/v1/quiz/exams/:id/results. Returns a BARE ARRAY
+    // of flat models.StudentExamResult rows (backend/internal/models/submission.go).
+    // Must be matched BEFORE the looser '/results' branch below, which would
+    // otherwise shadow it and return the exam-LIST summary shape instead.
+    if (typeof url === 'string' && /\/api\/v1\/quiz\/exams\/[^/]+\/results$/.test(url)) {
       return Promise.resolve({
         ok: true,
-        json: () => Promise.resolve({
-          exam_id: 1,
-          exam_title: 'Test Exam',
-          questions: [
-            {
-              question_id: 1,
-              requirement: 'Write a SELECT query',
-              question_type: 'QUERY',
-              points: 10,
-              submission: {
-                sql_text: 'SELECT * FROM users',
-                is_correct: true,
-                submitted_at: ISO_TIMESTAMP,
-                validation_details: null,
-              },
-            },
-          ],
-        }),
+        json: () => Promise.resolve([
+          {
+            question_id: 1,
+            requirement: 'Write a SELECT query',
+            type: 'QUERY',
+            points: 10,
+            sql_text: 'SELECT * FROM users',
+            is_correct: true,
+            score: 10,
+            submitted_at: ISO_TIMESTAMP,
+            validation_details: null,
+          },
+        ]),
       })
     }
     if (typeof url === 'string' && url.includes('/practice/summary')) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve([]) })
     }
+    // Exam list: GET /api/v1/quiz/results -> models.ExamResultSummary[].
     if (typeof url === 'string' && url.includes('/results')) {
       return Promise.resolve({
         ok: true,
         json: () => Promise.resolve([
           {
-            exam_id: 1,
+            exam_id: EXAM_ID,
             exam_title: 'Test Exam',
             is_active: true,
             question_count: 1,

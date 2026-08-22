@@ -151,9 +151,91 @@
         "ROLLBACK TO SAVEPOINT still precedes RESET ROLE on every exit path in the file, including the new seed-failure path.",
         "go build ./... passes; existing evaluation and restricted-pool tests still pass."
       ]
+    },
+    {
+      "id": "ARCH-055",
+      "title": "Practice Quiz Summary matrix (student x practice-question best score), frontend-only",
+      "decision": "Pivot /lecturer/practice/results into a student x question matrix on the lecturer Results page, as a new option in the existing View: select. Row axis from /lecturer/scores (all STUDENT users), column axis from /lecturer/practice/questions (full set, pq.id ASC order). Pure logic extracted to utils/practice_matrix.ts; presentation in components/lecturer/PracticeQuizMatrix.vue. Zero backend changes.",
+      "constraints": [
+        "No backend file may be modified.",
+        "MatrixQuestion must narrow the lecturer questions payload to {id,title,requirement,points,categoryName} so correct_sql/seed_sql/expected_result can never reach a cell, tooltip, or CSV.",
+        "cellClass branches on is_solved, not earned>=max, so points==0 questions do not render as score-pending.",
+        "Scoped CSS must out-specify .data-table tr:nth-child(even) td (0,2,2) or the heatmap dies on even rows.",
+        "Never sort the questions array; server order is the column order and index+1 is the Q-number.",
+        "Opaque publicid ids are join keys and :key only - never rendered."
+      ],
+      "plan_file": "/home/adamas/.claude/plans/on-the-viewing-result-swirling-frog.md"
     }
   ],
-  "todos": [],
+  "todos": [
+    {
+      "id": "TODO-055-1",
+      "assigned_to": "agy-implementor",
+      "parallel_group": "A",
+      "depends_on": [],
+      "title": "Create utils/practice_matrix.ts (pure pivot/CSV logic)",
+      "file_scope": [
+        "frontend/src/utils/practice_matrix.ts"
+      ],
+      "done_when": "File exports MatrixQuestion/MatrixStudent/MatrixCell types, toMatrixQuestions, columnsFromResults, buildMatrix, buildRowAxis, scoreClass, cellClass, columnLabel, columnTooltip, csvColumnHeader, buildMatrixCsv. No Vue import. Typechecks."
+    },
+    {
+      "id": "TODO-055-2",
+      "assigned_to": "agy-implementor",
+      "parallel_group": "A",
+      "depends_on": [
+        "TODO-055-1"
+      ],
+      "title": "Create components/lecturer/PracticeQuizMatrix.vue",
+      "file_scope": [
+        "frontend/src/components/lecturer/PracticeQuizMatrix.vue"
+      ],
+      "done_when": "Props-only component renders the matrix with sticky identity column, heatmap cells, row totals, loading/empty/degraded states, and scoped CSS that beats the zebra rule."
+    },
+    {
+      "id": "TODO-055-3",
+      "assigned_to": "agy-implementor",
+      "parallel_group": "B",
+      "depends_on": [],
+      "title": "Fix StudentResults exam-details 404 (wrong route + response shape)",
+      "file_scope": [
+        "frontend/src/components/StudentResults.vue"
+      ],
+      "done_when": "fetchExamDetails calls /api/v1/quiz/exams/{id}/results, handles the non-ok branch, and adapts the flat StudentExamResult array into the existing ExamDetails shape. Template changed ONLY in the score cell (2 expressions switched from `is_correct ? points : 0` to the endpoint's real `score`), authorised by the implementor brief step 4; rest of template unchanged.",
+      "done_when_amended_by": "orchestrator 2026-08-22: original done_when said 'Template unchanged' while the same brief's step 4 explicitly required the score-cell edit. The done_when text was wrong, not the implementation. Amended rather than reverted - the old expression discarded partial credit and misreported any partially-graded exam question."
+    },
+    {
+      "id": "TODO-055-4",
+      "assigned_to": "claude-implementor",
+      "parallel_group": "C",
+      "depends_on": [
+        "TODO-055-1",
+        "TODO-055-2"
+      ],
+      "title": "Wire the matrix into LecturerResults (6 surgical edits)",
+      "file_scope": [
+        "frontend/src/components/lecturer/LecturerResults.vue",
+        "frontend/src/utils/practice_matrix.ts",
+        "frontend/src/components/lecturer/PracticeQuizMatrix.vue"
+      ],
+      "done_when": "PRACTICE_MATRIX sentinel option added to the View select, lazy one-shot ensurePracticeQuestions, v-else-if branch renders PracticeQuizMatrix, Practice Breakdown hidden in that mode, CSV export button, watch guard. Existing two modes behave identically.",
+      "reason": "re-routed from agy-implementor: Claude Code permission classifier blocks that lane's jailed CLI invocation for substantive multi-file edits"
+    },
+    {
+      "id": "TODO-055-5",
+      "assigned_to": "regression-tester",
+      "parallel_group": "C",
+      "depends_on": [
+        "TODO-055-4"
+      ],
+      "title": "Vitest coverage for the matrix + LecturerResults integration",
+      "file_scope": [
+        "frontend/src/__tests__/components/practice_quiz_matrix.test.ts",
+        "frontend/src/__tests__/components/timestamp_tooltip.test.ts"
+      ],
+      "done_when": "7 assertion groups from the plan pass; full frontend suite still green. ALSO: timestamp_tooltip.test.ts mock must be updated to the real contract (URL /api/v1/quiz/exams/:id/results, bare array of flat StudentExamResultRow) - its current mock encodes the pre-fix bug and now fails 2 of 3."
+    }
+  ],
   "in_progress": [],
   "completed": [
     "TODO-001",
@@ -163,7 +245,12 @@
     "TODO-008",
     "TODO-005",
     "TODO-006",
-    "TODO-007"
+    "TODO-007",
+    "TODO-055-3",
+    "TODO-055-1",
+    "TODO-055-2",
+    "TODO-055-4",
+    "TODO-055-5"
   ],
   "failed": [],
   "agent_notes": {
@@ -175,7 +262,25 @@
       "TODO-008": "lecturer/ExamQuestionsPanel.vue + lecturer/types.ts. Same panel for exam authoring. autoSeedPlan is a standalone ref, never merged into `question` (which IS spread into save/preview bodies), so auto_seed structurally cannot leak into a request. types.ts had no ExamQuestion interface (typed any), so only AutoSeedColumn/AutoSeedPlan were added. vue-tsc clean, build ok, 74 tests pass.",
       "TODO-005": "postgres_practice.go: captureExpectedResult gained autoSeed *[]byte out-param; 0-row branch does SAVEPOINT autoseed -> fetchTableColumns -> deriveAutoSeed -> applyAutoSeed -> re-run correct_sql. Threaded auto_seed into Create/UpdatePracticeQuestion (placeholder renumber, WHERE id=$17 -> $18) and both read paths. NOTE: models.PracticeQuestion.Type is only QUERY|DML, never INSERT, so 'skip INSERT questions' is detected from the leading keyword of correct_sql via a NEW helper isAutoSeedIneligibleInsert() reusing dml_autoseed.go's unexported stripSQLComments/matchKeywordAt. marshalAutoSeed error ignored, matching the file's existing json.Marshal convention. 19 DB tests pass with -p 1.",
       "TODO-006": "postgres_questions.go: same rescue on the CreateQuestion 0-row branch. auto_seed appended as last bind param before NOW() in both the INSERT and the ON CONFLICT (id) DO UPDATE branch (SET auto_seed = EXCLUDED.auto_seed); conflict target untouched. GetQuestion + GetQuestionsByExamID read it. Same Type-is-only-QUERY|DML finding as TODO-005, solved with a SECOND helper isAutoSeedInsertStatement() -- DUPLICATE of TODO-005's helper, flag for merge-check. Build+vet clean; DB tests skipped (no TEST_DATABASE_URL in that agent's env).",
-      "TODO-007": "postgres_evaluation.go: seed replay in evaluateDML (after SET LOCAL ROLE exam_student, ~:229) and evaluateDMLPreview (after SET LOCAL ROLE + search_path, ~:461), both before execStudentStatement, with a comment recording the NOINHERIT reason. New const AutoSeedFailureFeedback = 'This question could not be prepared for grading due to a configuration problem. Please contact your instructor so the question can be re-saved.' Malformed stored JSON treated like an applyAutoSeed failure. ROLLBACK TO SAVEPOINT still precedes RESET ROLE on every path. nil plan issues zero extra statements. Verified end-to-end against a throwaway postgres:15-alpine: correct DELETE graded correct, no-op graded with seed row still present, real schema left with 0 rows. Two pre-existing test-isolation flakes in internal/services (TestDMLGrading_D2_*, TestParity_SingleVsBulk) reproduce on stashed pre-change code -- unrelated."
+      "TODO-007": "postgres_evaluation.go: seed replay in evaluateDML (after SET LOCAL ROLE exam_student, ~:229) and evaluateDMLPreview (after SET LOCAL ROLE + search_path, ~:461), both before execStudentStatement, with a comment recording the NOINHERIT reason. New const AutoSeedFailureFeedback = 'This question could not be prepared for grading due to a configuration problem. Please contact your instructor so the question can be re-saved.' Malformed stored JSON treated like an applyAutoSeed failure. ROLLBACK TO SAVEPOINT still precedes RESET ROLE on every path. nil plan issues zero extra statements. Verified end-to-end against a throwaway postgres:15-alpine: correct DELETE graded correct, no-op graded with seed row still present, real schema left with 0 rows. Two pre-existing test-isolation flakes in internal/services (TestDMLGrading_D2_*, TestParity_SingleVsBulk) reproduce on stashed pre-change code -- unrelated.",
+      "TODO-055-4": {
+        "status": "completed",
+        "lane": "claude-implementor (re-routed from agy)",
+        "files": [
+          "LecturerResults.vue",
+          "practice_matrix.ts",
+          "PracticeQuizMatrix.vue"
+        ],
+        "orchestrator_verification": "6 wiring edits grepped present; D1 mb-4 gone, D2 cellFor/defineExpose gone, D3 identity :title present, D4 PracticeQuestionInput in / duplicated DTO out (only doc-comment mention of correct_sql remains); vue-tsc clean for all 3 (only pre-existing ExamAnnouncementsPanel/SubmissionLog errors); vitest 50 files / 525 tests all pass"
+      },
+      "TODO-055-5": {
+        "status": "completed",
+        "files": [
+          "frontend/src/__tests__/components/practice_quiz_matrix.test.ts"
+        ],
+        "result": "7 new tests, suite 51 files / 532 tests all pass",
+        "note": "tester's own first draft asserted absence of the string 'Practice Breakdown' after switching modes; failed because the 'Export Practice Breakdown (CSV)' BUTTON stays rendered in all modes. Corrected to assert on the <h3> heading. Test flaw, not an implementation bug - but see orchestrator follow-up on that button's visibility."
+      }
     },
     "merge": {
       "summary": "8 files reviewed (6 modified backend + 2 new backend + 5 frontend already committed in ea3d5aa); one non-blocking duplicate-helper issue found, everything else clean.",
@@ -208,7 +313,25 @@
       },
       "minor_non_blocking_note": "Cosmetic UI drift (not flagged as a conflict): PracticeAuthoring.vue's auto-seed panel always single-quotes column values in its rendered INSERT preview (`'${c.value}'`), while ExamQuestionsPanel.vue's equivalent renders the raw value unquoted. Both are read-only display strings with no functional effect and no shared code path, so this is a cosmetic inconsistency between TODO-004 and TODO-008's independently-written render helpers, worth a follow-up polish pass but not a merge conflict.",
       "resolution": "Single conflict (duplicate INSERT-detection predicate) RESOLVED: canonical isAutoSeedIneligibleInsert now lives in dml_autoseed.go; both duplicates deleted, both call sites updated. Cosmetic finding (exam panel rendered auto-seed values unquoted vs practice panel single-quoted) also resolved in ExamQuestionsPanel.vue. TS-interface duplication across services/practice.ts and lecturer/types.ts judged not-a-conflict (identical shape, no cross-import). Everything else clean: ARCH-039 message strings byte-identical across both capture paths; placeholder renumbering correct in all four statements; read/write symmetry verified; ROLLBACK TO SAVEPOINT still precedes RESET ROLE on every path; seed sits after SET LOCAL ROLE; rescue-not-default invariant holds; no ARCH-038 contract drift.",
-      "unrelated_blocker": "frontend/src/components/PracticeView.vue:236 has `const function RefillData(text: string) {` \u2014 invalid TS, breaks `vue-tsc -b` and `npm run build` repo-wide. User's own in-progress edit, unrelated to dml-autoseed, NOT touched by the pipeline."
+      "unrelated_blocker": "frontend/src/components/PracticeView.vue:236 has `const function RefillData(text: string) {` \u2014 invalid TS, breaks `vue-tsc -b` and `npm run build` repo-wide. User's own in-progress edit, unrelated to dml-autoseed, NOT touched by the pipeline.",
+      "arch_055": {
+        "summary": "ARCH-055 (Practice Quiz Summary matrix) merge-check: 4 modified files (StudentResults.vue, LecturerResults.vue, timestamp_tooltip.test.ts, pipeline-state.json) + 3 new files (practice_matrix.ts, PracticeQuizMatrix.vue, practice_quiz_matrix.test.ts) reviewed. No cross-instance conflicts found. Clean run.",
+        "checklist": {
+          "backend_untouched": "PASS (hard constraint) - git status/diff shows zero backend files touched; only frontend/*, feedback.md (pre-existing unrelated 2026-08-10 backend-audit edit, not in any TODO-055 file_scope), and pipeline-state.json changed.",
+          "duplicate_dto": "none - frontend/src/utils/practice_matrix.ts:54 defines a narrow structural PracticeQuestionInput (id/title?/requirement/points/category_name?/category?), not a copy of services/practice.ts:75 PracticeQuestion; grep confirms PracticeQuestion interface exists exactly once in the whole frontend tree. Group C's cleanup of group A's original DTO duplication is fully in effect.",
+          "scoreClass_consistency": "deliberate identical copy, not divergent - practice_matrix.ts:154-165 and StudentResults.vue:169-174 have byte-identical branch logic and thresholds (score-pending/score-zero/score-full/score-partial), same order of checks.",
+          "dead_code_cleanup": "confirmed gone from PracticeQuizMatrix.vue - no cellFor, no defineExpose, no mb-4 (grepped, zero hits). No Tailwind-style utility classes (mb-*, mt-*, flex, gap-*, text-sm) in practice_matrix.ts or PracticeQuizMatrix.vue; project genuinely has no Tailwind, all classes are project-local (pqm-*) with var(--space-N) spacing.",
+          "results_page_consistency": "StudentResults.vue and PracticeQuizMatrix.vue both use .score-cell + .score-zero/.score-partial/.score-full/.score-pending; both render em/en-dash for the pending/never-attempted case with no disagreement on meaning.",
+          "css_scoping": "PracticeQuizMatrix.vue style block is <style scoped> (line 136); its zebra-beating rule .pqm-table tbody tr td.score-cell.score-zero (3 classes + 3 elements, plus the Vue scoped data-v attribute hash on every compiled selector segment) out-specifies the global .data-table tr:nth-child(even) td rule (style.css:350, 2 classes + 2 elements) and, being scoped, cannot leak to any other table in the app.",
+          "test_isolation": "both practice_quiz_matrix.test.ts and timestamp_tooltip.test.ts stub fetch via vi.stubGlobal and localStorage via localStorage.setItem in beforeEach, and both correctly call vi.unstubAllGlobals() (+ localStorage.clear() in the matrix test) in afterEach - no leakage between the two files or into the rest of the suite. Full run: 51 files / 532 tests pass.",
+          "import_hygiene": "no unused imports (grepped every named import from LecturerResults.vue against its usage); no circular imports - dependency direction is strictly practice_matrix.ts -> csv.ts, PracticeQuizMatrix.vue -> practice_matrix.ts (+Skeleton/EmptyState), LecturerResults.vue -> PracticeQuizMatrix.vue + practice_matrix.ts + services/practice.ts, all one-directional.",
+          "sequential_not_concurrent": "confirmed by the task-router's own depends_on graph - TODO-055-4 (group C, claude-implementor) declares depends_on: [TODO-055-1, TODO-055-2] (group A), and agent_notes.agy records group A's 2 files were already complete (with 4 defects logged for group C to fix) before TODO-055-4 started. This is dependency-ordered sequential handoff, not a concurrent collision, matching the task description.",
+          "cross_group_file_collision": "none - TODO-055-4's file_scope legitimately includes practice_matrix.ts and PracticeQuizMatrix.vue (the cleanup pass), and no other group touched those files concurrently. TODO-055-3 (group B, StudentResults.vue) and TODO-055-5 (group C, both test files) are each the sole owner of their files.",
+          "file_scope_adherence": "all touched/new files map 1:1 to their owning TODO's declared file_scope; no drive-by edits outside scope found."
+        },
+        "non_blocking_observation": "NOT a merge conflict (single-file, single-TODO, informational only for validator): LecturerResults.vue:322 - the \"Export Practice Breakdown (CSV)\" button is not gated by  the way the Practice Breakdown section itself is (v-if added at line ~348), so it stays visible/clickable while viewing the new Practice Matrix view. regression-tester already flagged this in agent_notes.tester[\"TODO-055-5\"] as a UI follow-up, not an implementation defect. Passing to validator/feedback-loop, not fixing here.",
+        "verdict": "clean - no conflicts between parallel instances; no backend diff; no duplicate implementations; no file-scope violations."
+      }
     },
     "tester": {
       "TODO-001": "dml_autoseed.go (derivation core): exercised end-to-end through real capture in backend/internal/repository/dml_autoseed_schema_isolation_test.go, dml_autoseed_rescue_not_default_test.go, and postgres_questions_autoseed_test.go (deriveAutoSeed/fetchTableColumns/applyAutoSeed/marshalAutoSeed/unmarshalAutoSeed all invoked via the real capture/grade/preview paths, not mocked). Pre-existing dml_autoseed_test.go (17 no-DB unit tests, implementor-authored) still passes unchanged. 24/24 new regression-tester tests pass; 0 failures.",
@@ -219,6 +342,51 @@
       "TODO-006": "postgres_questions.go capture (exam 0-row rescue branch): this repository's own implementor report said 'DB tests skipped (no TEST_DATABASE_URL in that agent's env)' and the design doc flags it as having NO DB coverage before this pass. Closed by backend/internal/repository/postgres_questions_autoseed_test.go: create->persists plan, upsert branch re-derives, upsert clears a stale plan once the model answer becomes effective, ON-CONFLICT(id) no-collision regression combined with the new auto_seed bind parameter, and the exam side of the ARCH-039 refusal-message parity test. 5/5 tests pass.",
       "TODO-007": "postgres_evaluation.go grade/preview replay: covered by dml_autoseed_schema_isolation_test.go's grade-error/preview-error stale-plan tests (nil Go error + AutoSeedFailureFeedback, schema untouched), backend/internal/services/dml_autoseed_grading_test.go's real-decision-layer grading-discrimination test (same DELETE grades CORRECT, no-op grades INCORRECT \u2014 the actual point of ARCH-008/037) and its ARCH-018 dual-schema-scrub-survival tests for AutoSeedFailureFeedback (dual and non-dual). 5/5 tests pass. Confirmed the two pre-existing test-isolation flakes this implementor already flagged (TestDMLGrading_D2_..., TestParity_SingleVsBulk) are unrelated to this feature: both reproduce on an unmodified worktree and are explicitly called out as pre-existing in this round's brief.",
       "TODO-008": "ExamQuestionsPanel.vue read-only auto-seed panel: NOT covered by this pass, same as TODO-004 \u2014 backend-only scope this round. Implementor's own report cites vue-tsc clean + 74 pre-existing tests passing; no new frontend tests added here."
+    },
+    "agy": {
+      "TODO-055-3": {
+        "status": "completed",
+        "lane_actually_used": "direct Bash (agent declined agy/bwrap delegation on security grounds)",
+        "files": [
+          "frontend/src/components/StudentResults.vue"
+        ],
+        "verified_by_orchestrator": "git status shows only that file; vue-tsc clean for it; 2 timestamp_tooltip failures reproduced and root-caused",
+        "follow_up": "timestamp_tooltip.test.ts mock updated under TODO-055-5"
+      },
+      "TODO-055-1+2": {
+        "status": "completed",
+        "lane_actually_used": "agy inside bwrap jail (2 calls: build + noUnusedLocals fixup)",
+        "files": [
+          "frontend/src/utils/practice_matrix.ts",
+          "frontend/src/components/lecturer/PracticeQuizMatrix.vue"
+        ],
+        "orchestrator_review": "7 spec checks verified by reading both files. 4 defects found and routed to group C: dead .mb-4 class (no Tailwind in project), cellFor+defineExpose dead code kept only to silence noUnusedLocals, sticky identity td missing title attr + unusable ellipsis on a td with block children, PracticeQuestion DTO duplicated from services/practice.ts"
+      },
+      "TODO-055-4-attempt": {
+        "status": "failed - no files changed",
+        "cause": "Claude Code auto-mode classifier blocked the jailed agy call on two independent triggers: (1) literal --dangerously-skip-permissions with a real-project write bind, (2) substantive multi-file edit/delete brief even with --mode accept-edits. Trivial single-line jailed writes still pass.",
+        "agent_behavior": "correctly refused to split the brief into small calls to evade content detection; stopped and escalated",
+        "artifact": ".agy/todo_brief.md (14KB, complete, reused by the claude-implementor re-route)",
+        "inconsistency": "group A completed 2 successful jailed agy calls ~1h earlier on the same setup"
+      }
+    },
+    "orchestrator": {
+      "TODO-055-5-partial": {
+        "status": "timestamp_tooltip.test.ts fixed inline by orchestrator (agent delegation blocked by permission classifier)",
+        "result": "3/3 pass; mock now matches /api/v1/quiz/exams/:id/results and returns bare array of flat StudentExamResult rows with opaque string exam id"
+      }
+    },
+    "validator": {
+      "arch_055": {
+        "verdict": "5 PASS / 0 FAIL",
+        "flags": {
+          "1_template_done_when": "resolved - done_when amended above",
+          "2_retry_on_failure": "ensurePracticeQuestions is one-shot on success but retries after failure; intentional (lets the degraded view self-heal), success path only is test-pinned",
+          "3_degraded_race": "if the questions fetch fails BEFORE practiceResults resolves, columnsFromResults sees [] and shows the empty state; practiceQuestions is a plain ref so it does not auto-recover, but toggling the view re-runs the fallback. Only reachable when the questions endpoint is already broken. ACCEPTED, documented.",
+          "4_export_button": "NOT a defect - always-visible export buttons match the existing convention of the other two export buttons in drill-down mode"
+        },
+        "strong_evidence": "validator compiled the SFC through @vue/compiler-sfc: emitted heatmap selector is (0,4,3) vs the zebra rule's (0,2,2), so the even-row trap is genuinely handled"
+      }
     }
   }
 }

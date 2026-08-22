@@ -3,7 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import ResultTable from './ResultTable.vue'
 import EmptyState from './EmptyState.vue'
 import Skeleton from './Skeleton.vue'
-import { handleApiError } from '../services/error_handler'
+import { handleApiError, toApiError } from '../services/error_handler'
 import { formatDate, formatRelative } from '../utils/format_date'
 
 interface ExamResult {
@@ -34,6 +34,7 @@ interface QuestionDetail {
   submission?: {
     sql_text: string
     is_correct: boolean
+    score: number
     submitted_at: string
     validation_details: any
   }
@@ -89,16 +90,50 @@ const fetchPracticeSummary = async () => {
   }
 }
 
+interface StudentExamResultRow {
+  question_id: number
+  requirement: string
+  type: string
+  points: number
+  sql_text: string
+  is_correct: boolean
+  score: number
+  submitted_at: string
+  validation_details: any
+}
+
 const fetchExamDetails = async (examId: string) => {
   loadingDetails.value = true
   view.value = 'details'
   const token = localStorage.getItem('sql_quiz_token')
   try {
-    const response = await fetch(`/api/v1/quiz/results/${examId}`, {
+    const response = await fetch(`/api/v1/quiz/exams/${examId}/results`, {
       headers: { 'Authorization': `Bearer ${token}` }
     })
     if (response.ok) {
-      selectedExam.value = await response.json()
+      const rows: StudentExamResultRow[] = (await response.json()) || []
+      const examMeta = exams.value.find(e => e.exam_id === examId)
+      selectedExam.value = {
+        exam_id: examId,
+        exam_title: examMeta?.exam_title ?? '',
+        questions: rows.map((r): QuestionDetail => ({
+          question_id: r.question_id,
+          requirement: r.requirement,
+          question_type: r.type,
+          points: r.points,
+          submission: r.submitted_at
+            ? {
+                sql_text: r.sql_text,
+                is_correct: r.is_correct,
+                score: r.score,
+                submitted_at: r.submitted_at,
+                validation_details: r.validation_details
+              }
+            : undefined
+        }))
+      }
+    } else {
+      throw await toApiError(response, 'Failed to load exam details')
     }
   } catch (err) {
     handleApiError(err, { fallback: 'Failed to load exam details' })
@@ -300,11 +335,11 @@ function scoreClass(scored: number | null | undefined, max: number | null | unde
                   <td
                     class="score-cell"
                     :class="q.submission
-                      ? scoreClass(q.submission.is_correct ? q.points : 0, q.points)
+                      ? scoreClass(q.submission.score, q.points)
                       : 'score-pending'"
                   >
                     <template v-if="q.submission">
-                      {{ q.submission.is_correct ? q.points : 0 }} / {{ q.points }}
+                      {{ q.submission.score }} / {{ q.points }}
                     </template>
                     <template v-else>&mdash;</template>
                   </td>

@@ -6,6 +6,10 @@ import Skeleton from '../Skeleton.vue'
 import EmptyState from '../EmptyState.vue'
 import Spinner from '../Spinner.vue'
 import { toCsv, downloadCsv } from '../../utils/csv'
+import PracticeQuizMatrix from './PracticeQuizMatrix.vue'
+import { lecturerListQuestions } from '../../services/practice'
+import { toMatrixQuestions, columnsFromResults, buildMatrixCsv } from '../../utils/practice_matrix'
+import type { MatrixQuestion } from '../../utils/practice_matrix'
 
 interface ConsolidatedScore {
   student_id: string
@@ -195,7 +199,37 @@ const exportPracticeBreakdownCSV = () => {
   downloadCsv('practice_breakdown.csv', toCsv(PRACTICE_BREAKDOWN_HEADER, rows))
 }
 
+// Lazy + one-shot: lecturerListQuestions() payload carries correct_sql/seed_sql/
+// expected_result blobs, so there is no reason to fetch it on every Results page
+// load — only when the lecturer actually opens the Practice Quiz Summary view.
+async function ensurePracticeQuestions() {
+  if (practiceQuestionsLoaded.value || loadingPracticeQuestions.value) return
+  loadingPracticeQuestions.value = true
+  try {
+    const qs = await lecturerListQuestions()
+    practiceQuestions.value = toMatrixQuestions(qs)
+    practiceQuestionsLoaded.value = true
+  } catch (err) {
+    practiceQuestions.value = columnsFromResults(practiceResults.value)
+    practiceQuestionsDegraded.value = true
+    handleApiError(err, { fallback: 'Failed to load practice questions; showing only attempted questions.' })
+  } finally {
+    loadingPracticeQuestions.value = false
+  }
+}
+
+function exportPracticeMatrixCSV() {
+  downloadCsv('practice_quiz_matrix.csv', buildMatrixCsv(consolidatedScores.value, practiceQuestions.value, practiceResults.value))
+}
+
 // --- Results drill-down ---
+// Sentinel for the third View: mode. Exam ids are publicid tokens, so an
+// underscore-wrapped literal can never collide with a real id.
+const PRACTICE_MATRIX = '__practice_matrix__'
+const practiceQuestions = ref<MatrixQuestion[]>([])
+const loadingPracticeQuestions = ref(false)
+const practiceQuestionsLoaded = ref(false)
+const practiceQuestionsDegraded = ref(false)
 const resultsExamId = ref<string | null>(null)
 const drillLoading = ref(false)
 const drillQuestions = ref<any[]>([])
@@ -258,12 +292,15 @@ async function fetchDrillData(examId: string) {
 }
 
 watch(resultsExamId, (id) => {
-  if (id !== null) {
+  if (id !== null && id !== PRACTICE_MATRIX) {
     fetchDrillData(id)
   } else {
     drillQuestions.value = []
     drillSubmissions.value = []
     drillRoster.value = []
+    if (id === PRACTICE_MATRIX) {
+      ensurePracticeQuestions()
+    }
   }
 })
 
@@ -283,6 +320,7 @@ onMounted(() => {
         <button @click="exportExamCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Exam Scores (CSV)</button>
         <button @click="exportPracticeCSV" class="secondary-btn" style="margin: 0;" :disabled="consolidatedScores.length === 0">Export Practice Scores (CSV)</button>
         <button @click="exportPracticeBreakdownCSV" class="secondary-btn" style="margin: 0;" :disabled="practiceResults.length === 0">Export Practice Breakdown (CSV)</button>
+        <button v-if="resultsExamId === PRACTICE_MATRIX" @click="exportPracticeMatrixCSV" class="secondary-btn" style="margin: 0;" :disabled="loadingPracticeQuestions || practiceQuestions.length === 0 || consolidatedScores.length === 0">Export Practice Matrix (CSV)</button>
       </div>
     </div>
 
@@ -291,6 +329,7 @@ onMounted(() => {
       <label>View:</label>
       <select v-model="resultsExamId">
         <option :value="null">All exams (consolidated)</option>
+        <option :value="PRACTICE_MATRIX">Practice quiz summary (all questions)</option>
         <option v-for="e in exams" :key="e.id" :value="e.id">{{ e.title }} (ID: {{ e.id }})</option>
       </select>
     </div>
@@ -333,6 +372,17 @@ onMounted(() => {
           </tbody>
         </table>
       </div>
+    </template>
+
+    <!-- Practice quiz summary matrix view -->
+    <template v-else-if="resultsExamId === PRACTICE_MATRIX">
+      <PracticeQuizMatrix
+        :students="consolidatedScores"
+        :questions="practiceQuestions"
+        :results="practiceResults"
+        :loading="loadingScores || loadingPracticeResults || loadingPracticeQuestions"
+        :degraded="practiceQuestionsDegraded"
+      />
     </template>
 
     <!-- Per-exam drill-down view -->
@@ -395,7 +445,7 @@ onMounted(() => {
     </template>
 
     <!-- Practice Breakdown: per-student/per-question practice results (ARCH-007) -->
-    <div style="margin-top: var(--space-4);">
+    <div v-if="resultsExamId !== PRACTICE_MATRIX" style="margin-top: var(--space-4);">
       <h3 style="margin-bottom: var(--space-2);">Practice Breakdown</h3>
       <Skeleton v-if="loadingPracticeResults" variant="table-row" :rows="5" :cols="6" />
       <EmptyState v-else-if="!loadingPracticeResults && practiceResults.length === 0" title="No practice attempts yet" body="Once students attempt practice questions, their per-question breakdown appears here." />
