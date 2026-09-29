@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -39,14 +40,14 @@ const (
 	KnownPassword   = "gradeload-pw-1234"
 	EmailDomain     = "example.com"
 	defaultSelectQ  = "SELECT ssn, fname, lname FROM employee ORDER BY ssn"
-	defaultDMLQ     = "UPDATE works_on SET hours = 40"
+	defaultDMLQ     = "UPDATE works_on SET hours = hours + 10"
 	defaultDMLTable = "works_on"
 )
 
 // Manifest is what gradedriver reads to know what to hit.
 type Manifest struct {
 	Base         string `json:"base"`
-	ExamID       int    `json:"exam_id"`
+	ExamID       string `json:"exam_id"`
 	SelectQID    int    `json:"select_qid"`
 	DMLQID       int    `json:"dml_qid"`
 	StudentCount int    `json:"student_count"`
@@ -65,6 +66,7 @@ func main() {
 	dmlTable := flag.String("dml-table", defaultDMLTable, "target table for the DML question")
 	teardown := flag.Bool("teardown", false, "delete gradeload accounts + their exams instead of seeding")
 	dsn := flag.String("dsn", os.Getenv("DATABASE_URL"), "postgres DSN (default $DATABASE_URL)")
+	idSalt := flag.String("id-salt", os.Getenv("ID_SALT"), "backend ID_SALT, to encode opaque student ids (default $ID_SALT)")
 	flag.Parse()
 
 	if *dsn == "" {
@@ -82,6 +84,9 @@ func main() {
 	if *teardown {
 		doTeardown(ctx, pool)
 		return
+	}
+	if err := publicid.Init(*idSalt); err != nil {
+		log.Fatalf("publicid init (set ID_SALT to the backend's value): %v", err)
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(KnownPassword), bcrypt.DefaultCost)
@@ -135,7 +140,7 @@ func main() {
 		log.Fatalf("create SELECT question: %v", err)
 	}
 	if err := api.createQuestion(map[string]any{
-		"exam_id": examID, "type": "DML", "target_table": *dmlTable, "correct_sql": *dmlSQL,
+		"exam_id": examID, "type": "DML", "dml_kind": "UPDATE", "target_table": *dmlTable, "correct_sql": *dmlSQL,
 		"points": 10, "requirement": "loadtest dml", "strict_mode": map[string]bool{},
 	}); err != nil {
 		log.Fatalf("create DML question: %v", err)
@@ -164,7 +169,7 @@ func main() {
 	if err := os.WriteFile(*out, buf, 0o644); err != nil {
 		log.Fatalf("write manifest: %v", err)
 	}
-	log.Printf("ACTIVE exam %d ready: select_qid=%d dml_qid=%d students=%d", examID, selectQID, dmlQID, *n)
+	log.Printf("ACTIVE exam %s ready: select_qid=%d dml_qid=%d students=%d", examID, selectQID, dmlQID, *n)
 	log.Printf("manifest -> %s", *out)
 	fmt.Println(string(buf))
 }
@@ -221,9 +226,9 @@ func (a *apiClient) login(user, pass string) (string, error) {
 	return out.Token, nil
 }
 
-func (a *apiClient) createExam(title string) (int, error) {
+func (a *apiClient) createExam(title string) (string, error) {
 	var out struct {
-		ID int `json:"id"`
+		ID string `json:"id"`
 	}
 	err := a.do(http.MethodPost, "/api/v1/lecturer/exams", map[string]string{"title": title}, &out)
 	return out.ID, err
@@ -233,13 +238,13 @@ func (a *apiClient) createQuestion(body map[string]any) error {
 	return a.do(http.MethodPost, "/api/v1/lecturer/question", body, nil)
 }
 
-func (a *apiClient) questionIDsByType(examID int) (selectQID, dmlQID int, err error) {
+func (a *apiClient) questionIDsByType(examID string) (selectQID, dmlQID int, err error) {
 	var qs []struct {
 		ID     int    `json:"id"`
 		Type   string `json:"type"`
 		Status string `json:"expected_result_status"`
 	}
-	if err = a.do(http.MethodGet, fmt.Sprintf("/api/v1/lecturer/exams/%d/questions", examID), nil, &qs); err != nil {
+	if err = a.do(http.MethodGet, fmt.Sprintf("/api/v1/lecturer/exams/%s/questions", examID), nil, &qs); err != nil {
 		return 0, 0, err
 	}
 	for _, q := range qs {
@@ -259,13 +264,18 @@ func (a *apiClient) questionIDsByType(examID int) (selectQID, dmlQID int, err er
 	return selectQID, dmlQID, nil
 }
 
-func (a *apiClient) assignStudents(examID int, ids []int) error {
-	return a.do(http.MethodPost, fmt.Sprintf("/api/v1/lecturer/exams/%d/students", examID),
-		map[string]any{"student_ids": ids}, nil)
+func (a *apiClient) assignStudents(examID string, ids []int) error {
+	// student_ids are opaque UserID tokens on the wire (ARCH-005).
+	enc := make([]string, len(ids))
+	for i, id := range ids {
+		enc[i] = publicid.Encode(publicid.TypeUser, id)
+	}
+	return a.do(http.MethodPost, fmt.Sprintf("/api/v1/lecturer/exams/%s/students", examID),
+		map[string]any{"student_ids": enc}, nil)
 }
 
-func (a *apiClient) activate(examID int) error {
-	return a.do(http.MethodPut, fmt.Sprintf("/api/v1/lecturer/exams/%d/activate", examID),
+func (a *apiClient) activate(examID string) error {
+	return a.do(http.MethodPut, fmt.Sprintf("/api/v1/lecturer/exams/%s/activate", examID),
 		map[string]any{"active": true, "mode": "instant"}, nil)
 }
 
