@@ -61,15 +61,53 @@ type LecturerExaminationResponse struct {
 	UncapturedCount         int           `json:"uncaptured_count"`
 }
 
+// lecturerRepo is the repository surface LecturerController uses; satisfied by *repository.PostgresRepository.
+type lecturerRepo interface {
+	AddStudentsToExam(ctx context.Context, examID int, studentIDs []int) error
+	ArchiveExamination(ctx context.Context, id int) error
+	CountExamIntroImageBytes(ctx context.Context, examID int) (int64, error)
+	CreateExamination(ctx context.Context, exam models.Examination) (int, error)
+	CreateQuestion(ctx context.Context, q models.Question) (int, error)
+	DeleteExamIntroImage(ctx context.Context, examID, imgID int) error
+	DeleteExamination(ctx context.Context, id int) error
+	DeleteQuestion(ctx context.Context, id int) error
+	ExamHasMixedDualSchema(ctx context.Context, examID int) (bool, error)
+	ExecuteSchemaScript(ctx context.Context, sql string, importedBy int) error
+	GetAllExaminationsWithCounts(ctx context.Context) ([]models.Examination, error)
+	GetConsolidatedScores(ctx context.Context) ([]models.ConsolidatedScore, error)
+	GetExamByID(ctx context.Context, id int) (models.Examination, error)
+	GetExamMaxScores(ctx context.Context) (map[string]float64, error)
+	GetExamPreviewCurriculumSchema(ctx context.Context, examID int) (string, error)
+	GetExamRoster(ctx context.Context, examID int) ([]models.RosterStudent, error)
+	GetLecturerPracticeResults(ctx context.Context) ([]models.LecturerPracticeResultRow, error)
+	GetQuestion(ctx context.Context, id int) (models.Question, error)
+	GetQuestionsByExamID(ctx context.Context, examID int) ([]models.Question, error)
+	GetSubmissionsByExamID(ctx context.Context, examID int) ([]models.Submission, error)
+	ImportSchemaIntoExamCurriculum(ctx context.Context, examID int, sql string, importedBy int, confirmReplace bool) error
+	ImportSchemaIntoExamCurriculumPreview(ctx context.Context, examID int, sql string, importedBy int, confirmReplace bool) (parityWarning string, err error)
+	InsertExamIntroImage(ctx context.Context, examID int, mime string, data []byte) (models.IntroImage, error)
+	IsAnyExamActive(ctx context.Context) (bool, error)
+	PreviewCorrectSQLInSchema(ctx context.Context, qType, targetTable, sqlText string, examID int, categoryID int, useDecoy bool, seedSQL string) ([]map[string]interface{}, []string, error)
+	RemoveStudentFromExam(ctx context.Context, examID, studentID int) error
+	ReorderExamIntroImages(ctx context.Context, examID int, order []struct{ ID, SortOrder int }) error
+	SetExamPracticeFreeze(ctx context.Context, examID int, block bool) error
+	SetExaminationActive(ctx context.Context, id int, active bool, scheduledStartAt *time.Time, scheduledEndAt *time.Time) error
+	SetScheduledEndAt(ctx context.Context, examID int, scheduledEndAt *time.Time) error
+	UpdateExaminationIntroduction(ctx context.Context, id int, introduction string) error
+	UpdateExaminationTitle(ctx context.Context, id int, title string) error
+}
+
+var _ lecturerRepo = (*repository.PostgresRepository)(nil)
+
 type LecturerController struct {
-	repo          *repository.PostgresRepository
+	repo          lecturerRepo
 	importService *services.StudentImportService
 	authService   *services.AuthService
 	hub           *services.Hub
 	emailJobs     *services.EmailJobRegistry
 }
 
-func NewLecturerController(repo *repository.PostgresRepository, hub *services.Hub) *LecturerController {
+func NewLecturerController(repo lecturerRepo, hub *services.Hub) *LecturerController {
 	return &LecturerController{repo: repo, hub: hub}
 }
 

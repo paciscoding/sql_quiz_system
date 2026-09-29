@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -12,6 +13,14 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/publicid"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 )
+
+// liveQuestionEditRepo is the repository surface LiveQuestionEditController uses; satisfied by *repository.PostgresRepository.
+type liveQuestionEditRepo interface {
+	GetQuestion(ctx context.Context, id int) (models.Question, error)
+	UpdateQuestionRequirementLive(ctx context.Context, examID, questionID int, requirement string) error
+}
+
+var _ liveQuestionEditRepo = (*repository.PostgresRepository)(nil)
 
 // LiveQuestionEditController serves the one edit a lecturer may make to a
 // question of a RUNNING examination: its wording.
@@ -32,10 +41,10 @@ import (
 // finds out immediately rather than discovering mid-exam that half the class
 // was graded against a different question than the other half.
 type LiveQuestionEditController struct {
-	repo *repository.PostgresRepository
+	repo liveQuestionEditRepo
 }
 
-func NewLiveQuestionEditController(repo *repository.PostgresRepository) *LiveQuestionEditController {
+func NewLiveQuestionEditController(repo liveQuestionEditRepo) *LiveQuestionEditController {
 	return &LiveQuestionEditController{repo: repo}
 }
 

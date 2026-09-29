@@ -16,6 +16,8 @@ A PostgreSQL examination system for undergraduate computer science students (90�
 ## Codebase Map
 62 non-test Go files (plus 85 `_test.go`) and a Vue SPA with 44 Vitest files. Layering is strict: `controllers → services → repository`, with `models` shared by all three and no upward imports.
 
+**Dependency seams.** Controllers and `AuthService` do not hold the concrete `*repository.PostgresRepository`. Each consumer declares a small unexported consumer-side interface in its own file, directly above its struct (`quizRepo`, `lecturerRepo`, `practiceRepo`, `examCategoryRepo`, `announcementRepo`, `submissionLogRepo`, `exportRepo`, `liveQuestionEditRepo`, `authRepo`), listing exactly the repository methods that file calls; `QuizController` likewise takes `quizQueue` and `quizValidator`, and `PracticeController` takes `practiceValidator`. Every interface is followed by a compile-time assertion against its concrete type, e.g. `var _ quizRepo = (*repository.PostgresRepository)(nil)`, so drift fails in the consumer's own file. `cmd/main.go` still wires the single `*repository.PostgresRepository` into every constructor, and tests may pass fakes instead: `internal/controllers/quiz_controller_submit_test.go` is the DB-free example. New consumers should follow this convention rather than depend on the concrete type.
+
 ### Backend (`backend/`)
 ```
 cmd/main.go                 boot order + the whole route table (see below)

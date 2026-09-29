@@ -1,20 +1,30 @@
 package controllers
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/paciscoding/sql-quiz-system/internal/models"
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 	"github.com/paciscoding/sql-quiz-system/internal/services"
 )
 
+// exportRepo is the repository surface ExportController uses; satisfied by *repository.PostgresRepository.
+type exportRepo interface {
+	GetExportState(ctx context.Context) (models.ExportState, error)
+	SetExportEnabled(ctx context.Context, enabled bool) error
+}
+
+var _ exportRepo = (*repository.PostgresRepository)(nil)
+
 // ExportController exposes admin controls for the submission-log exporter.
 type ExportController struct {
-	repo *repository.PostgresRepository
+	repo exportRepo
 	svc  *services.SubmissionExportService
 }
 
-func NewExportController(repo *repository.PostgresRepository, svc *services.SubmissionExportService) *ExportController {
+func NewExportController(repo exportRepo, svc *services.SubmissionExportService) *ExportController {
 	return &ExportController{repo: repo, svc: svc}
 }
 

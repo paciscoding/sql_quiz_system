@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -92,13 +93,51 @@ type practiceValidator interface {
 	ValidatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (models.ValidationResult, []map[string]interface{}, []string, int, bool, error)
 }
 
+var _ practiceValidator = (*services.ValidationService)(nil)
+
+// practiceRepo is the repository surface PracticeController uses; satisfied by
+// *repository.PostgresRepository.
+type practiceRepo interface {
+	CategoryExists(ctx context.Context, id int) (bool, error)
+	CategoryHasMixedDualSchema(ctx context.Context, categoryID int) (bool, error)
+	CountCategoryIntroImageBytes(ctx context.Context, catID int) (int64, error)
+	CreatePracticeAttempt(ctx context.Context, a *models.PracticeAttempt) error
+	CreatePracticeCategory(ctx context.Context, name string, createdBy int) (*models.PracticeCategory, error)
+	CreatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error
+	DeleteCategoryIntroImage(ctx context.Context, catID, imgID int) error
+	DeletePracticeCategory(ctx context.Context, id int, force bool) error
+	DeletePracticeQuestion(ctx context.Context, id int) error
+	GetCategoryIntroImageBytes(ctx context.Context, catID, imgID int) (mime string, data []byte, updatedAt time.Time, err error)
+	GetPracticeCategory(ctx context.Context, id int) (*models.PracticeCategory, error)
+	GetPracticeCategorySchema(ctx context.Context, id int) (string, error)
+	GetPracticeQuestion(ctx context.Context, id int) (*models.PracticeQuestion, error)
+	GetPracticeSummary(ctx context.Context, studentID int) ([]models.PracticeSummary, error)
+	GetSchemaTablesWithColumns(ctx context.Context, schema string) ([]models.TableIntrospection, error)
+	ImportSchemaIntoCategory(ctx context.Context, categoryID int, sql string, importedBy int, confirmReplace bool) error
+	ImportSchemaIntoCategoryPreview(ctx context.Context, categoryID int, sql string, importedBy int, confirmReplace bool) (parityWarning string, err error)
+	InsertCategoryIntroImage(ctx context.Context, catID int, mime string, data []byte) (models.IntroImage, error)
+	ListCategoryIntroImages(ctx context.Context, catID int) ([]models.IntroImage, error)
+	ListPracticeAttempts(ctx context.Context, studentID int) ([]models.PracticeAttempt, error)
+	ListPracticeCategories(ctx context.Context) ([]models.PracticeCategory, error)
+	ListPracticeQuestions(ctx context.Context) ([]models.PracticeQuestion, error)
+	PreviewCorrectSQL(ctx context.Context, qType, targetTable, sqlText string) ([]map[string]interface{}, []string, error)
+	PreviewPracticeCorrectSQL(ctx context.Context, categoryID int, qType, targetTable, sqlText string, useDecoy bool, seedSQL string) ([]map[string]interface{}, []string, error)
+	RenamePracticeCategory(ctx context.Context, id int, name string) error
+	ReorderCategoryIntroImages(ctx context.Context, catID int, order []struct{ ID, SortOrder int }) error
+	SchemaHasTables(ctx context.Context, schema string) (bool, error)
+	UpdatePracticeCategoryIntroduction(ctx context.Context, id int, introduction string) error
+	UpdatePracticeQuestion(ctx context.Context, q *models.PracticeQuestion) error
+}
+
+var _ practiceRepo = (*repository.PostgresRepository)(nil)
+
 type PracticeController struct {
-	repo      *repository.PostgresRepository
+	repo      practiceRepo
 	validator practiceValidator
 	auth      *services.AuthService
 }
 
-func NewPracticeController(repo *repository.PostgresRepository, validator practiceValidator, auth *services.AuthService) *PracticeController {
+func NewPracticeController(repo practiceRepo, validator practiceValidator, auth *services.AuthService) *PracticeController {
 	return &PracticeController{
 		repo:      repo,
 		validator: validator,
