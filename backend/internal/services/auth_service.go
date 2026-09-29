@@ -16,8 +16,35 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// authRepo is the repository surface AuthService uses; satisfied by *repository.PostgresRepository.
+type authRepo interface {
+	ApplyPasswordReset(ctx context.Context, userID int, passwordHash string, changedBy int, source string, enc []byte, nonce []byte) error
+	BumpTokenVersion(ctx context.Context, userID int) error
+	ClearResetOTP(ctx context.Context, userID int) error
+	CreateUser(ctx context.Context, u models.User) (int, error)
+	DeleteUser(ctx context.Context, id int) error
+	GetAllUsers(ctx context.Context) ([]models.User, error)
+	GetAllUsersByRole(ctx context.Context, role models.Role) ([]models.User, error)
+	GetLastForgotResetAt(ctx context.Context, userID int) (*time.Time, error)
+	GetPasswordEvents(ctx context.Context, userID int) ([]models.PasswordEventRow, error)
+	GetResetOTP(ctx context.Context, userID int) (hash *string, expiresAt *time.Time, attempts int, err error)
+	GetTokenVersion(ctx context.Context, userID int) (int, error)
+	GetUserByID(ctx context.Context, id int) (models.User, error)
+	GetUserByUsername(ctx context.Context, username string) (models.User, error)
+	IncrementResetOTPAttempts(ctx context.Context, userID int) (newCount int, err error)
+	InsertPasswordEvent(ctx context.Context, ev models.PasswordEvent) (int, error)
+	NonStudentUserIDs(ctx context.Context, userIDs []int) ([]int, error)
+	ResolveBulkResetTargets(ctx context.Context, mode string, userIDs []int, examID int, afterID int, limit int) (targets []models.BulkResetTarget, remaining int, err error)
+	SetLastForgotResetAt(ctx context.Context, userID int) error
+	SetResetOTP(ctx context.Context, userID int, otpHash string, expiresAt time.Time) error
+	UpdateUser(ctx context.Context, u models.User) error
+	UpdateUserPassword(ctx context.Context, id int, hashedPassword string) error
+}
+
+var _ authRepo = (*repository.PostgresRepository)(nil)
+
 type AuthService struct {
-	repo          *repository.PostgresRepository
+	repo          authRepo
 	jwtSecret     []byte
 	loginAttempts sync.Map
 
@@ -28,7 +55,7 @@ type AuthService struct {
 	adminEmail string
 }
 
-func NewAuthService(repo *repository.PostgresRepository, secret string) *AuthService {
+func NewAuthService(repo authRepo, secret string) *AuthService {
 	cipher, ok := NewPasswordCipherFromEnv()
 	if ok {
 		log.Printf("auth: password-event logging enabled (encryption key configured)")

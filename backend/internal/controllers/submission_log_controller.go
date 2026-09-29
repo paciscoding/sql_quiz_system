@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"log"
@@ -14,6 +15,18 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 )
 
+// submissionLogRepo is the repository surface SubmissionLogController uses; satisfied by *repository.PostgresRepository.
+type submissionLogRepo interface {
+	GetExamSubmissionDetail(ctx context.Context, submissionID int) (models.ExamSubmissionLogDetail, error)
+	GetPracticeAttemptDetail(ctx context.Context, attemptID int) (models.PracticeAttemptLogDetail, error)
+	ListExamSubmissionLog(ctx context.Context, f models.SubmissionLogFilter) ([]models.ExamSubmissionLogRow, int, error)
+	ListPracticeSubmissionLog(ctx context.Context, f models.SubmissionLogFilter) ([]models.PracticeSubmissionLogRow, int, error)
+	StreamExamSubmissionLog(ctx context.Context, f models.SubmissionLogFilter, fn func(models.ExamSubmissionLogDetail) error) error
+	StreamPracticeSubmissionLog(ctx context.Context, f models.SubmissionLogFilter, fn func(models.PracticeAttemptLogDetail) error) error
+}
+
+var _ submissionLogRepo = (*repository.PostgresRepository)(nil)
+
 // SubmissionLogController serves the in-app, on-demand, filterable submission
 // log for admins/lecturers: every attempt (exam or practice), never just the
 // counted one. This is distinct from services/submission_export.go's emailed
@@ -21,10 +34,10 @@ import (
 //
 // Read-only: no handler in this file writes to any table.
 type SubmissionLogController struct {
-	repo *repository.PostgresRepository
+	repo submissionLogRepo
 }
 
-func NewSubmissionLogController(repo *repository.PostgresRepository) *SubmissionLogController {
+func NewSubmissionLogController(repo submissionLogRepo) *SubmissionLogController {
 	return &SubmissionLogController{repo: repo}
 }
 

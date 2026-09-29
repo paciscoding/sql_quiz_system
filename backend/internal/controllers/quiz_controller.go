@@ -31,15 +31,57 @@ type ExaminationResponse struct {
 	Introduction     string        `json:"introduction"`
 }
 
+// quizRepo is the repository surface QuizController uses; satisfied by *repository.PostgresRepository.
+type quizRepo interface {
+	CreateSubmission(ctx context.Context, s models.Submission) error
+	EnsureExamCategoryPreviewSandboxReady(ctx context.Context, categoryID int) error
+	EnsureExamCategorySchemasReady(ctx context.Context, examID int) error
+	EnsureExamPreviewSandboxReady(ctx context.Context, examID int) error
+	EnsureExamSandboxReady(ctx context.Context, examID int) error
+	GetExamByID(ctx context.Context, id int) (models.Examination, error)
+	GetExamIntroImageBytes(ctx context.Context, examID, imgID int) (mime string, data []byte, updatedAt time.Time, err error)
+	GetExamPreviewCurriculumSchema(ctx context.Context, examID int) (string, error)
+	GetQuestion(ctx context.Context, id int) (models.Question, error)
+	GetQuestionsByExamID(ctx context.Context, examID int) ([]models.Question, error)
+	GetSchemaTablesWithColumns(ctx context.Context, schema string) ([]models.TableIntrospection, error)
+	GetStudentEnrolledExams(ctx context.Context, studentID int) ([]models.Examination, error)
+	GetStudentExamResults(ctx context.Context, studentID, examID int) ([]models.StudentExamResult, error)
+	GetStudentExams(ctx context.Context, studentID int) ([]models.Examination, error)
+	GetStudentResultsSummary(ctx context.Context, studentID int) ([]models.ExamResultSummary, error)
+	IsStudentEnrolledInExam(ctx context.Context, studentID, examID int) (bool, error)
+	ListExamIntroImages(ctx context.Context, examID int) ([]models.IntroImage, error)
+	SchemaHasTables(ctx context.Context, schema string) (bool, error)
+}
+
+var _ quizRepo = (*repository.PostgresRepository)(nil)
+
+// quizQueue is the slice of *services.SubmissionQueue that QuizController uses:
+// exam DML evaluation (and DML preview) is serialised through Run.
+type quizQueue interface {
+	Run(ctx context.Context, fn func(context.Context) error) error
+}
+
+var _ quizQueue = (*services.SubmissionQueue)(nil)
+
+// quizValidator is the slice of *services.ValidationService that QuizController
+// uses. It mirrors practiceValidator but is declared separately so the quiz
+// path does not depend on a practice-named type.
+type quizValidator interface {
+	Validate(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string) (models.ValidationResult, error)
+	ValidatePreview(ctx context.Context, studentID int, question models.Question, studentSQL string, sandboxSchema string, previewSchema string) (models.ValidationResult, []map[string]interface{}, []string, int, bool, error)
+}
+
+var _ quizValidator = (*services.ValidationService)(nil)
+
 type QuizController struct {
-	valService      *services.ValidationService
-	submissionQueue *services.SubmissionQueue
-	repo            *repository.PostgresRepository
+	valService      quizValidator
+	submissionQueue quizQueue
+	repo            quizRepo
 	hub             *services.Hub
 	authService     *services.AuthService
 }
 
-func NewQuizController(valService *services.ValidationService, submissionQueue *services.SubmissionQueue, repo *repository.PostgresRepository, hub *services.Hub, authService *services.AuthService) *QuizController {
+func NewQuizController(valService quizValidator, submissionQueue quizQueue, repo quizRepo, hub *services.Hub, authService *services.AuthService) *QuizController {
 	return &QuizController{
 		valService:      valService,
 		submissionQueue: submissionQueue,

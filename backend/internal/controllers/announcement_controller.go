@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,13 +16,26 @@ import (
 // enforced server-side after trimming (per the API contract).
 const maxAnnouncementMessageLen = 2000
 
+// announcementRepo is the repository surface AnnouncementController uses;
+// satisfied by *repository.PostgresRepository.
+type announcementRepo interface {
+	CreateAnnouncement(ctx context.Context, examID int, lecturerID int, message string) (models.ExamAnnouncement, error)
+	DeleteAnnouncement(ctx context.Context, examID int, announcementID int) (int64, error)
+	GetExamByID(ctx context.Context, id int) (models.Examination, error)
+	IsStudentEnrolledInExam(ctx context.Context, studentID, examID int) (bool, error)
+	ListActiveAnnouncementsForStudent(ctx context.Context, examID int) ([]models.StudentExamAnnouncement, error)
+	ListAnnouncementsForExam(ctx context.Context, examID int) ([]models.ExamAnnouncement, error)
+}
+
+var _ announcementRepo = (*repository.PostgresRepository)(nil)
+
 // AnnouncementController implements the staff and student exam-announcement
 // endpoints described in the API contract (ARCH announcement feature).
 type AnnouncementController struct {
-	repo *repository.PostgresRepository
+	repo announcementRepo
 }
 
-func NewAnnouncementController(repo *repository.PostgresRepository) *AnnouncementController {
+func NewAnnouncementController(repo announcementRepo) *AnnouncementController {
 	return &AnnouncementController{repo: repo}
 }
 

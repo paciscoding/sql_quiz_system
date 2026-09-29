@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"regexp"
@@ -13,6 +14,23 @@ import (
 	"github.com/paciscoding/sql-quiz-system/internal/repository"
 )
 
+// examCategoryRepo is the repository surface ExamCategoryController uses; satisfied by *repository.PostgresRepository.
+type examCategoryRepo interface {
+	CreateExamCategory(ctx context.Context, examID int, name string, createdBy *int) (*models.ExamCategory, error)
+	DeleteExamCategory(ctx context.Context, examID, categoryID int) error
+	GetExamByID(ctx context.Context, id int) (models.Examination, error)
+	GetSchemaTablesWithColumns(ctx context.Context, schema string) ([]models.TableIntrospection, error)
+	ImportSchemaIntoExamCategory(ctx context.Context, examID, categoryID int, sql string, importedBy int, confirmReplace bool) error
+	ImportSchemaIntoExamCategoryPreview(ctx context.Context, examID, categoryID int, sql string, importedBy int, confirmReplace bool) (parityWarning string, err error)
+	IsStudentEnrolledInExam(ctx context.Context, studentID, examID int) (bool, error)
+	ListExamCategories(ctx context.Context, examID int) ([]models.ExamCategory, error)
+	RenameExamCategory(ctx context.Context, examID, categoryID int, name string) error
+	SchemaHasTables(ctx context.Context, schema string) (bool, error)
+	UpdateExamCategoryIntroduction(ctx context.Context, examID, categoryID int, introduction string) error
+}
+
+var _ examCategoryRepo = (*repository.PostgresRepository)(nil)
+
 // ExamCategoryController holds the lecturer CRUD handlers (ARCH-029) and the
 // student-facing category-headers handler (ARCH-030) for exam categories. It
 // is deliberately its own file/type — lecturer_controller.go is already
@@ -21,10 +39,10 @@ import (
 // in cmd/main.go (see NewExamCategoryController and the staff/quiz route
 // groups there), wired by TODO-073.
 type ExamCategoryController struct {
-	repo *repository.PostgresRepository
+	repo examCategoryRepo
 }
 
-func NewExamCategoryController(repo *repository.PostgresRepository) *ExamCategoryController {
+func NewExamCategoryController(repo examCategoryRepo) *ExamCategoryController {
 	return &ExamCategoryController{repo: repo}
 }
 
